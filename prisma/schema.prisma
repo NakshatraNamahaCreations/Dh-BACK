@@ -1,0 +1,1091 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserType {
+  CUSTOMER
+  PARTNER
+  ADMIN
+}
+
+enum DeletionRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// Account-deletion requests. A customer or partner can submit one from
+/// their profile with a free-form reason; admin reviews the queue and
+/// either approves (which actually deletes the underlying Customer /
+/// Partner row) or rejects. We do not FK to Customer/Partner here so
+/// approved requests remain a durable audit trail after the user row
+/// is gone — `userType` + `userId` are the soft pointer.
+model AccountDeletionRequest {
+  id          Int                   @id @default(autoincrement())
+  userType    UserType
+  userId      Int
+  /// Snapshot of phone / name / email captured at request time. Kept
+  /// here so the admin queue still shows who asked even after the
+  /// underlying account is wiped.
+  phone       String
+  name        String?
+  email       String?
+  reason      String
+  status      DeletionRequestStatus  @default(PENDING)
+  /// Admin-only note captured when the request is approved or rejected.
+  adminNote   String?
+  reviewedBy  Int?
+  reviewedAt  DateTime?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  @@index([status, createdAt])
+  @@index([userType, userId])
+  @@map("account_deletion_requests")
+}
+
+model Customer {
+  id        Int       @id @default(autoincrement())
+  phone     String    @unique
+  name      String?
+  email     String?
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  bookings  Booking[]
+  addresses CustomerAddress[]
+  ratings   BookingRating[]
+
+  @@map("customers")
+}
+
+/// Saved addresses (Home, Work, etc.) a customer can pick at checkout.
+/// Acts as the source of truth — Booking still keeps its own
+/// addressLine / city / lat / lng SNAPSHOT so historical bookings stay
+/// accurate even if the customer later edits or deletes the saved row.
+/// Same denormalisation pattern as `couponCode`/`couponDiscount` on
+/// Booking: full record here, frozen copy on Booking.
+model CustomerAddress {
+  id          Int      @id @default(autoincrement())
+  customerId  Int
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  /// Display label, e.g. "Home", "Work", or a custom string.
+  label       String
+  /// Full single-line address for display + delivery routing.
+  addressLine String
+  city        String
+  /// 6-digit Indian pincode when available — geocoded or typed.
+  pincode     String?
+  lat         Float?
+  lng         Float?
+
+  /// Exactly one row per customer should have isDefault=true. The
+  /// service enforces this invariant by clearing the previous default
+  /// inside a transaction whenever a new default is set.
+  isDefault   Boolean  @default(false)
+
+  /// Geography FK — populated by the backfill script and on every
+  /// new save once the customer-app moves to the city dropdown.
+  /// Nullable while old rows are still on free-text `city` only.
+  cityId      Int?
+  cityRef     City?    @relation(fields: [cityId], references: [id], onDelete: SetNull)
+
+  bookings    Booking[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([customerId, isDefault])
+  @@index([cityId])
+  @@map("customer_addresses")
+}
+
+model Partner {
+  id           Int      @id @default(autoincrement())
+  phone        String   @unique
+  name         String?
+  email        String?
+  businessName String?
+  categoryId    Int?
+  city          String?
+  callVerified  Boolean  @default(false)
+  /// Onboarding fee — admin sets per partner (kit cost + signup fee)
+  /// after call verification. Null means "admin hasn't set it yet";
+  /// the partner-app shows an "awaiting fee" message and the partner
+  /// can't proceed to payment until this is populated. In rupees.
+  onboardingFeeAmount Int?
+  /// Free-form note shown to the partner alongside the amount —
+  /// e.g. "Includes: branded uniform, ID card, and tool kit".
+  onboardingFeeNote   String?
+  onboardingFeePaidAt DateTime?
+  /// Razorpay audit trail for the onboarding-fee payment. Order id
+  /// is set when the partner taps "Pay now" (createOnboardingOrder);
+  /// payment id + signature are filled after the signed callback is
+  /// verified. Kept on the Partner row so a single denormalised read
+  /// surfaces everything admin needs without joining the Payment
+  /// table — onboarding fees don't pass through bookings.
+  onboardingFeeOrderId   String?
+  onboardingFeePaymentId String?
+  paymentStatus String   @default("unpaid")
+  /// Training step — admin marks this done after the partner
+  /// completes the in-person / video training session. Without this,
+  /// approve() refuses to flip the partner active.
+  trainingCompletedAt DateTime?
+  rejectedReason String?
+  isActive      Boolean  @default(true)
+  isVerified    Boolean  @default(false)
+  /// Suspension audit. When `isActive` flips to false via the
+  /// admin's Suspend action, we capture the reason + timestamp here
+  /// so the partner-app can show the message on Home and the admin
+  /// can later see why the account was paused. Cleared when the
+  /// admin resumes the account. Distinct from `rejectedReason`
+  /// which is for onboarding rejections — semantically different
+  /// even if both flag an account out.
+  suspendReason String?
+  suspendedAt   DateTime?
+  /// Expo push token for background job-alert notifications. Updated
+  /// by the partner-app whenever the partner first turns on duty.
+  /// Used by the dispatcher to push `dispatch.offer` to the device
+  /// even when the app is closed or minimised.
+  expoPushToken String?
+  /// Denormalised rating aggregate — recomputed after every BookingRating
+  /// upsert so admin/partner reads never need a GROUP BY aggregation.
+  avgRating    Float   @default(0)
+  ratingCount  Int     @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  /// Live location, updated by the partner-app while on an accepted
+  /// booking. Customer-app reads this through `/tracking/bookings/:id`
+  /// to show a moving marker as the partner approaches. `lastLocationAt`
+  /// gates staleness — a customer hitting refresh after the partner's
+  /// app died should see the timestamp and stop polling.
+  currentLat       Float?
+  currentLng       Float?
+  lastLocationAt   DateTime?
+
+  /// Geography FK — populated by the backfill script and by partner
+  /// onboarding once the city dropdown ships in the partner-app.
+  /// Nullable while legacy rows are still on free-text `city` only.
+  cityId       Int?
+  cityRef      City?    @relation(fields: [cityId], references: [id], onDelete: SetNull)
+
+  bookings     Booking[]
+  document     PartnerDocument?
+  earnings     PartnerEarning[]
+  payouts      Payout[]
+  notifications PartnerNotification[]
+  ratings      BookingRating[]
+
+  @@index([isVerified, createdAt])
+  @@index([isActive, isVerified])
+  @@index([categoryId])
+  @@index([city])
+  @@index([cityId])
+  /// Geospatial-ish — supports the "nearby partners" admin/dispatch
+  /// query without a dedicated geo extension. When traffic justifies
+  /// it, swap to PostGIS GIST or move location into Redis Geo and
+  /// keep this column as the durable backup.
+  @@index([currentLat, currentLng])
+  @@map("partners")
+}
+
+/// KYC / onboarding documents for a partner.
+/// Kept separate from Partner so third-party KYC integrations (DigiLocker,
+/// Karza, etc.) can add image URLs, signature, verification status and raw
+/// provider payloads here without touching the core partner record.
+model PartnerDocument {
+  id              Int       @id @default(autoincrement())
+  partnerId       Int       @unique
+  partner         Partner   @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  // Numbers entered by the partner during onboarding
+  aadharNumber    String?
+  panNumber       String?
+  dlNumber        String?
+  bankAccount     String?
+  bankIfsc        String?
+
+  // Image / file URLs — populated via third-party KYC or manual upload
+  aadharImageUrl     String?
+  /// Back of the Aadhaar card — address side. Both faces are
+  /// captured during partner onboarding so admin has the full
+  /// picture for review.
+  aadharBackImageUrl String?
+  panImageUrl     String?
+  dlImageUrl      String?
+  bankPassbookUrl String?
+  signatureUrl    String?
+  /// Partner-uploaded selfie / profile photo. Shown on the partner-app
+  /// profile screen and in admin onboarding review. Captured via the
+  /// device camera so the partner can't substitute someone else's
+  /// photo from their gallery during onboarding.
+  selfieUrl       String?
+
+  // KYC verification state — managed by third-party provider integration
+  kycStatus       String?   // pending | verified | rejected
+  kycProvider     String?   // e.g. "digilocker", "karza", "quickekyc"
+  kycVerifiedAt   DateTime?
+  kycRejectedAt   DateTime?
+  kycNote         String?   // rejection reason or notes from provider
+
+  /// Per-document verification timestamps. `kycVerifiedAt` above is a
+  /// rollup ("at least one doc verified"); these drive the admin's
+  /// per-document "Verified" badges and gate uniqueness checks so
+  /// two partners can't claim the same Aadhaar / PAN / DL / bank
+  /// account.
+  aadharVerifiedAt DateTime?
+  panVerifiedAt    DateTime?
+  dlVerifiedAt     DateTime?
+  bankVerifiedAt   DateTime?
+  /// Account-holder name as returned by the bank-verification API
+  /// (QuickeKYC penny-drop / NPCI lookup). Captured so admin can
+  /// confirm it matches the partner's claimed name before payout.
+  bankAccountHolder String?
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([kycStatus])
+  @@index([panNumber])
+  @@index([aadharNumber])
+  @@index([bankIfsc])
+  @@map("partner_documents")
+}
+
+model Admin {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  password  String
+  name      String?
+  isActive  Boolean  @default(true)
+  /// Admin role. SUPER sees everything across the platform.
+  /// CITY_MANAGER only sees rows in their assigned cities — every
+  /// admin list endpoint intersects this set into its WHERE clause.
+  /// Stored as a free-text column instead of an enum so we can add
+  /// roles later (STATE_MANAGER, FINANCE, etc.) without a migration.
+  role      String   @default("SUPER")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cityAssignments AdminCityAssignment[]
+  auditLogs       AdminAuditLog[]
+  notifications   AdminNotification[]
+
+  @@map("admins")
+}
+
+/// Junction table mapping a CITY_MANAGER admin to the cities they
+/// can see. A SUPER admin has zero rows here (their scope is implicit
+/// — "everything"). One admin can be assigned to multiple cities so
+/// regional ops folks managing a cluster (e.g. Bengaluru + Mysuru +
+/// Mangaluru) only need one account.
+model AdminCityAssignment {
+  id        Int      @id @default(autoincrement())
+  adminId   Int
+  admin     Admin    @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  cityId    Int
+  city      City     @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([adminId, cityId])
+  @@index([cityId])
+  @@map("admin_city_assignments")
+}
+
+model AdminAuditLog {
+  id        Int      @id @default(autoincrement())
+  adminId   Int?
+  admin     Admin?   @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  adminName String?
+  adminEmail String?
+  module    String
+  action    String
+  method    String
+  path      String
+  targetId  String?
+  statusCode Int?
+  ip        String?
+  userAgent String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([adminId, createdAt])
+  @@index([module, createdAt])
+  @@index([action, createdAt])
+  @@map("admin_audit_logs")
+}
+
+model Otp {
+  id        Int      @id @default(autoincrement())
+  phone     String
+  userType  UserType
+  codeHash  String
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  consumed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([phone, userType, consumed])
+  @@map("otps")
+}
+
+model Category {
+  id              Int       @id @default(autoincrement())
+  name            String
+  /// lucide icon name, e.g. "snowflake", "wrench"
+  icon            String    @default("wrench")
+  /// hex color, e.g. "#2F5FFF"
+  color           String    @default("#2F5FFF")
+  active          Boolean   @default(true)
+  /// display order — admins reorder via drag/buttons
+  sortOrder       Int       @default(0)
+  bannerImageUrl  String?
+  offerHeadline   String?
+  offerSubtext    String?
+  /// optional starting price shown on the customer-app banner
+  offerPrice      Int?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  services        Service[]
+  range           CategoryRange?
+  commissionRule  CommissionRule?
+
+  @@index([active, sortOrder])
+  @@map("categories")
+}
+
+model Service {
+  id            Int      @id @default(autoincrement())
+  name          String
+  description   String   @default("")
+  imageUrl      String?
+  durationMins  Int
+  /// price in INR (whole rupees — keep as int to avoid float drift)
+  basePrice     Int
+  /// optional MRP / strike-through original price
+  originalPrice Int?
+  active        Boolean  @default(true)
+  /// what this service covers — array of bullet strings
+  includes      String[] @default([])
+  /// what's chargeable extra
+  excludes      String[] @default([])
+
+  categoryId    Int
+  category      Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  bookingItems  BookingItem[]
+  faqs          ServiceFaq[]
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([categoryId, active])
+  @@map("services")
+}
+
+/// Per-service FAQs surfaced inside the customer-app service detail screen.
+/// Admins edit them inline as part of the service form — they're treated as a
+/// replaceable list (save = wipe + recreate) rather than CRUD'd individually.
+model ServiceFaq {
+  id        Int      @id @default(autoincrement())
+  serviceId Int
+  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  question  String
+  answer    String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([serviceId, sortOrder])
+  @@map("service_faqs")
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model Booking {
+  id              Int           @id @default(autoincrement())
+  customerId      Int
+  customer        Customer      @relation(fields: [customerId], references: [id])
+  partnerId       Int?
+  partner         Partner?      @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+  status          BookingStatus @default(PENDING)
+
+  /// when the customer wants the partner to arrive
+  scheduledAt     DateTime
+  /// labelled slot, e.g. "Morning · 9–12 AM" — kept for display/history even
+  /// if our slot scheme changes later
+  slotLabel       String
+  /// true for "instant" bookings (within 30 min)
+  isInstant       Boolean       @default(false)
+  /// Dispatch lifecycle for partner broadcast. Values: waiting | broadcasting | no_partner_found | accepted.
+  dispatchStatus  String        @default("waiting")
+  dispatchStartedAt DateTime?
+  dispatchExpiresAt DateTime?
+  dispatchRadiusKm Int?
+  dispatchWave     Int          @default(0)
+  noPartnerReason  String?
+
+  /// Optional pointer to the saved CustomerAddress this booking was
+  /// placed against. Nullable because (a) bookings can be placed with a
+  /// one-off typed address that was never saved, and (b) a customer
+  /// can later delete the saved address — onDelete:SetNull keeps the
+  /// snapshot fields valid while the FK clears. The snapshot
+  /// (addressLine / city / lat / lng) below is still authoritative for
+  /// display + routing on the booking itself.
+  customerAddressId Int?
+  customerAddress   CustomerAddress? @relation(fields: [customerAddressId], references: [id], onDelete: SetNull)
+
+  /// Snapshot fields for one-time booking addresses. When the customer
+  /// chooses a saved address, reads prefer the joined CustomerAddress.
+  /// When they use current location without saving it, these columns
+  /// keep the booking address without creating a saved-address row.
+  addressLabel    String?
+  addressLine     String?
+  city            String?
+  lat             Float?
+  lng             Float?
+
+  /// pricing in whole rupees (int)
+  ///
+  /// Pricing breakdown — snapshot at booking time so historical reads
+  /// remain accurate even if the GST / platform-fee percentages are
+  /// later changed.
+  ///
+  ///   subtotal     — sum of items (basePrice × qty)
+  ///   discount     — any rupee discount (coupon + manual baseDiscount)
+  ///   total        — partner-facing job amount = subtotal - discount
+  ///                  (or offeredPrice when BYOP). Earnings + commission
+  ///                  compute on this — does NOT include GST/fee.
+  ///   gstAmount    — 18% GST on `total`. Pass-through to government.
+  ///   platformFee  — 2% platform fee on `total`. Platform's cut.
+  ///   grandTotal   — what the customer actually pays =
+  ///                  total + gstAmount + platformFee. Razorpay charges
+  ///                  this; receipts show this.
+  subtotal        Int
+  discount        Int           @default(0)
+  total           Int
+  gstAmount       Int           @default(0)
+  platformFee     Int           @default(0)
+  grandTotal      Int           @default(0)
+  /// optional customer-offered price (used for "Book at your price")
+  offeredPrice    Int?
+  /// optional coupon redemption — set when the customer applied a code
+  /// at checkout. `couponDiscount` is the actual rupees deducted (after
+  /// percent + cap math), captured at booking time so the value remains
+  /// accurate even if the coupon row is later edited.
+  couponId        Int?
+  coupon          Coupon?       @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  couponCode      String?
+  couponDiscount  Int?
+
+  /// Payment lifecycle ROLLUP. Values: unpaid | pending | paid | failed | refunded.
+  /// This is a denormalised cache of the latest Payment row's status so
+  /// list endpoints (customer/partner/admin) can render a "Paid" pill
+  /// without joining `payments` on every read. The `Payment` table is
+  /// the source of truth — these fields are kept in sync by the payment
+  /// service whenever a Payment status changes. Same pattern as
+  /// `couponDiscount` (snapshot of the redeemed coupon amount).
+  paymentStatus   String        @default("unpaid")
+  /// "razorpay" | "cash" | null. Mirrors the latest Payment row's
+  /// method.
+  paymentMethod   String?
+  paidAt          DateTime?
+
+  payments        Payment[]
+
+  notes           String?
+
+  /// Pay-after-accept window for BYOP (Book At Your Price) bookings.
+  /// Set when a partner accepts a booking that has `offeredPrice` —
+  /// the customer must complete payment by this timestamp or the
+  /// booking auto-cancels. Null for non-BYOP flows (those pay
+  /// upfront so there's no holding window). 3 minutes today; tunable
+  /// via the worker constant.
+  paymentDeadlineAt DateTime?
+
+  /// Job handoff OTPs. Generated at booking creation and shown only to
+  /// the customer; the partner app prompts for them when starting and
+  /// completing the job. The customer reads the code aloud, the partner
+  /// types it in. Plain text is fine — these are short-lived handoff
+  /// codes seen by both parties, not security secrets.
+  jobStartOtp     String?
+  jobStartedAt    DateTime?
+  jobCompleteOtp  String?
+  jobCompletedAt  DateTime?
+
+  items           BookingItem[]
+  /// Partner credit. One earning row per completed booking — created
+  /// the moment a partner marks the job COMPLETED. Optional because
+  /// PENDING / CANCELLED bookings have no earning attached.
+  earning         PartnerEarning?
+  /// Customer's post-completion rating for the partner. One row per
+  /// booking (the relation is @unique on bookingId). Null until the
+  /// customer submits — completed bookings stay un-rated forever if
+  /// the customer skips, that's fine.
+  rating          BookingRating?
+
+  /// Geography FK — populated by the backfill script and by booking
+  /// creation once the customer-app routes through the city dropdown.
+  /// Nullable while legacy rows are still on free-text `city` only.
+  cityId          Int?
+  cityRef         City?         @relation(fields: [cityId], references: [id], onDelete: SetNull)
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([customerId, createdAt])
+  @@index([partnerId])
+  @@index([status, scheduledAt])
+  @@index([dispatchStatus, dispatchStartedAt])
+  @@index([isInstant, createdAt])
+  @@index([paymentStatus])
+  @@index([cityId, createdAt])
+  @@map("bookings")
+}
+
+model BookingItem {
+  id          Int      @id @default(autoincrement())
+  bookingId   Int
+  booking     Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  serviceId   Int
+  service     Service  @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  /// snapshot at time of booking — service can be edited later, history stays accurate
+  serviceName String
+  basePrice   Int
+  qty         Int
+
+  createdAt   DateTime @default(now())
+
+  @@index([bookingId])
+  @@map("booking_items")
+}
+
+/// Customer's star-rating for a completed booking. Exactly one row per
+/// booking (enforced by @unique on bookingId) — the customer can edit
+/// their rating by upserting against the bookingId. The partner
+/// aggregate (avg stars, count) is computed on demand by the analytics
+/// service; we don't denormalise onto Partner because rating volume
+/// is low and admin reads dominate writes.
+model BookingRating {
+  id         Int      @id @default(autoincrement())
+  bookingId  Int      @unique
+  booking    Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  partnerId  Int
+  partner    Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  customerId Int
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  /// 1–5 inclusive. Enforced at the service layer; the DB column is a
+  /// plain Int so admins can backfill historical data if needed.
+  stars      Int
+  comment    String?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([partnerId, createdAt])
+  @@index([customerId, createdAt])
+  @@map("booking_ratings")
+}
+
+/// One Payment row per attempt at paying a Booking. The Booking carries
+/// a denormalised rollup (paymentStatus / paymentMethod / paidAt) so list
+/// endpoints don't have to join — the Payment table holds the full audit
+/// trail of every order/attempt/refund.
+///
+/// Provider-agnostic naming (provider + providerOrderId) so a future
+/// cash-on-completion flow or a different gateway slots in without
+/// renaming columns.
+model Payment {
+  id                Int      @id @default(autoincrement())
+  bookingId         Int
+  booking           Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  /// Whole rupees, mirrors Booking.total/offeredPrice at the time the
+  /// order was minted. Stored separately because a partial refund or a
+  /// later price edit shouldn't retroactively change what was charged.
+  amount            Int
+  currency          String   @default("INR")
+
+  /// initiated → pending → paid | failed → refunded
+  status            String
+  /// "razorpay" | "cash" | null
+  method            String?
+  failureReason     String?
+
+  /// Provider-specific identifiers. For Razorpay these correspond to
+  /// the `order_xxx`, `pay_xxx`, and HMAC signature returned by Checkout.
+  provider          String   @default("razorpay")
+  providerOrderId   String?
+  providerPaymentId String?
+  providerSignature String?
+
+  paidAt            DateTime?
+  refundedAt        DateTime?
+  refundAmount      Int?
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([bookingId, createdAt])
+  @@index([status])
+  @@index([providerOrderId])
+  @@map("payments")
+}
+
+/// Per-category commission rule. `partnerPct` is the % of each
+/// completed booking's `total` that goes to the partner — platform
+/// keeps the remainder. One row per category; defaults to 80 if no
+/// row exists (gives sensible behaviour on a fresh install).
+///
+/// Replaces the previous in-memory tier matrix (Bronze/Silver/Gold/
+/// Platinum). Tier-based commissions can be re-introduced later
+/// without breaking this schema by extending the row, but the v1
+/// model is intentionally simple — admins set one number per
+/// category and that's what every partner of that category earns.
+model CommissionRule {
+  id          Int      @id @default(autoincrement())
+  categoryId  Int      @unique
+  category    Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  /// Percentage of booking total credited to the partner. 0–100.
+  /// Stored as Int (whole percent) — fractional commission isn't a
+  /// real ops requirement, and Int avoids float drift in the
+  /// earnedAmount math (`bookingAmount * partnerPct / 100`).
+  partnerPct  Int      @default(80)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("commission_rules")
+}
+
+/// One row per booking the partner has earned money on. Created the
+/// moment the partner flips a job to COMPLETED — see the `creditFor
+/// Booking` flow in earnings.service.js. The row is the durable
+/// audit trail: `commissionPct` and `bookingAmount` are snapshotted
+/// from the rule and the booking total at credit time, so a later
+/// rule edit doesn't retroactively change historical earnings.
+///
+/// Status lifecycle:
+///   pending  — earned, not yet rolled into a payout
+///   paid     — bundled into a Payout that the admin marked paid
+///   reversed — admin reversed (e.g. dispute resolved against partner)
+model PartnerEarning {
+  id            Int      @id @default(autoincrement())
+  partnerId     Int
+  partner       Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  /// One earning per booking — `@unique` enforces idempotency when
+  /// the completion handler is triggered twice (network retry,
+  /// admin re-mark, etc.).
+  bookingId     Int      @unique
+  booking       Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  /// Snapshot of `booking.total` at credit time.
+  bookingAmount Int
+  /// Snapshot of `commission_rules.partnerPct` for the booking's
+  /// category at credit time. Without the snapshot, an admin
+  /// changing the % later would silently rewrite history.
+  commissionPct Int
+  /// `bookingAmount * commissionPct / 100` rounded to whole rupees.
+  earnedAmount  Int
+
+  status        String   @default("pending")
+
+  /// Once an earning is rolled into a Payout, both sides know about
+  /// it via this back-pointer.
+  payoutId      Int?
+  payout        Payout?  @relation(fields: [payoutId], references: [id], onDelete: SetNull)
+
+  createdAt     DateTime @default(now())
+  paidAt        DateTime?
+
+  @@index([partnerId, status])
+  @@index([payoutId])
+  @@index([createdAt])
+  @@map("partner_earnings")
+}
+
+/// A Payout is one settlement to a partner — the admin groups N
+/// pending earnings into a Payout, approves it, and marks it paid
+/// (with a bank reference) once the actual transfer goes through.
+///
+/// Status lifecycle:
+///   pending  — generated, awaiting admin approval
+///   approved — admin approved; transfer being arranged
+///   paid     — money actually disbursed (admin recorded reference)
+///   rejected — admin rejected (notes carry the reason)
+///
+/// `periodStart` / `periodEnd` are computed at generation time so the
+/// admin UI can label the payout "Week of …" without re-deriving from
+/// the underlying earnings.
+model Payout {
+  id          Int      @id @default(autoincrement())
+  partnerId   Int
+  partner     Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  /// Sum of `earnedAmount` across the included earnings — copied
+  /// here so a payout listing doesn't have to JOIN earnings.
+  amount      Int
+  /// Count of earnings rolled into this payout. Same denormalisation
+  /// rationale as `amount`.
+  earningsCount Int      @default(0)
+
+  status      String   @default("pending")
+
+  periodStart DateTime
+  periodEnd   DateTime
+
+  /// Approval audit. `approvedBy` is an Admin.id; we don't enforce
+  /// a relation here so deleting an admin doesn't cascade-block
+  /// historical payout records.
+  approvedBy  Int?
+  approvedAt  DateTime?
+  paidAt      DateTime?
+  /// Bank-side reference, e.g. UPI txn id or NEFT reference.
+  reference   String?
+  notes       String?
+
+  earnings    PartnerEarning[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([partnerId, status])
+  @@index([status, createdAt])
+  @@map("payouts")
+}
+
+enum BannerPlacement {
+  HOME_HERO
+  SPOTLIGHT
+}
+
+enum BannerCtaType {
+  NONE
+  CATEGORY
+  SERVICE
+  URL
+}
+
+model AppBanner {
+  id              Int             @id @default(autoincrement())
+  placement       BannerPlacement
+  imageUrl        String?
+  ctaType         BannerCtaType   @default(NONE)
+  /// target value: category-id (as string), service-id (as string), or absolute URL — empty when NONE
+  ctaValue        String?
+  ctaLabel        String?
+  active          Boolean         @default(true)
+  sortOrder       Int             @default(0)
+  /// optional schedule — banner is hidden outside this window
+  startsAt        DateTime?
+  endsAt          DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([placement, active, sortOrder])
+  @@index([startsAt, endsAt])
+  @@map("app_banners")
+}
+
+/// Customer-facing "Offer your price" bounds — configured per category as
+/// percentages of each service's basePrice. Applied at quote time so price
+/// disparities within a category (e.g. ₹449 uninstall vs ₹1,899 gas refill)
+/// scale naturally without per-service tuning.
+model CategoryRange {
+  id         Int      @id @default(autoincrement())
+  categoryId Int      @unique
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  /// lower bound as a percentage of basePrice — e.g. 70 means 70% of basePrice
+  minPct     Int
+  /// recommended price as a percentage of basePrice — typically 100
+  midPct     Int
+  /// upper bound as a percentage of basePrice — e.g. 125 means basePrice + 25%
+  maxPct     Int
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@map("category_ranges")
+}
+
+/// Time-slot windows the customer can pick when scheduling a booking.
+/// Configured by admins so the catalog can be tuned per market/launch phase.
+/// `capacity` is currently advisory — booking-create logic doesn't yet
+/// reject overflows; the field is stored so we can light up scheduling rules
+/// in a follow-up without a schema change.
+model TimeSlot {
+  id        Int      @id @default(autoincrement())
+  /// Display label, e.g. "Morning"
+  label     String
+  /// "HH:mm" — start of the window (24h)
+  startTime String
+  /// "HH:mm" — end of the window (24h)
+  endTime   String
+  /// Max concurrent bookings allowed for this slot on a single day.
+  capacity  Int      @default(10)
+  /// Ionicons-friendly hint for the customer-app card. Examples: "sunny",
+  /// "partly-sunny", "moon".
+  icon      String   @default("sunny")
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([active, sortOrder])
+  @@map("time_slots")
+}
+
+/// Customers who hit the "Coming soon" screen and asked to be notified when
+/// we launch in their area. One row per (phone, city) — admin sees this as a
+/// demand signal for which markets to open next.
+model LaunchInterest {
+  id        Int      @id @default(autoincrement())
+  phone     String
+  city      String
+  pincode   String?
+  /// what surfaced the prompt — "coming_soon" today; reserved for future
+  /// triggers (e.g. "category_unavailable")
+  source    String   @default("coming_soon")
+  notified  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([phone, city])
+  @@index([city, createdAt])
+  @@map("launch_interests")
+}
+
+enum CouponDiscountType {
+  PERCENT
+  FLAT
+}
+
+/// Promo codes the customer can apply at checkout. A coupon's discount
+/// is computed against the cart subtotal, capped by `maxDiscount` for
+/// percentage codes, and only valid when the cart subtotal meets
+/// `minOrderValue`. `usedCount` is incremented at booking creation; once
+/// it hits `usageLimit` the coupon stops applying.
+model Coupon {
+  id              Int                @id @default(autoincrement())
+  /// Customer-facing code, stored upper-cased (we lowercase + uppercase
+  /// at validate-time so "welcome50" and "WELCOME50" map to the same row).
+  code            String             @unique
+  description     String?
+  discountType    CouponDiscountType
+  /// Percentage 1-100 when type=PERCENT; whole rupees when type=FLAT.
+  discountValue   Int
+  /// Minimum cart subtotal (₹) the coupon applies to. 0 = no minimum.
+  minOrderValue   Int                @default(0)
+  /// Cap on the discount amount (₹) for percentage codes. Null = no cap.
+  maxDiscount     Int?
+  /// Optional date window. Null = unbounded on that side.
+  validFrom       DateTime?
+  validUntil      DateTime?
+  /// Total redemptions allowed across all customers. Null = unlimited.
+  usageLimit      Int?
+  usedCount       Int                @default(0)
+  active          Boolean            @default(true)
+
+  bookings        Booking[]
+
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  @@index([active, code])
+  @@index([validFrom, validUntil])
+  @@map("coupons")
+}
+
+/// Cities (and optionally pincode subsets) where Dhoond is live. The customer
+/// app gates on this at launch — non-serviceable areas see "Coming soon".
+model ServiceArea {
+  id          Int      @id @default(autoincrement())
+  /// canonical city name; matched case-insensitively against geocoded city
+  city        String   @unique
+  state       String?
+  /// empty = whole city is serviceable; populated = whitelist of pincodes
+  pincodes    String[] @default([])
+  /// empty = all categories available here; populated = restricted set
+  categoryIds Int[]    @default([])
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  /// Geography FK — backfill script will populate this from the
+  /// existing free-text `city` column. Once stable we'll drop the
+  /// free-text column and add a `@unique` constraint here.
+  cityId      Int?
+  cityRef     City?    @relation(fields: [cityId], references: [id], onDelete: SetNull)
+
+  surgeRules  SurgeRule[]
+
+  @@index([cityId])
+  @@map("service_areas")
+}
+
+/// Indian state — operational rollup. About 28 states + 8 UTs. We
+/// model state as its own row so admin reports can slice by state
+/// without scanning City rows. States rarely change once seeded.
+model State {
+  id        Int      @id @default(autoincrement())
+  /// Display name, e.g. "Karnataka", "Maharashtra".
+  name      String   @unique
+  /// Two-letter ISO 3166-2:IN code (KA, MH, TN, etc.). Optional —
+  /// some UTs don't have memorable codes and admins seed them by
+  /// name only.
+  code      String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cities    City[]
+
+  @@map("states")
+}
+
+/// Operational city — the unit Dhoond actually launches in and
+/// dispatches against. Free-text `city` columns on Booking, Partner,
+/// CustomerAddress and ServiceArea are deprecated once backfill
+/// completes; the `cityId` FK becomes the canonical reference.
+model City {
+  id         Int       @id @default(autoincrement())
+  /// Display name, e.g. "Bengaluru". Can repeat across states (a
+  /// "Hyderabad" exists in both Telangana and Andhra Pradesh).
+  name       String
+  stateId    Int
+  state      State     @relation(fields: [stateId], references: [id], onDelete: Restrict)
+  active     Boolean   @default(true)
+  /// Optional centroid — used for "nearest city" autocomplete and
+  /// map widgets. Not used for dispatch; that runs off lat/lng on
+  /// the booking itself.
+  lat        Float?
+  lng        Float?
+  /// When service went live in this city. Null = not yet launched
+  /// (still appears in admin lists for planning, but customer-app
+  /// coverage check returns "coming soon").
+  launchedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  bookings          Booking[]
+  partners          Partner[]
+  customerAddresses CustomerAddress[]
+  serviceAreas      ServiceArea[]
+  adminAssignments  AdminCityAssignment[]
+
+  /// Same city name within a state would be ambiguous; across states
+  /// is allowed.
+  @@unique([name, stateId])
+  @@index([stateId, active])
+  @@map("cities")
+}
+
+/// Surge multiplier rules — bound to a specific ServiceArea. Optionally
+/// narrowed to a pincode subset within that area for neighbourhood-level
+/// surges. categoryId is null when the rule applies to all categories.
+model SurgeRule {
+  id            Int       @id @default(autoincrement())
+  name          String
+  categoryId    Int?
+  serviceAreaId Int
+  serviceArea   ServiceArea @relation(fields: [serviceAreaId], references: [id], onDelete: Cascade)
+  /// optional subset within the service area; empty = whole area
+  pincodes      String[]  @default([])
+  /// list of mon|tue|wed|thu|fri|sat|sun
+  days          String[]
+  /// "HH:mm"
+  startTime     String
+  endTime       String
+  multiplier    Float
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([serviceAreaId, active])
+  @@map("surge_rules")
+}
+
+/// In-app notifications for partners. Rows are written by service-layer
+/// emitters at key lifecycle moments (booking completed, account
+/// suspended, KYC verified, onboarding fee paid, admin-assigned job,
+/// payout settled) and read back by the partner-app's notifications
+/// screen. The socket gateway also pushes a `notification.new` event
+/// on insert so the bell badge updates without polling.
+///
+/// `type` is an open-ended string — partner-app maps known values to
+/// icons/colors and falls back to a generic icon for unknown ones.
+/// `bookingId` is optional; when set, tapping the notification deep
+/// links to BookingSummary.
+/// Admin-side notification feed. Mirrors `PartnerNotification` in
+/// shape — per-admin rows (i.e. one row per admin per event), so a
+/// "mark as read" by one admin doesn't quietly mark it read for
+/// everyone else. Wasteful in storage at scale, but the admin team
+/// is small (<20 active) and the per-row write keeps the read model
+/// trivial (one index on adminId + readAt covers the bell badge).
+///
+/// `href` is the admin-panel route to navigate to when the row is
+/// tapped (e.g. "/bookings/history/123"). Free-form so adding new
+/// notification types doesn't require a schema migration.
+model AdminNotification {
+  id        Int      @id @default(autoincrement())
+  adminId   Int
+  admin     Admin    @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  type      String
+  title     String
+  body      String
+  href      String?
+  /// Denormalised FK hints — saves a parse of `href` when the UI
+  /// wants to badge/cross-reference. Each is independent.
+  bookingId  Int?
+  partnerId  Int?
+  customerId Int?
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([adminId, createdAt])
+  @@index([adminId, readAt])
+  @@map("admin_notifications")
+}
+
+model PartnerNotification {
+  id        Int      @id @default(autoincrement())
+  partnerId Int
+  partner   Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  /// One of: job_request | job_completed | job_cancelled | payment |
+  /// review | system | kyc | onboarding. New values are non-breaking —
+  /// the partner-app shows them with a generic icon.
+  type      String
+  title     String
+  body      String
+  /// Optional deep-link target. When set, tapping the row in the
+  /// partner-app navigates to BookingSummary for this id.
+  bookingId Int?
+  /// Null until the partner taps the row (or marks-all-read). We
+  /// store the timestamp rather than a boolean so we can later
+  /// surface "seen but unactioned" analytics without a schema change.
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  /// Fast list-for-partner-newest-first read path.
+  @@index([partnerId, createdAt])
+  /// Unread-count query — used by the bell badge.
+  @@index([partnerId, readAt])
+  @@map("partner_notifications")
+}

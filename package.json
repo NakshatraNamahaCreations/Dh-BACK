@@ -1,0 +1,55 @@
+{
+  "name": "dhoond-backend",
+  "version": "1.0.0",
+  "description": "Backend API with Node.js, Express, PostgreSQL and Prisma",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "worker": "node src/worker.js",
+    "worker:dev": "nodemon src/worker.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "prisma:studio": "prisma studio",
+    "prisma:seed": "node prisma/seed.js",
+    "banners:images": "node scripts/generate-app-banners.js",
+    "categories:images": "node scripts/generate-category-banners.js",
+    "services:images": "node scripts/generate-service-images.js",
+    "services:faqs": "node scripts/seed-service-faqs.js",
+    "seed:geography": "node scripts/seed-geography.js",
+    "backfill:cities": "node scripts/backfill-cities.js",
+    "lint": "eslint ."
+  },
+  "prisma": {
+    "seed": "node prisma/seed.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1038.0",
+    "@aws-sdk/s3-request-presigner": "^3.1038.0",
+    "@prisma/client": "^5.22.0",
+    "bcryptjs": "^2.4.3",
+    "bullmq": "^5.76.6",
+    "compression": "^1.7.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.1",
+    "express-async-errors": "^3.1.1",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.10.1",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "razorpay": "^2.9.6",
+    "socket.io": "^4.8.1",
+    "winston": "^3.17.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7",
+    "prisma": "^5.22.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
