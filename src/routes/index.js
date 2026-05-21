@@ -23,6 +23,7 @@ const adminsRoutes = require('../modules/admins/admins.routes');
 const accountDeletionRoutes = require('../modules/account-deletion/account-deletion.routes');
 const kycRoutes = require('../modules/kyc/kyc.routes');
 const partnerNotificationRoutes = require('../modules/notifications/notifications.routes');
+const pushBroadcastRoutes = require('../modules/push-broadcasts/push-broadcasts.routes');
 
 const router = express.Router();
 
@@ -54,5 +55,6 @@ router.use('/admins', adminsRoutes);
 router.use('/account-deletion-requests', accountDeletionRoutes);
 router.use('/kyc', kycRoutes);
 router.use('/partners/me/notifications', partnerNotificationRoutes);
+router.use('/push-broadcasts', pushBroadcastRoutes);
 
 module.exports = router;

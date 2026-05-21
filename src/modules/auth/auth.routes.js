@@ -68,4 +68,7 @@ router.post('/partner/payment-done', authenticate, requireType('PARTNER'), contr
 router.get('/me', authenticate, controller.me);
 router.patch('/me', authenticate, validate(updateMeSchema), controller.updateMe);
 
+// Push token registration — called by customer and partner apps after login
+router.patch('/me/push-token', authenticate, controller.registerPushToken);
+
 module.exports = router;

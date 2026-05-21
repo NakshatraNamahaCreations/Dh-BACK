@@ -10,6 +10,7 @@ const {
   rejectSchema,
   onboardingFeeSchema,
   trainingStatusSchema,
+  skipDlSchema,
   updateDocumentsSchema,
   updateCategorySchema,
   createSchema,
@@ -25,6 +26,7 @@ router.get('/onboarding', adminOnly, validate(onboardingQuerySchema), controller
 router.patch('/onboarding/:id/stage', adminOnly, validate(stageSchema), controller.updateStage);
 router.patch('/onboarding/:id/fee', adminOnly, validate(onboardingFeeSchema), controller.setOnboardingFee);
 router.patch('/onboarding/:id/training', adminOnly, validate(trainingStatusSchema), controller.setTrainingStatus);
+router.post('/onboarding/:id/dl/skip', adminOnly, validate(skipDlSchema), controller.skipDlVerification);
 router.post('/onboarding/:id/approve', adminOnly, validate(idParam), controller.approve);
 router.post('/onboarding/:id/reject', adminOnly, validate(rejectSchema), controller.reject);
 

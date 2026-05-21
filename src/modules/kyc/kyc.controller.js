@@ -6,6 +6,8 @@ exports.generateAadhaarOtp = asyncHandler(async (req, res) => {
   const result = await service.generateAadhaarOtp({
     partnerId: req.user.sub,
     aadhaarNumber: req.body.aadhaarNumber,
+    imageUrl: req.body.imageUrl,
+    backImageUrl: req.body.backImageUrl,
   });
   success(res, result, 'OTP sent to your Aadhaar-linked mobile.');
 });

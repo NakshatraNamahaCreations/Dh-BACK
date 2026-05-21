@@ -42,13 +42,15 @@ const categoryName = (p, categoryById) =>
 
 const docState = (value) => (value ? 'uploaded' : 'pending');
 
+const isDlComplete = (doc) => Boolean(doc?.dlVerifiedAt || doc?.dlSkippedAt);
+
 const hasRequiredDocuments = (doc) =>
-  Boolean(doc?.aadharNumber && doc?.panNumber && doc?.dlNumber && doc?.bankAccount && doc?.bankIfsc);
+  Boolean(doc?.aadharNumber && doc?.panNumber && isDlComplete(doc) && doc?.bankAccount && doc?.bankIfsc);
 
 const onboardingStatus = (p) => {
   if (p.rejectedReason || !p.isActive) return 'rejected';
   if (p.isVerified) return 'approved';
-  if (p.callVerified || p.document?.kycStatus === 'verified') return 'in_review';
+  if (p.callVerified) return 'in_review';
   return 'pending';
 };
 
@@ -63,7 +65,7 @@ const stagesForPartner = (p, updatedBy = 'System') => {
   const doc = p.document;
   if (doc?.aadharNumber) done.add('aadhaar');
   if (doc?.panNumber) done.add('pan');
-  if (doc?.dlNumber) done.add('dl');
+  if (isDlComplete(doc) || doc?.dlNumber || doc?.dlImageUrl) done.add('dl');
   if (doc?.kycStatus === 'verified' || hasRequiredDocuments(doc)) done.add('background');
   if (p.callVerified) done.add('call');
   if (doc?.bankAccount && doc?.bankIfsc) done.add('bank');
@@ -84,7 +86,7 @@ const stagesForPartner = (p, updatedBy = 'System') => {
 const documentsForPartner = (p) => ({
   aadhaar: docState(p.document?.aadharNumber || p.document?.aadharImageUrl),
   pan: docState(p.document?.panNumber || p.document?.panImageUrl),
-  dl: docState(p.document?.dlNumber || p.document?.dlImageUrl),
+  dl: p.document?.dlSkippedAt ? 'skipped' : docState(p.document?.dlNumber || p.document?.dlImageUrl),
 });
 
 const enrichPartner = (p, categoryById, jobsCount = 0, earnings = 0) => {
@@ -218,28 +220,75 @@ exports.list = async ({ status, kyc, search, scope, page = 1, pageSize = 25 } = 
 /// URLs as stored. Admin needs the unmasked values to cross-check
 /// against the uploaded image; the customer-app and partner-app
 /// never receive this shape.
-const documentDetailsForPartner = (p) => ({
-  aadharNumber: p.document?.aadharNumber ?? null,
-  panNumber: p.document?.panNumber ?? null,
-  dlNumber: p.document?.dlNumber ?? null,
-  aadharImageUrl: p.document?.aadharImageUrl ?? null,
-  panImageUrl: p.document?.panImageUrl ?? null,
-  dlImageUrl: p.document?.dlImageUrl ?? null,
-  bankAccount: p.document?.bankAccount ?? null,
-  bankIfsc: p.document?.bankIfsc ?? null,
-  bankPassbookUrl: p.document?.bankPassbookUrl ?? null,
-  signatureUrl: p.document?.signatureUrl ?? null,
-  selfieUrl: p.document?.selfieUrl ?? null,
-  kycStatus: p.document?.kycStatus ?? null,
-  kycVerifiedAt: p.document?.kycVerifiedAt ?? null,
-  /// Per-document verification timestamps. Non-null = QuickeKYC
-  /// (or another integration) confirmed this specific document.
-  /// The admin UI uses these to render the green "Verified" badge
-  /// next to each row in the Documents card.
-  aadharVerifiedAt: p.document?.aadharVerifiedAt ?? null,
-  panVerifiedAt: p.document?.panVerifiedAt ?? null,
-  dlVerifiedAt: p.document?.dlVerifiedAt ?? null,
-});
+/// Flatten QuickeKYC's nested address object into a single readable
+/// line. Fields are ordered from specific → broad so the string reads
+/// naturally (house → street → landmark → locality → city → district
+/// → state → country). Null / empty parts are silently dropped.
+const formatAadhaarAddress = (addr) => {
+  if (!addr || typeof addr !== 'object') return null;
+  const parts = [
+    addr.house,
+    addr.street,
+    addr.landmark,
+    addr.loc,
+    addr.vtc,
+    addr.po,
+    addr.subdist,
+    addr.dist,
+    addr.state,
+    addr.country,
+  ].filter((v) => v && String(v).trim());
+  return parts.length > 0 ? parts.join(', ') : null;
+};
+
+const documentDetailsForPartner = (p) => {
+  /// Parse kycNote JSON (Aadhaar verification payload). Stored as a
+  /// raw string so we can snapshot provider data without schema churn.
+  let kycParsed = null;
+  try {
+    if (p.document?.kycNote) kycParsed = JSON.parse(p.document.kycNote);
+  } catch {
+    // malformed — treat as absent
+  }
+
+  return {
+    aadharNumber: p.document?.aadharNumber ?? null,
+    panNumber: p.document?.panNumber ?? null,
+    dlNumber: p.document?.dlNumber ?? null,
+    aadharImageUrl: p.document?.aadharImageUrl ?? null,
+    aadharBackImageUrl: p.document?.aadharBackImageUrl ?? null,
+    panImageUrl: p.document?.panImageUrl ?? null,
+    dlImageUrl: p.document?.dlImageUrl ?? null,
+    bankAccount: p.document?.bankAccount ?? null,
+    bankIfsc: p.document?.bankIfsc ?? null,
+    bankPassbookUrl: p.document?.bankPassbookUrl ?? null,
+    signatureUrl: p.document?.signatureUrl ?? null,
+    selfieUrl: p.document?.selfieUrl ?? null,
+    kycStatus: p.document?.kycStatus ?? null,
+    kycVerifiedAt: p.document?.kycVerifiedAt ?? null,
+    /// Per-document verification timestamps.
+    aadharVerifiedAt: p.document?.aadharVerifiedAt ?? null,
+    panVerifiedAt: p.document?.panVerifiedAt ?? null,
+    dlVerifiedAt: p.document?.dlVerifiedAt ?? null,
+    dlSkippedAt: p.document?.dlSkippedAt ?? null,
+    dlSkipReason: p.document?.dlSkipReason ?? null,
+    bankVerifiedAt: p.document?.bankVerifiedAt ?? null,
+    /// Verified holder names from QuickeKYC responses.
+    panHolderName: p.document?.panHolderName ?? null,
+    dlHolderName: p.document?.dlHolderName ?? null,
+    bankAccountHolder: p.document?.bankAccountHolder ?? null,
+    /// Aadhaar-verified identity fields. Prefer the dedicated columns
+    /// (populated by `submitAadhaarOtp` for partners verified after the
+    /// 2026-05-20 schema migration); fall back to the legacy kycNote
+    /// JSON for partners verified before it. Once all live rows are
+    /// migrated forward, the kycNote fallback + the parsing block above
+    /// can be removed.
+    kycName: p.document?.aadharName ?? kycParsed?.fullName ?? null,
+    kycDob: p.document?.aadharDob ?? kycParsed?.dob ?? null,
+    kycGender: p.document?.aadharGender ?? kycParsed?.gender ?? null,
+    kycAddress: p.document?.aadharAddress ?? formatAadhaarAddress(kycParsed?.address),
+  };
+};
 
 exports.get = async (id) => {
   const [p, categoryById] = await Promise.all([
@@ -574,7 +623,7 @@ exports.approve = async (id) => {
   const partnerId = Number(id);
   const partner = await prisma.partner.findUnique({ where: { id: partnerId }, include: { document: true } });
   if (!partner) throw ApiError.notFound('Partner not found');
-  if (!hasRequiredDocuments(partner.document)) throw ApiError.badRequest('All required documents must be submitted before approval.');
+  if (!hasRequiredDocuments(partner.document)) throw ApiError.badRequest('All required documents must be verified or skipped before approval.');
   if (!partner.callVerified) throw ApiError.badRequest('Call verification must be completed before approval.');
   if (partner.onboardingFeeAmount == null) throw ApiError.badRequest('Set the onboarding fee before activation.');
   if (partner.paymentStatus !== 'paid') throw ApiError.badRequest('Onboarding payment must be completed before activation.');
@@ -657,6 +706,41 @@ exports.setTrainingStatus = async (id, { completed }) => {
       body: 'Your training has been marked complete by admin. Activation is the next step.',
     });
   }
+  return exports.get(partnerId);
+};
+
+exports.skipDlVerification = async (id, reason, adminId = null) => {
+  const partnerId = Number(id);
+  const partner = await prisma.partner.findUnique({ where: { id: partnerId } });
+  if (!partner) throw ApiError.notFound('Partner not found');
+
+  const admin = adminId
+    ? await prisma.admin.findUnique({ where: { id: Number(adminId) }, select: { name: true } })
+    : null;
+  const note = reason?.trim() || 'Skipped by admin';
+  const suffix = admin?.name ? ` (${admin.name})` : '';
+
+  await prisma.partnerDocument.upsert({
+    where: { partnerId },
+    create: {
+      partnerId,
+      dlSkippedAt: new Date(),
+      dlSkipReason: `${note}${suffix}`,
+    },
+    update: {
+      dlSkippedAt: new Date(),
+      dlSkipReason: `${note}${suffix}`,
+    },
+  });
+
+  const notifications = require('../notifications/notifications.service');
+  await notifications.create({
+    partnerId,
+    type: 'kyc',
+    title: 'Driving license step skipped',
+    body: 'Admin has skipped DL verification for your onboarding. Continue with bank verification.',
+  });
+
   return exports.get(partnerId);
 };
 

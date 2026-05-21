@@ -18,6 +18,15 @@ const generateAadhaarOtpSchema = z.object({
       .trim()
       .transform((s) => s.replace(/\s/g, ''))
       .refine((s) => /^\d{12}$/.test(s), 'Aadhaar must be 12 digits'),
+    /// Front-of-card image URL. Required so the backend can OCR-check
+    /// the number BEFORE burning a QuickeKYC OTP credit on a partner
+    /// who uploaded a non-Aadhaar photo (e.g. a screenshot, selfie, etc).
+    imageUrl: imageUrlSchema,
+    /// Back-of-card image URL. Backend OCR-checks for UIDAI markers
+    /// (uidai.gov.in, "Unique Identification Authority", 1947 helpline)
+    /// — the number isn't reliably printed on every Aadhaar back, but
+    /// those strings always are.
+    backImageUrl: imageUrlSchema,
   }),
 });
 
@@ -60,11 +69,17 @@ const verifyDlSchema = z.object({
       .trim()
       .min(5, 'Driving license number is too short')
       .max(30),
-    /// YYYY-MM-DD; QuickeKYC rejects other formats with 422.
+    /// Accept either DD-MM-YYYY (what the partner-app form takes —
+    /// natural for Indian date entry) or YYYY-MM-DD (the ISO form,
+    /// used by admin tooling). The service normalises to YYYY-MM-DD
+    /// before calling QuickeKYC, which rejects everything else with 422.
     dob: z
       .string()
       .trim()
-      .regex(/^\d{4}-\d{2}-\d{2}$/, 'Date of birth must be in YYYY-MM-DD format'),
+      .regex(
+        /^(\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2})$/,
+        'Date of birth must be in DD-MM-YYYY or YYYY-MM-DD format',
+      ),
     imageUrl: imageUrlSchema,
   }),
 });

@@ -76,6 +76,13 @@ const trainingStatusSchema = z.object({
   }),
 });
 
+const skipDlSchema = z.object({
+  params: z.object({ id: z.coerce.number().int().positive() }),
+  body: z.object({
+    reason: z.string().trim().min(3).max(500).optional(),
+  }).default({}),
+});
+
 /// Admin-only category reassignment. Partners can't edit their own
 /// category from the partner-app (it's set during onboarding and
 /// locked from then on); only admin can move them between trades
@@ -151,6 +158,7 @@ module.exports = {
   rejectSchema,
   onboardingFeeSchema,
   trainingStatusSchema,
+  skipDlSchema,
   updateDocumentsSchema,
   updateCategorySchema,
   createSchema,

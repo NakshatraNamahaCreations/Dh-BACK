@@ -728,7 +728,19 @@ exports.listMine = async ({ customerId, status, bucket }) => {
   if (bucket === 'upcoming') {
     where.status = { in: ['PENDING', 'CONFIRMED', 'IN_PROGRESS'] };
   } else if (bucket === 'past') {
-    where.status = { in: ['COMPLETED', 'CANCELLED'] };
+    /// Past = completed jobs + cancellations the user can act on.
+    /// Hide system-driven cancellations (no-pay timeout, fresh-attempt
+    /// supersede, no-partner-accepted broadcast expiry) — those rows
+    /// populate `noPartnerReason`. User-driven cancels and admin-driven
+    /// cancels go through `notes` and leave `noPartnerReason` null, so
+    /// they still appear here. The rows stay in the DB for audit /
+    /// support / fraud detection — we just stop surfacing them to the
+    /// customer who didn't make the decision.
+    delete where.status;
+    where.OR = [
+      { status: 'COMPLETED' },
+      { status: 'CANCELLED', noPartnerReason: null },
+    ];
   }
 
   /// Most-recent-first across both buckets — a customer who just
@@ -833,16 +845,23 @@ exports.cancelOwn = async ({ customerId, id, reason }) => {
   /// so calling unconditionally is safe.
   await tryRefund(id, reason ?? 'Customer cancelled');
 
+  /// Snapshot who was watching this offer BEFORE clearing Redis —
+  /// cancelAllForBooking wipes the visibleTo set, so we must read
+  /// the audience first or the broadcast below has nobody to notify.
+  const offerAudience = await dispatchRegistry.listPartnersForBooking(id).catch(() => []);
+
   /// Tear down the dispatch queue + clear the partner offers set in
   /// Redis. Without this, partners who had the booking in their
   /// `partner:offers:{id}` set continue to see the JobAlert on
-  /// their next 5s poll because that set isn't joined against
-  /// booking.status. Fire-and-forget — the row is already CANCELLED
-  /// and the dispatcher's `dispatch.claimed` broadcast handles the
-  /// live-modal case for any partner currently looking at the offer.
+  /// their next 5s poll because that set isn't joined against booking.status.
   dispatcher.cancelAllForBooking(id).catch((err) => {
     console.warn(`Cancel dispatch teardown failed for booking ${id}: ${err.message}`);
   });
+
+  /// Push a dispatch.claimed event to every partner who had this offer
+  /// on their screen so the JobAlertModal closes immediately instead of
+  /// waiting for the next 30s poll.
+  dispatcher.broadcastClaimed(offerAudience, { bookingId: id, partnerId: null });
 
   /// If a partner had accepted this booking, tell them it's gone.
   /// Without this they'd find out only when their app polls and the
@@ -1830,7 +1849,18 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
 exports.partnerMine = async ({ partnerId, bucket }) => {
   const where = { partnerId };
   if (bucket === 'active') where.status = { in: ['CONFIRMED', 'IN_PROGRESS'] };
-  else if (bucket === 'history') where.status = { in: ['COMPLETED', 'CANCELLED'] };
+  else if (bucket === 'history') {
+    /// History = jobs the partner actually owned. Hide system-driven
+    /// cancellations (no-pay timeout, etc.) so the partner doesn't see
+    /// "you accepted but customer ghosted" rows piling up — those
+    /// weren't the partner's fault and shouldn't count against their
+    /// completion rate. Same signal as customer-side listMine:
+    /// `noPartnerReason` non-null = system cancel.
+    where.OR = [
+      { status: 'COMPLETED' },
+      { status: 'CANCELLED', noPartnerReason: null },
+    ];
+  }
 
   const bookings = await prisma.booking.findMany({
     where,

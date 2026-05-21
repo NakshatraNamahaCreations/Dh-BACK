@@ -76,3 +76,8 @@ exports.setTrainingStatus = asyncHandler(async (req, res) => {
   });
   success(res, item, req.body.completed ? 'Training marked complete' : 'Training reset to pending');
 });
+
+exports.skipDlVerification = asyncHandler(async (req, res) => {
+  const item = await service.skipDlVerification(req.params.id, req.body?.reason, req.user.sub);
+  success(res, item, 'Driving license verification skipped');
+});

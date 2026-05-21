@@ -39,6 +39,12 @@ exports.updateMe = asyncHandler(async (req, res) => {
   success(res, result, 'Profile updated');
 });
 
+exports.registerPushToken = asyncHandler(async (req, res) => {
+  const { token } = req.body;
+  await authService.registerPushToken(req.user, token);
+  success(res, { ok: true });
+});
+
 exports.partnerPaymentDone = asyncHandler(async (req, res) => {
   const result = await authService.partnerPaymentDone(req.user.sub);
   success(res, result, 'Payment confirmed. Welcome to Dhoond!');

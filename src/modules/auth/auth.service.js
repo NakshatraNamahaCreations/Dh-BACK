@@ -175,7 +175,7 @@ const hasRequiredPartnerDocuments = (document) =>
   Boolean(
     document?.aadharNumber &&
     document?.panNumber &&
-    document?.dlNumber &&
+    (document?.dlVerifiedAt || document?.dlSkippedAt) &&
     document?.bankAccount &&
     document?.bankIfsc,
   );
@@ -278,6 +278,15 @@ const partnerPaymentDone = async (partnerId) => {
   return { type: 'PARTNER', user: updated };
 };
 
+const registerPushToken = async ({ sub, type }, token) => {
+  if (!token || !token.startsWith('ExponentPushToken[')) return;
+  if (type === 'CUSTOMER') {
+    await prisma.customer.update({ where: { id: sub }, data: { expoPushToken: token } });
+  } else if (type === 'PARTNER') {
+    await prisma.partner.update({ where: { id: sub }, data: { expoPushToken: token } });
+  }
+};
+
 module.exports = {
   customerSendOtp,
   customerVerifyOtp,
@@ -287,4 +296,5 @@ module.exports = {
   me,
   updateMe,
   partnerPaymentDone,
+  registerPushToken,
 };

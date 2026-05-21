@@ -12,8 +12,9 @@
  *   2. POST /api/v1/aadhaar-v2/submit-otp
  *      Partner enters the OTP; QuickeKYC returns the full Aadhaar
  *      profile (name, DOB, gender, address). We snapshot the verified
- *      number + name + DOB onto PartnerDocument and flip kycStatus to
- *      'verified'.
+ *      number + name + DOB onto PartnerDocument and mark Aadhaar
+ *      specifically verified. The aggregate kycStatus remains pending
+ *      until bank verification succeeds.
  *
  *   3. POST /api/v1/pan/pan_advance
  *      Single-shot PAN verification. Returns holder name + DOB; we
@@ -37,8 +38,46 @@ const prisma = require('../../config/prisma');
 const ApiError = require('../../utils/ApiError');
 const env = require('../../config/env');
 const logger = require('../../config/logger');
+const { nameSimilarity, NAME_MATCH_THRESHOLD } = require('./nameMatch');
 
 const PROVIDER = 'quickekyc';
+
+/// Look up the partner's UIDAI-verified name (set on Aadhaar OTP submit).
+/// Returns null if Aadhaar wasn't verified yet on this account — in
+/// which case downstream KYC checks skip the name match (there's nothing
+/// to compare against). Legacy partners verified before the aadharName
+/// migration also fall through this null path.
+const getAadhaarVerifiedName = async (partnerId) => {
+  const doc = await prisma.partnerDocument.findUnique({
+    where: { partnerId: Number(partnerId) },
+    select: { aadharName: true },
+  });
+  return doc?.aadharName ?? null;
+};
+
+/// Throws if the holder name returned by QuickeKYC for a non-Aadhaar
+/// doc doesn't match the partner's Aadhaar-verified name. Backend-side
+/// enforcement is the source of truth — the partner-app does the same
+/// check for fast UX, but only this gate prevents the verified-at
+/// timestamp from being written. `docLabel` shapes the error message
+/// ("DL", "PAN", "bank account") so it's actionable for the partner.
+const assertNameMatchesAadhaar = async ({ partnerId, holderName, docLabel }) => {
+  if (!holderName) return;
+  const aadhaarName = await getAadhaarVerifiedName(partnerId);
+  if (!aadhaarName) return; /// Aadhaar not verified or legacy row — skip.
+  const sim = nameSimilarity(holderName, aadhaarName);
+  if (sim < NAME_MATCH_THRESHOLD) {
+    logger.warn(
+      `[kyc] ${docLabel} name-match=${Math.round(sim * 100)}% (need ≥${Math.round(
+        NAME_MATCH_THRESHOLD * 100,
+      )}%) — "${holderName}" vs Aadhaar "${aadhaarName}"`,
+    );
+    throw ApiError.badRequest(
+      `Name on ${docLabel} "${holderName}" doesn't match your Aadhaar name "${aadhaarName}". ` +
+        `Please ensure you're using your own ${docLabel}.`,
+    );
+  }
+};
 
 const ensureConfigured = () => {
   if (!env.QUICKEKYC_API_TOKEN) {
@@ -112,11 +151,45 @@ const post = async (path, body) => {
 /// Step 1 of Aadhaar verification — send the OTP to the linked
 /// mobile. Returns the `request_id` the client passes back into
 /// submitAadhaarOtp.
-exports.generateAadhaarOtp = async ({ partnerId, aadhaarNumber }) => {
+exports.generateAadhaarOtp = async ({ partnerId, aadhaarNumber, imageUrl, backImageUrl }) => {
   ensureConfigured();
   const digits = String(aadhaarNumber).replace(/\D/g, '');
   if (digits.length !== 12) {
     throw ApiError.badRequest('Aadhaar number must be 12 digits.');
+  }
+  if (!imageUrl) {
+    throw ApiError.badRequest('Front-of-Aadhaar photo is required.');
+  }
+  if (!backImageUrl) {
+    throw ApiError.badRequest('Back-of-Aadhaar photo is required.');
+  }
+
+  /// OCR gate — run BOTH checks in parallel before any QuickeKYC call:
+  ///   front: the 12-digit number must appear on the uploaded image
+  ///   back:  at least one UIDAI marker (uidai.gov.in, "Unique
+  ///          Identification Authority", or the 1947 helpline) must
+  ///          appear — the number isn't reliably printed on every back
+  ///          layout, but those strings always are.
+  ///
+  /// The catch-then-found:true fallback keeps the flow alive if the
+  /// OCR worker itself crashes — a real Aadhaar with a stray OCR
+  /// failure shouldn't be blocked from generating an OTP.
+  const ocr = require('./ocr.service');
+  const [frontOcr, backOcr] = await Promise.all([
+    ocr.numberExistsInImage(imageUrl, digits).catch(() => ({ found: true })),
+    ocr.aadhaarBackMarkersInImage(backImageUrl).catch(() => ({ found: true })),
+  ]);
+  if (!frontOcr.found) {
+    throw ApiError.badRequest(
+      'Please upload a valid Aadhaar front image — the 12-digit number you entered ' +
+      'was not detected on the uploaded front photo.',
+    );
+  }
+  if (!backOcr.found) {
+    throw ApiError.badRequest(
+      'Please upload a valid Aadhaar back image — the back side with the address ' +
+      'and QR code (containing the UIDAI footer) was not detected on the uploaded photo.',
+    );
   }
 
   const { body } = await post('/api/v1/aadhaar-v2/generate-otp', { id_number: digits });
@@ -124,24 +197,33 @@ exports.generateAadhaarOtp = async ({ partnerId, aadhaarNumber }) => {
     throw ApiError.badRequest(body?.message || 'Could not send Aadhaar OTP. Check the number.');
   }
 
-  /// Stash the in-flight Aadhaar number + photo against the
-  /// request_id on the partner row so step 2 can verify the OTP
-  /// came from the same intent. The card photo (`aadharImageUrl`)
-  /// is saved here on the generate step — submit-otp overwrites
-  /// `selfieUrl` with the UIDAI face crop separately, but the
-  /// partner-supplied card scan stays on `aadharImageUrl`.
+  const existingDoc = await prisma.partnerDocument.findUnique({
+    where: { partnerId: Number(partnerId) },
+    select: { bankVerifiedAt: true, kycVerifiedAt: true },
+  });
+
+  /// Stash the in-flight Aadhaar number + both photo URLs against the
+  /// request_id on the partner row so step 2 can verify the OTP came
+  /// from the same intent. submit-otp overwrites `selfieUrl` with the
+  /// UIDAI face crop separately, but the partner-supplied card scans
+  /// stay on `aadharImageUrl` / `aadharBackImageUrl`.
   await prisma.partnerDocument.upsert({
     where: { partnerId: Number(partnerId) },
     create: {
       partnerId: Number(partnerId),
       aadharNumber: digits,
+      aadharImageUrl: imageUrl,
+      aadharBackImageUrl: backImageUrl,
       kycProvider: PROVIDER,
       kycStatus: 'pending',
     },
     update: {
       aadharNumber: digits,
+      aadharImageUrl: imageUrl,
+      aadharBackImageUrl: backImageUrl,
       kycProvider: PROVIDER,
-      kycStatus: 'pending',
+      kycStatus: existingDoc?.bankVerifiedAt ? 'verified' : 'pending',
+      kycVerifiedAt: existingDoc?.bankVerifiedAt ? (existingDoc.kycVerifiedAt ?? existingDoc.bankVerifiedAt) : null,
     },
   });
 
@@ -174,10 +256,12 @@ const normaliseProfileImage = (raw) => {
 };
 
 /// Step 2 of Aadhaar — submit the OTP. On success we receive the
-/// full profile and snapshot the key fields onto PartnerDocument +
-/// flip kycStatus to verified. The holder's photo (`profile_image`)
-/// is saved straight into `aadharImageUrl` so the partner doesn't
-/// have to upload an Aadhaar card scan separately.
+/// full profile and snapshot the key fields onto PartnerDocument.
+/// Aadhaar gets its own verified timestamp, but the aggregate
+/// `kycStatus` stays pending until the final bank verification step.
+/// The holder's photo (`profile_image`) is saved straight into
+/// `aadharImageUrl` so the partner doesn't have to upload an Aadhaar
+/// card scan separately.
 exports.submitAadhaarOtp = async ({ partnerId, requestId, otp }) => {
   ensureConfigured();
   if (!requestId || !otp) {
@@ -201,7 +285,7 @@ exports.submitAadhaarOtp = async ({ partnerId, requestId, otp }) => {
   /// canonical 12-digit value we'll uniqueness-check against.
   const pending = await prisma.partnerDocument.findUnique({
     where: { partnerId: Number(partnerId) },
-    select: { aadharNumber: true },
+    select: { aadharNumber: true, bankVerifiedAt: true, kycVerifiedAt: true },
   });
   if (pending?.aadharNumber) {
     await ensureNumberAvailable({
@@ -213,34 +297,102 @@ exports.submitAadhaarOtp = async ({ partnerId, requestId, otp }) => {
     });
   }
 
-  const noteJson = {
-    fullName: data.full_name ?? null,
-    dob: data.dob ?? null,
-    gender: data.gender ?? null,
-    address: data.address ?? null,
-    referenceId: data.reference_id ?? null,
-    verifiedAt: new Date().toISOString(),
+  /// Gate the verified write on Basic-Details-name match. UIDAI OTP
+  /// proves the partner owns the Aadhaar mobile, but the *name* they
+  /// typed in the Personal Info screen might differ from the UIDAI
+  /// record (typo, nickname, missing surname). Without this gate the
+  /// row gets marked verified even when the partner saw a mismatch
+  /// error in the app — admin would then see "Verified" on what the
+  /// partner believed was rejected.
+  ///
+  /// Marker phrase `Aadhaar name` in the message is what the partner-app
+  /// matches on to show the "Go to Basic Details" CTA, so keep the
+  /// wording consistent here.
+  const aadhaarFullName = data.full_name ? String(data.full_name).trim() : null;
+  if (aadhaarFullName) {
+    const partner = await prisma.partner.findUnique({
+      where: { id: Number(partnerId) },
+      select: { name: true },
+    });
+    if (partner?.name) {
+      const sim = nameSimilarity(aadhaarFullName, partner.name);
+      if (sim < NAME_MATCH_THRESHOLD) {
+        logger.warn(
+          `[kyc.aadhaar] name-match=${Math.round(sim * 100)}% (need ≥${Math.round(
+            NAME_MATCH_THRESHOLD * 100,
+          )}%) — Aadhaar "${aadhaarFullName}" vs profile "${partner.name}"`,
+        );
+        /// Mark the row explicitly rejected BEFORE throwing so admin UI
+        /// shows "Rejected" instead of stale "Pending" / a leftover
+        /// "Verified" badge from a prior attempt. aadharVerifiedAt
+        /// stays null. kycNote captures the reason for admin review.
+        const rejectMessage = `Name mismatch — Aadhaar "${aadhaarFullName}" vs profile "${partner.name}"`;
+        await prisma.partnerDocument.update({
+          where: { partnerId: Number(partnerId) },
+          data: {
+            kycProvider: PROVIDER,
+            kycStatus: 'rejected',
+            kycRejectedAt: new Date(),
+            kycVerifiedAt: null,
+            aadharVerifiedAt: null,
+            kycNote: rejectMessage,
+          },
+        });
+        throw ApiError.badRequest(
+          `Name on Aadhaar "${aadhaarFullName}" doesn't match your profile name "${partner.name}". ` +
+            `Please update your name in Basic Details to match your Aadhaar, then verify again.`,
+        );
+      }
+    }
+  }
+
+  /// Flatten the Aadhaar address object into a single human-readable
+  /// string. QuickeKYC returns it as { house, street, landmark, vtc,
+  /// po, district, subdist, state, country, pincode } — null fields
+  /// are dropped, present ones are joined with ", " in mailing order.
+  const flattenAddress = (addr) => {
+    if (!addr || typeof addr !== 'object') return null;
+    const parts = [
+      addr.house,
+      addr.street,
+      addr.landmark,
+      addr.vtc,
+      addr.po,
+      addr.subdist,
+      addr.district,
+      addr.state,
+      addr.country,
+      addr.pincode,
+    ]
+      .map((p) => (p ? String(p).trim() : ''))
+      .filter(Boolean);
+    return parts.length ? parts.join(', ') : null;
   };
 
   await prisma.partnerDocument.update({
     where: { partnerId: Number(partnerId) },
     data: {
       kycProvider: PROVIDER,
-      kycStatus: 'verified',
-      kycVerifiedAt: new Date(),
+      kycStatus: pending?.bankVerifiedAt ? 'verified' : 'pending',
+      kycVerifiedAt: pending?.bankVerifiedAt ? (pending.kycVerifiedAt ?? pending.bankVerifiedAt) : null,
       kycRejectedAt: null,
-      kycNote: JSON.stringify(noteJson),
+      /// Clear the rejection note from any prior name-mismatch attempt
+      /// — the partner has now successfully re-verified after fixing
+      /// their Basic Details name.
+      kycNote: null,
       /// Mark Aadhaar specifically verified so per-doc badges and
       /// the uniqueness check above can rely on a definite signal.
       aadharVerifiedAt: new Date(),
-      /// QuickeKYC's `profile_image` is the holder's face crop from
-      /// UIDAI — not a full Aadhaar card scan. Storing it as the
-      /// partner's `selfieUrl` (their profile photo) is the honest
-      /// placement: it IS their official photo, just sourced from a
-      /// government record instead of a phone camera. We don't write
-      /// to `aadharImageUrl` since QuickeKYC doesn't expose the full
-      /// card image.
-      ...(imageUrl ? { selfieUrl: imageUrl } : {}),
+      /// Extracted snapshot fields. Captured here so admin can display
+      /// + filter without re-calling QuickeKYC.
+      aadharName: data.full_name ? String(data.full_name).trim() : null,
+      aadharDob: data.dob ?? null,
+      aadharGender: data.gender ?? null,
+      aadharAddress: flattenAddress(data.address),
+      /// `selfieUrl` and the full provider payload are deliberately
+      /// NOT persisted — every QuickeKYC field we care about is already
+      /// captured by the four columns above. Storing the JSON again
+      /// would just duplicate the data.
     },
   });
 
@@ -273,11 +425,26 @@ exports.saveAadhaarPhotos = async ({ partnerId, imageUrl, backImageUrl }) => {
   }
   const existing = await prisma.partnerDocument.findUnique({
     where: { partnerId: Number(partnerId) },
-    select: { aadharVerifiedAt: true },
+    select: { aadharVerifiedAt: true, aadharNumber: true },
   });
   if (!existing?.aadharVerifiedAt) {
     throw ApiError.badRequest('Verify your Aadhaar via OTP before uploading photos.');
   }
+
+  /// OCR check — confirm the Aadhaar number appears in the front photo.
+  /// Aadhaar numbers can appear as "XXXX XXXX XXXX" or without spaces;
+  /// ocr.service normalises both before comparing.
+  if (existing.aadharNumber) {
+    const ocr = require('./ocr.service');
+    const ocrResult = await ocr.numberExistsInImage(imageUrl, existing.aadharNumber).catch(() => ({ found: true }));
+    if (!ocrResult.found) {
+      throw ApiError.badRequest(
+        `Aadhaar number ${existing.aadharNumber} was not detected in the uploaded front photo. ` +
+        `Please upload a clear photo of your Aadhaar card — the 12-digit number must be readable.`,
+      );
+    }
+  }
+
   await prisma.partnerDocument.update({
     where: { partnerId: Number(partnerId) },
     data: {
@@ -296,8 +463,6 @@ exports.saveAadhaarPhotos = async ({ partnerId, imageUrl, backImageUrl }) => {
 exports.verifyPan = async ({ partnerId, panNumber, imageUrl }) => {
   ensureConfigured();
   const pan = String(panNumber).toUpperCase().replace(/\s/g, '');
-  /// 10-char ABCDE1234F format. Stop obvious typos before hitting
-  /// the third-party (saves credit + latency).
   if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) {
     throw ApiError.badRequest('PAN must follow ABCDE1234F format.');
   }
@@ -305,7 +470,29 @@ exports.verifyPan = async ({ partnerId, panNumber, imageUrl }) => {
     throw ApiError.badRequest('PAN card photo is required.');
   }
 
-  const { body } = await post('/api/v1/pan/pan', { id_number: pan });
+  /// Run OCR + QuickeKYC in parallel — OCR on the uploaded image,
+  /// QuickeKYC against the NSDL database. Both start at the same time
+  /// so the OCR check adds zero extra wall-clock latency.
+  const ocr = require('./ocr.service');
+  const [ocrResult, apiResult] = await Promise.all([
+    ocr.numberExistsInImage(imageUrl, pan).catch(() => ({ found: true })),
+    post('/api/v1/pan/pan', { id_number: pan }),
+  ]);
+
+  if (!ocrResult.found) {
+    /// Soft gate — same rationale as DL. Tesseract.js misreads PAN
+    /// numbers on real cards often enough that hard-blocking traps
+    /// legitimate partners. QuickeKYC's NSDL lookup is the real
+    /// truth check, and the downstream Aadhaar-name-match catches
+    /// someone uploading another person's PAN. Logged so admin can
+    /// audit if needed.
+    logger.warn(
+      `[kyc.pan] OCR could not detect PAN ${pan} on uploaded image — ` +
+      `proceeding because QuickeKYC + name-match will gate identity.`,
+    );
+  }
+
+  const { body } = apiResult;
   if (body?.status !== 'success' || !body?.data) {
     throw ApiError.badRequest(body?.message || 'PAN verification failed.');
   }
@@ -322,6 +509,22 @@ exports.verifyPan = async ({ partnerId, panNumber, imageUrl }) => {
   });
 
   const data = body.data;
+  const panHolderName = data.full_name ? String(data.full_name).trim() : null;
+  /// `address` is only present on pan_advance responses. Lite returns
+  /// just full_name + category; the column stays null until the
+  /// endpoint is upgraded. Captured here so admin UI doesn't need a
+  /// follow-up code change when that flip happens.
+  const panAddress = data.address ? String(data.address).trim() : null;
+  /// PAN Lite returns a one-word category: person / company / huf /
+  /// firm / trust / government / association. Persisting it as a flat
+  /// column means we no longer need a raw JSON blob just for this one
+  /// field.
+  const panCategory = data.category ? String(data.category).trim() : null;
+
+  /// Gate the verified write on Aadhaar name match. Throws on mismatch
+  /// — the upsert below never runs and `panVerifiedAt` stays null, so
+  /// admin doesn't see a "Verified" badge on a rejected document.
+  await assertNameMatchesAadhaar({ partnerId, holderName: panHolderName, docLabel: 'PAN' });
   await prisma.partnerDocument.upsert({
     where: { partnerId: Number(partnerId) },
     create: {
@@ -330,12 +533,18 @@ exports.verifyPan = async ({ partnerId, panNumber, imageUrl }) => {
       panImageUrl: imageUrl,
       kycProvider: PROVIDER,
       panVerifiedAt: new Date(),
+      ...(panHolderName ? { panHolderName } : {}),
+      ...(panAddress ? { panAddress } : {}),
+      ...(panCategory ? { panCategory } : {}),
     },
     update: {
       panNumber: pan,
       panImageUrl: imageUrl,
       kycProvider: PROVIDER,
       panVerifiedAt: new Date(),
+      ...(panHolderName ? { panHolderName } : {}),
+      ...(panAddress ? { panAddress } : {}),
+      ...(panCategory ? { panCategory } : {}),
     },
   });
 
@@ -363,26 +572,50 @@ exports.verifyDrivingLicense = async ({ partnerId, dlNumber, dob, imageUrl: card
   if (dl.length < 5) {
     throw ApiError.badRequest('Driving license number looks too short.');
   }
-  /// QuickeKYC expects YYYY-MM-DD.
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dob))) {
-    throw ApiError.badRequest('Date of birth must be in YYYY-MM-DD format.');
+  /// QuickeKYC expects YYYY-MM-DD. Partner-app sends DD-MM-YYYY
+  /// (natural Indian date entry); admin tooling sends YYYY-MM-DD.
+  /// Normalise both to ISO before hitting the provider.
+  const dobIso = String(dob).trim();
+  let dobForApi;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dobIso)) {
+    dobForApi = dobIso;
+  } else if (/^\d{2}-\d{2}-\d{4}$/.test(dobIso)) {
+    const [dd, mm, yyyy] = dobIso.split('-');
+    dobForApi = `${yyyy}-${mm}-${dd}`;
+  } else {
+    throw ApiError.badRequest('Date of birth must be in DD-MM-YYYY or YYYY-MM-DD format.');
   }
   if (!cardImageUrl) {
     throw ApiError.badRequest('Driving license photo is required.');
   }
 
-  const { body } = await post('/api/v1/driving-license/driving-license', {
-    id_number: dl,
-    dob: String(dob),
-  });
+  /// OCR + QuickeKYC in parallel — same pattern as PAN.
+  /// OCR is a SOFT gate for DL: tesseract.js has accuracy issues reading
+  /// DL numbers from glossy laminated cards (glare, font, proximity to
+  /// photo), so a real DL can fail OCR even when QuickeKYC + name-match
+  /// would happily verify it. We still run OCR for logging / future
+  /// audit, but rely on the RTO verification + Aadhaar-name-match below
+  /// to catch the real abuse cases (someone uploading another person's
+  /// DL). If OCR fails on a wrong upload, QuickeKYC will return
+  /// "not found" anyway.
+  const ocr = require('./ocr.service');
+  const [ocrResult, apiResult] = await Promise.all([
+    ocr.numberExistsInImage(cardImageUrl, dl).catch(() => ({ found: true })),
+    post('/api/v1/driving-license/driving-license', { id_number: dl, dob: dobForApi }),
+  ]);
+
+  if (!ocrResult.found) {
+    logger.warn(
+      `[kyc.dl] OCR could not detect DL number ${dl} on uploaded image — ` +
+      `proceeding because QuickeKYC + name-match will gate identity.`,
+    );
+  }
+
+  const { body } = apiResult;
   if (body?.status !== 'success' || !body?.data) {
     throw ApiError.badRequest(body?.message || 'DL verification failed.');
   }
 
-  /// QuickeKYC sometimes returns status_code 422 inside a "success"
-  /// envelope when the DL number is malformed but their parser
-  /// didn't reject outright — guard explicitly on the presence of
-  /// the holder's name.
   const data = body.data;
   if (!data.name) {
     throw ApiError.badRequest('DL verification failed. Check the number and date of birth.');
@@ -399,18 +632,18 @@ exports.verifyDrivingLicense = async ({ partnerId, dlNumber, dob, imageUrl: card
     label: 'Driving license',
   });
 
-  const imageUrl = normaliseProfileImage(data.profile_image);
+  const dlHolderName = data.name ? String(data.name).trim() : null;
 
-  /// Decide where the DL photo goes. It's the holder's face (RTO
-  /// portrait), not a card scan, so semantically it's a profile
-  /// photo. We only write it to `selfieUrl` when the partner doesn't
-  /// already have one — Aadhaar verification is the higher-trust
-  /// source (UIDAI) so its photo wins if it ran first.
-  const existing = await prisma.partnerDocument.findUnique({
-    where: { partnerId: Number(partnerId) },
-    select: { selfieUrl: true },
-  });
-  const writeSelfie = imageUrl && !existing?.selfieUrl;
+  /// Gate the verified write on Aadhaar name match. Throws on mismatch
+  /// — the upsert below never runs and `dlVerifiedAt` stays null, so
+  /// admin doesn't see a "Verified" badge on a rejected document.
+  await assertNameMatchesAadhaar({ partnerId, holderName: dlHolderName, docLabel: 'driving license' });
+
+  /// Keep only the DL permanent address from QuickeKYC. Other DL
+  /// profile fields are deliberately not stored.
+  const dlSnapshot = {
+    dlPermanentAddress: data.permanent_address ?? null,
+  };
 
   await prisma.partnerDocument.upsert({
     where: { partnerId: Number(partnerId) },
@@ -420,14 +653,20 @@ exports.verifyDrivingLicense = async ({ partnerId, dlNumber, dob, imageUrl: card
       dlImageUrl: cardImageUrl,
       kycProvider: PROVIDER,
       dlVerifiedAt: new Date(),
-      ...(writeSelfie ? { selfieUrl: imageUrl } : {}),
+      dlSkippedAt: null,
+      dlSkipReason: null,
+      ...dlSnapshot,
+      ...(dlHolderName ? { dlHolderName } : {}),
     },
     update: {
       dlNumber: dl,
       dlImageUrl: cardImageUrl,
       kycProvider: PROVIDER,
       dlVerifiedAt: new Date(),
-      ...(writeSelfie ? { selfieUrl: imageUrl } : {}),
+      dlSkippedAt: null,
+      dlSkipReason: null,
+      ...dlSnapshot,
+      ...(dlHolderName ? { dlHolderName } : {}),
     },
   });
 
@@ -447,7 +686,9 @@ exports.verifyDrivingLicense = async ({ partnerId, dlNumber, dob, imageUrl: card
     vehicleClasses: data.vehicle_classes ?? [],
     issuedOn: data.doi ?? null,
     expiresOn: data.doe ?? null,
-    imageUrl,
+    /// imageUrl intentionally dropped — we no longer persist the RTO
+    /// portrait or expose it back to the client.
+    imageUrl: null,
   };
 };
 
@@ -519,6 +760,21 @@ exports.verifyBankAccount = async ({ partnerId, accountNumber, ifsc, imageUrl })
     throw ApiError.badRequest('Bank returned no holder name — please double-check the account number and IFSC.');
   }
 
+  /// Gate the verified write on Aadhaar name match. Throws on mismatch
+  /// — the upsert below never runs and `bankVerifiedAt` stays null, so
+  /// admin doesn't see a "Verified" badge on a rejected account.
+  await assertNameMatchesAadhaar({ partnerId, holderName, docLabel: 'bank account' });
+
+  /// Extracted bank-verify snapshot. `ifsc_details` is whatever
+  /// QuickeKYC sends back (branch / city / IFSC metadata when
+  /// available) — stored as Json since the shape varies by bank.
+  const bankSnapshot = {
+    bankAccountExists: typeof data.account_exists === 'boolean' ? data.account_exists : null,
+    bankUpiId: data.upi_id ? String(data.upi_id).trim() : null,
+    bankRemarks: data.remarks ? String(data.remarks).trim() : null,
+    bankIfscDetails: data.ifsc_details && typeof data.ifsc_details === 'object' ? data.ifsc_details : null,
+  };
+
   await prisma.partnerDocument.upsert({
     where: { partnerId: Number(partnerId) },
     create: {
@@ -528,7 +784,12 @@ exports.verifyBankAccount = async ({ partnerId, accountNumber, ifsc, imageUrl })
       bankAccountHolder: holderName,
       bankPassbookUrl: imageUrl,
       kycProvider: PROVIDER,
+      kycStatus: 'verified',
+      kycVerifiedAt: new Date(),
+      kycRejectedAt: null,
+      kycNote: null,
       bankVerifiedAt: new Date(),
+      ...bankSnapshot,
     },
     update: {
       bankAccount: acc,
@@ -536,7 +797,12 @@ exports.verifyBankAccount = async ({ partnerId, accountNumber, ifsc, imageUrl })
       bankAccountHolder: holderName,
       bankPassbookUrl: imageUrl,
       kycProvider: PROVIDER,
+      kycStatus: 'verified',
+      kycVerifiedAt: new Date(),
+      kycRejectedAt: null,
+      kycNote: null,
       bankVerifiedAt: new Date(),
+      ...bankSnapshot,
     },
   });
 

@@ -58,17 +58,21 @@ const { sendJobOfferPushes } = require('../notifications/push.service');
 /// window — any partner who comes online in that radius can still
 /// accept up until expiry.
 ///
-///   Wave 1 (0:00)   — 3km, partner alert
-///   Wave 2 (0:15)   — 5km, partner alert
-///   Wave 3 (0:30)   — 7km, partner alert
-///   Expiry (10:00)  — booking flips to `needs_admin_dispatch`,
+///   Wave 1 (0:00)   — 3km, partner alert (1-min window to accept)
+///   Wave 2 (1:00)   — 5km, partner alert (1-min window to accept)
+///   Wave 3 (2:00)   — 7km, partner alert (1-min window to accept)
+///   Expiry (3:00)   — booking flips to `needs_admin_dispatch`,
 ///                     ops takes over from here.
+///
+/// Per-wave window is 60s — each radius gets a full minute to surface
+/// an acceptor before the next ring opens up. After wave 3's window
+/// elapses with no acceptance, the booking moves to manual dispatch.
 const DISPATCH_WAVES = [
   { wave: 1, radiusKm: 3, offsetMs: 0 },
-  { wave: 2, radiusKm: 5, offsetMs: 15 * 1000 },
-  { wave: 3, radiusKm: 7, offsetMs: 30 * 1000 },
+  { wave: 2, radiusKm: 5, offsetMs: 60 * 1000 },
+  { wave: 3, radiusKm: 7, offsetMs: 120 * 1000 },
 ];
-const DISPATCH_TOTAL_MS = 10 * 60 * 1000;
+const DISPATCH_TOTAL_MS = 3 * 60 * 1000;
 const SCHEDULE_DISPATCH_LEAD_MS = 30 * 60 * 1000;
 /// When all three waves elapse without acceptance, the booking is
 /// handed off to admin (status stays PENDING, dispatchStatus flips

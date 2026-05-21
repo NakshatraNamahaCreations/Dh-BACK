@@ -1,0 +1,15 @@
+ALTER TABLE "partner_documents"
+  DROP COLUMN IF EXISTS "dlState",
+  DROP COLUMN IF EXISTS "dlPermanentZip",
+  DROP COLUMN IF EXISTS "dlTemporaryAddress",
+  DROP COLUMN IF EXISTS "dlTemporaryZip",
+  DROP COLUMN IF EXISTS "dlCitizenship",
+  DROP COLUMN IF EXISTS "dlOlaName",
+  DROP COLUMN IF EXISTS "dlOlaCode",
+  DROP COLUMN IF EXISTS "dlGender",
+  DROP COLUMN IF EXISTS "dlFatherOrHusbandName",
+  DROP COLUMN IF EXISTS "dlDob",
+  DROP COLUMN IF EXISTS "dlDoe",
+  DROP COLUMN IF EXISTS "dlTransportDoe",
+  DROP COLUMN IF EXISTS "dlDoi",
+  DROP COLUMN IF EXISTS "dlTransportDoi";

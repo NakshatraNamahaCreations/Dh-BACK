@@ -18,6 +18,16 @@ const errorHandler = (err, req, res, next) => {
     statusCode = 400;
     message = 'Validation failed';
     details = err.flatten().fieldErrors;
+  } else if (
+    err instanceof Prisma.PrismaClientInitializationError ||
+    err instanceof Prisma.PrismaClientRustPanicError
+  ) {
+    /// Connection-level failures: DB unreachable (P1001), TLS issues,
+    /// auth (P1000), engine crash. These are infra problems — surface
+    /// as 503 so the frontend can offer a retry CTA instead of telling
+    /// the user to change their inputs.
+    statusCode = 503;
+    message = 'Service temporarily unavailable. Please try again in a moment.';
   } else if (err instanceof Prisma.PrismaClientKnownRequestError) {
     if (err.code === 'P2002') {
       statusCode = 409;
@@ -25,6 +35,14 @@ const errorHandler = (err, req, res, next) => {
     } else if (err.code === 'P2025') {
       statusCode = 404;
       message = 'Record not found';
+    } else if (
+      /// Runtime connection errors that can fire AFTER the pool has
+      /// been initialised — e.g. the network drops mid-query or the
+      /// DB closes an idle pooled connection. Same UX as init errors.
+      ['P1001', 'P1002', 'P1008', 'P1011', 'P1017'].includes(err.code)
+    ) {
+      statusCode = 503;
+      message = 'Service temporarily unavailable. Please try again in a moment.';
     } else {
       statusCode = 400;
       message = `Database error: ${err.code}`;
