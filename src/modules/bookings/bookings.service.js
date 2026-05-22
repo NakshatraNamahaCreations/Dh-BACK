@@ -163,7 +163,10 @@ const partnerHasActiveJob = async (partnerId) => {
 
 const PARTNER_INCLUDE = {
   customer: { select: { id: true, name: true, phone: true } },
-  items: true,
+  /// Service.categoryId is needed for per-category commission lookup
+  /// so the partner-app can show the actual partner share / platform
+  /// commission split on the bill view.
+  items: { include: { service: { select: { categoryId: true } } } },
   /// Join the canonical address row. New bookings store address only
   /// via `customerAddressId`; the snapshot columns on Booking are
   /// nullable + legacy. Including the relation here lets every shape
@@ -219,7 +222,51 @@ const resolveBookingAddress = (b) => {
   };
 };
 
-const partnerShape = (b, partnerCoords) => {
+/// Load category → partnerPct as a Map for synchronous lookup inside
+/// `partnerShape`. One query covers an entire list-shaping pass, so
+/// even a 50-booking response only costs a single round-trip.
+const loadCommissionMap = async () => {
+  const rules = await prisma.commissionRule.findMany({
+    select: { categoryId: true, partnerPct: true },
+  });
+  return new Map(rules.map((r) => [r.categoryId, r.partnerPct]));
+};
+
+/// Resolve the booking's fare breakdown. Prefers the persisted snapshot
+/// columns (`grandTotal`, `gstAmount`, `platformFee`) set at create time
+/// via `computeFare`. For legacy rows where those columns are null, we
+/// re-derive on the fly from `subtotal/discount/offeredPrice` using the
+/// same `computeFare` helper — so the partner-app gets a consistent
+/// breakdown regardless of when the booking was created.
+const resolveFare = (b) => {
+  const persisted = {
+    grandTotal: b.grandTotal,
+    total: b.total,
+    gstAmount: b.gstAmount,
+    platformFee: b.platformFee,
+  };
+  const anyMissing =
+    persisted.grandTotal == null ||
+    persisted.gstAmount == null ||
+    persisted.platformFee == null;
+  if (!anyMissing) return persisted;
+  const derived = computeFare({
+    subtotal: b.subtotal,
+    discount: b.discount ?? 0,
+    offeredPrice: b.offeredPrice ?? null,
+  });
+  return {
+    grandTotal: persisted.grandTotal ?? derived.grandTotal,
+    total: persisted.total ?? derived.total,
+    gstAmount: persisted.gstAmount ?? derived.gstAmount,
+    platformFee: persisted.platformFee ?? derived.platformFee,
+  };
+};
+
+/// `commissionMap` is an optional Map<categoryId, partnerPct>. When
+/// absent, falls back to the platform default (80%) so the helper
+/// remains usable in code paths that don't prefetch commission rules.
+const partnerShape = (b, partnerCoords, commissionMap) => {
   const addr = resolveBookingAddress(b);
   const bookingLat = addr.lat;
   const bookingLng = addr.lng;
@@ -233,6 +280,17 @@ const partnerShape = (b, partnerCoords) => {
     qty: i.qty,
     price: i.basePrice,
   }));
+
+  const fare = resolveFare(b);
+  const primaryCategoryId = b.items?.[0]?.service?.categoryId ?? null;
+  const partnerCommissionPct =
+    (commissionMap && primaryCategoryId != null
+      ? commissionMap.get(primaryCategoryId)
+      : undefined) ?? 80;
+  /// Floor matches the standard payout-rounding direction used by
+  /// earnings.creditForBooking — partner gets at most their fair
+  /// share, never more than the rule says.
+  const partnerEarning = Math.floor((fare.total * partnerCommissionPct) / 100);
 
   const statusMap = {
     PENDING: 'incoming',
@@ -257,7 +315,22 @@ const partnerShape = (b, partnerCoords) => {
     status: statusMap[b.status] ?? 'incoming',
     subtotal: b.subtotal,
     discount: b.discount ?? 0,
-    total: b.total,
+    /// Authoritative fare breakdown. Reads the persisted snapshot when
+    /// available, otherwise re-derives via `computeFare` so legacy rows
+    /// (created before these columns existed) don't surface NaN/0 on
+    /// the partner's bill view.
+    total: fare.total,
+    grandTotal: fare.grandTotal,
+    gstAmount: fare.gstAmount,
+    platformFee: fare.platformFee,
+    /// Partner-side earnings split for THIS booking. `partnerEarning`
+    /// is what the partner takes home for the job; `platformCommission`
+    /// is what the platform keeps out of `total`. GST and platformFee
+    /// are separate from this commission split — those come out of the
+    /// customer's payment before the partner's share is computed.
+    partnerCommissionPct,
+    partnerEarning,
+    platformCommission: fare.total - partnerEarning,
     offeredPrice: b.offeredPrice ?? null,
     /// Payment lifecycle surfaced to the partner app so the partner can
     /// see whether the customer has paid yet — drives the "Awaiting
@@ -279,6 +352,12 @@ const partnerShape = (b, partnerCoords) => {
     etaMins: km > 0 ? Math.max(1, Math.ceil((km / 25) * 60)) : 0,
     createdAt: b.createdAt,
     updatedAt: b.updatedAt,
+    /// Lifecycle timestamps — partner-app uses these to render the
+    /// earnings screen (jobs grouped by `jobCompletedAt`, duration
+    /// computed from start↔complete) and to label active-job timers.
+    /// Null until the corresponding transition has happened.
+    jobStartedAt: b.jobStartedAt ?? null,
+    jobCompletedAt: b.jobCompletedAt ?? null,
   };
 };
 
@@ -1658,9 +1737,10 @@ exports.partnerIncoming = async ({ partnerId, lat, lng }) => {
       take: 50,
     });
 
+    const commissionMap = await loadCommissionMap();
     return bookings
       .filter((b) => b.lat != null && b.lng != null)
-      .map((b) => partnerShape(b, coords))
+      .map((b) => partnerShape(b, coords, commissionMap))
       .sort((a, z) => a.distanceKm - z.distanceKm);
   }
 
@@ -1715,8 +1795,9 @@ exports.partnerIncoming = async ({ partnerId, lat, lng }) => {
 
   if (waveUpdates.length > 0) await Promise.all(waveUpdates);
 
+  const commissionMap = await loadCommissionMap();
   return visible
-    .map((b) => partnerShape(b, coords))
+    .map((b) => partnerShape(b, coords, commissionMap))
     .sort((a, z) => a.distanceKm - z.distanceKm);
 };
 
@@ -1843,7 +1924,8 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
     where: { id },
     include: PARTNER_INCLUDE,
   });
-  return partnerShape(updated, null);
+  const commissionMap = await loadCommissionMap();
+  return partnerShape(updated, null, commissionMap);
 };
 
 exports.partnerMine = async ({ partnerId, bucket }) => {
@@ -1868,7 +1950,8 @@ exports.partnerMine = async ({ partnerId, bucket }) => {
     orderBy: { updatedAt: 'desc' },
     take: 50,
   });
-  return bookings.map((b) => partnerShape(b, null));
+  const commissionMap = await loadCommissionMap();
+  return bookings.map((b) => partnerShape(b, null, commissionMap));
 };
 
 // 'enroute' and 'arrived' are purely client-side states (no separate DB enum).
@@ -1937,5 +2020,6 @@ exports.partnerUpdateStatus = async ({ bookingId, partnerId, status, otp }) => {
     }
   }
 
-  return partnerShape(updated, null);
+  const commissionMap = await loadCommissionMap();
+  return partnerShape(updated, null, commissionMap);
 };

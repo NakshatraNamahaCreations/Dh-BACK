@@ -30,7 +30,12 @@ const sendPush = async (token, { title, body, data = {} } = {}) => {
         data,
         sound: 'default',
         priority: 'high',
-        channelId: 'job-alerts-v3',
+        /// MUST match `CHANNEL_ID` in partner-app/src/services/notifications.ts.
+        /// Bumped from v3 → v4 alongside the client. Channel IDs are
+        /// immutable on Android, so when we bump the client to fix
+        /// importance-lock, the backend has to follow or pushes land
+        /// in the old (silent) channel and never alert the partner.
+        channelId: 'job-alerts-v5',
         ttl: 60,
       }),
     });

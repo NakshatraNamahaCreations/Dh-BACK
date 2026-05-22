@@ -255,6 +255,15 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
     partnerIds: candidates.map((c) => c.partnerId),
   });
 
+  /// Compute the display fields ONCE before the socket emit so the
+  /// payload can carry everything the partner-app needs to render a
+  /// rich heads-up notification without a follow-up HTTP fetch. On
+  /// Vivo/Oppo/Xiaomi the partner-app can't reliably make an HTTP
+  /// call when backgrounded — so we ship `serviceName` + `amount` in
+  /// the socket payload itself, matching what the FCM push carries.
+  const serviceName = booking.items[0]?.service?.name ?? 'Job request';
+  const amount = booking.offeredPrice ?? booking.total ?? 0;
+
   /// Push to connected partners. The gateway's emitter is responsible
   /// for figuring out which candidates have a live socket; the rest
   /// will pick up the offer via partnerIncoming polling.
@@ -265,6 +274,8 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
         wave: waveSpec.wave,
         radiusKm: waveSpec.radiusKm,
         distanceKm: c.distanceKm,
+        serviceName,
+        amount,
       });
     }
   }
@@ -273,8 +284,6 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
   /// closed or minimised. Fires after the socket emit so the
   /// connected partners get the in-app alert first; disconnected
   /// partners get the device notification instead.
-  const serviceName = booking.items[0]?.service?.name ?? 'Job request';
-  const amount = booking.offeredPrice ?? booking.total ?? 0;
   void sendJobOfferPushes(
     prisma,
     candidates.map((c) => c.partnerId),
