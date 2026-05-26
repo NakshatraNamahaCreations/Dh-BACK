@@ -30,6 +30,7 @@ const createSchema = z.object({
     addressLabel: z.string().trim().min(1).max(40).default('Home'),
     addressLine: z.string().trim().min(5, 'Full address is required').max(300).optional(),
     city: z.string().trim().min(1).max(80).optional(),
+    pincode: z.string().trim().regex(/^\d{3,8}$/, 'Invalid pincode').optional(),
     lat: z.number().min(-90).max(90).optional(),
     lng: z.number().min(-180).max(180).optional(),
 

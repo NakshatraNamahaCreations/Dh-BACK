@@ -30,6 +30,54 @@ const tryRefund = async (bookingId, reason, refundAmount = null) => {
 /// string when the customer reads it out and the partner types it.
 const generateOtp = () => String(1000 + crypto.randomInt(0, 9000));
 
+const findServiceAreaForAddress = async ({ city, pincode, cityId }) => {
+  const pin = String(pincode ?? '').trim();
+  if (pin) {
+    const pinMatch = await prisma.serviceArea.findFirst({
+      where: { pincodes: { has: pin }, active: true },
+      select: { id: true, city: true, pincodes: true, categoryIds: true },
+    });
+    if (pinMatch) return pinMatch;
+  }
+
+  if (cityId) {
+    const cityMatch = await prisma.serviceArea.findFirst({
+      where: { cityId, active: true },
+      select: { id: true, city: true, pincodes: true, categoryIds: true },
+    });
+    if (cityMatch) return cityMatch;
+  }
+
+  const cityKey = String(city ?? '').trim();
+  if (!cityKey) return null;
+  return prisma.serviceArea.findFirst({
+    where: { city: { equals: cityKey, mode: 'insensitive' }, active: true },
+    select: { id: true, city: true, pincodes: true, categoryIds: true },
+  });
+};
+
+const assertServicesAllowedInArea = async ({ services, city, pincode, cityId }) => {
+  const area = await findServiceAreaForAddress({ city, pincode, cityId });
+  if (!area) {
+    throw ApiError.badRequest('Dhoond is not live at this address yet.');
+  }
+
+  const pin = String(pincode ?? '').trim();
+  if (area.pincodes.length > 0 && (!pin || !area.pincodes.includes(pin))) {
+    throw ApiError.badRequest(`We're live in ${area.city} but not at this pincode yet.`);
+  }
+
+  if (area.categoryIds.length === 0) return;
+
+  const allowed = new Set(area.categoryIds.map(Number));
+  const blocked = services.filter((s) => !allowed.has(Number(s.categoryId)));
+  if (blocked.length > 0) {
+    throw ApiError.badRequest(
+      `This service is not available in ${area.city} yet: ${blocked.map((s) => s.name).join(', ')}`,
+    );
+  }
+};
+
 /// BYOP pay-after-accept window. When a partner accepts a booking
 /// with `offeredPrice`, the customer has this long to pay before the
 /// booking auto-cancels. 3 minutes balances "long enough to open
@@ -622,6 +670,13 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
       `One or more services are no longer available: ${inactive.map((s) => s.name).join(', ')}`,
     );
   }
+
+  await assertServicesAllowedInArea({
+    services,
+    city: saved?.city ?? inlineAddress?.city,
+    pincode: saved?.pincode ?? inlineAddress?.pincode,
+    cityId: bookingCityId,
+  });
 
   const items = payload.items.map((i) => {
     const svc = map.get(i.serviceId);
