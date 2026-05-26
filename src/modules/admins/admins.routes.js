@@ -1,7 +1,6 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
-const { authenticate, requireType } = require('../../middlewares/auth');
-const { requireRole } = require('../../middlewares/adminScope');
+const { authenticate, requireType, requirePermission } = require('../../middlewares/auth');
 const controller = require('./admins.controller');
 const notificationsController = require('../notifications/admin-notifications.controller');
 const {
@@ -40,15 +39,17 @@ router.delete('/me/notifications', notificationsController.clearAll);
 router.patch('/me/notifications/:id/read', notificationsController.markRead);
 router.delete('/me/notifications/:id', notificationsController.remove);
 
-/// Every endpoint below is SUPER-only — a CITY_MANAGER must not be
-/// able to create more admins or alter someone else's city scope.
-router.use(requireRole('SUPER'));
-
-router.get('/', validate(listQuerySchema), controller.list);
-router.post('/', validate(createSchema), controller.create);
-router.get('/:id', validate(idParam), controller.get);
-router.patch('/:id', validate(updateSchema), controller.update);
-router.put('/:id/cities', validate(setCitiesSchema), controller.setCities);
-router.post('/:id/reset-password', validate(resetPasswordSchema), controller.resetPassword);
+/// Every endpoint below manages admin accounts — gated by the `admins.*`
+/// RBAC permissions. The built-in Super Admin role carries the bypass
+/// flag, and a legacy CITY_MANAGER token is denied access-control perms,
+/// so this preserves the previous SUPER-only behaviour while letting a
+/// custom role be granted these capabilities explicitly.
+router.get('/', requirePermission('admins.view'), validate(listQuerySchema), controller.list);
+router.post('/', requirePermission('admins.create'), validate(createSchema), controller.create);
+router.get('/:id', requirePermission('admins.view'), validate(idParam), controller.get);
+router.patch('/:id', requirePermission('admins.edit'), validate(updateSchema), controller.update);
+router.delete('/:id', requirePermission('admins.delete'), validate(idParam), controller.remove);
+router.put('/:id/cities', requirePermission('admins.edit'), validate(setCitiesSchema), controller.setCities);
+router.post('/:id/reset-password', requirePermission('admins.edit'), validate(resetPasswordSchema), controller.resetPassword);
 
 module.exports = router;

@@ -31,6 +31,14 @@ exports.getOwn = asyncHandler(async (req, res) => {
   success(res, item, 'Booking fetched');
 });
 
+exports.cancellationQuote = asyncHandler(async (req, res) => {
+  const quote = await service.cancellationQuote({
+    customerId: req.user.sub,
+    id: req.params.id,
+  });
+  success(res, quote, 'Cancellation quote');
+});
+
 exports.cancelOwn = asyncHandler(async (req, res) => {
   const item = await service.cancelOwn({
     customerId: req.user.sub,
@@ -158,6 +166,15 @@ exports.partnerMine = asyncHandler(async (req, res) => {
     bucket: req.query.bucket,
   });
   success(res, items, 'Bookings fetched');
+});
+
+exports.partnerCancel = asyncHandler(async (req, res) => {
+  const result = await service.partnerCancel({
+    partnerId: req.user.sub,
+    id: req.params.id,
+    reason: req.body?.reason,
+  });
+  success(res, result, 'Booking released');
 });
 
 exports.partnerUpdateStatus = asyncHandler(async (req, res) => {

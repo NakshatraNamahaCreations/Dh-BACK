@@ -33,10 +33,14 @@ const updateSchema = z.object({
 });
 
 const checkQuerySchema = z.object({
-  query: z.object({
-    city: z.string().trim().min(1).max(80),
-    pincode: z.string().trim().regex(/^\d{3,8}$/).optional(),
-  }),
+  query: z
+    .object({
+      city: z.string().trim().max(80).optional(),
+      pincode: z.string().trim().regex(/^\d{3,8}$/).optional(),
+    })
+    .refine((v) => Boolean(v.city || v.pincode), {
+      message: 'City or pincode is required',
+    }),
 });
 
 module.exports = {

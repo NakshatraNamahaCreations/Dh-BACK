@@ -3,6 +3,9 @@ const { z } = require('zod');
 const listQuerySchema = z.object({
   query: z.object({
     search: z.string().trim().max(100).optional(),
+    /// Filter by RBAC role id (e.g. "r-fin"). `role` (scope) is still
+    /// accepted for backward compatibility with older clients.
+    roleId: z.string().trim().max(80).optional(),
     role: z.enum(['SUPER', 'CITY_MANAGER']).optional(),
     status: z.enum(['active', 'inactive']).optional(),
     page: z.coerce.number().int().min(1).optional(),
@@ -19,7 +22,8 @@ const createSchema = z.object({
     email: z.string().email().max(160),
     password: z.string().min(8, 'Password must be at least 8 characters').max(100),
     name: z.string().trim().max(100).optional(),
-    role: z.enum(['SUPER', 'CITY_MANAGER']),
+    /// RBAC role id from the Roles & access catalog (e.g. "r-city-manager").
+    roleId: z.string().trim().min(1, 'Role is required').max(80),
     cityIds: z.array(z.coerce.number().int().positive()).optional(),
   }),
 });
@@ -29,7 +33,7 @@ const updateSchema = z.object({
   body: z
     .object({
       name: z.string().trim().max(100).optional(),
-      role: z.enum(['SUPER', 'CITY_MANAGER']).optional(),
+      roleId: z.string().trim().min(1).max(80).optional(),
       isActive: z.boolean().optional(),
     })
     .refine((v) => Object.keys(v).length > 0, { message: 'No fields to update' }),

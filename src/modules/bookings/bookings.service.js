@@ -7,6 +7,7 @@ const dispatchQueue = require('../dispatch/queue');
 const dispatchRegistry = require('../dispatch/registry');
 const earningsService = require('../payments/earnings.service');
 const razorpayService = require('../payments/razorpay.service');
+const policyService = require('../policy/policy.service');
 const cityResolver = require('../geography/city-resolver');
 const { computeFare } = require('../../utils/fare');
 
@@ -16,9 +17,9 @@ const { computeFare } = require('../../utils/fare');
 /// path (`handleRefundWebhook`) will eventually catch up if the call
 /// failed; the admin can also manually re-trigger via an admin tool
 /// added later.
-const tryRefund = async (bookingId, reason) => {
+const tryRefund = async (bookingId, reason, refundAmount = null) => {
   try {
-    return await razorpayService.refundForBooking({ bookingId, reason });
+    return await razorpayService.refundForBooking({ bookingId, reason, refundAmount });
   } catch (err) {
     console.warn(`Refund kick failed for booking ${bookingId}: ${err.message}`);
     return null;
@@ -36,6 +37,7 @@ const generateOtp = () => String(1000 + crypto.randomInt(0, 9000));
 /// enough that a partner isn't held in limbo while the customer
 /// disappears". Tune via env if needed.
 const BYOP_PAYMENT_HOLD_MS = 3 * 60 * 1000;
+const INSTANT_PAYMENT_HOLD_MS = 3 * 60 * 1000;
 
 // ── Partner helpers ──────────────────────────────────────────────────────────
 
@@ -398,10 +400,31 @@ const BOOKING_INCLUDE = {
       updatedAt: true,
     },
   },
+  /// Minimal payment join so the customer shape can surface the ACTUAL
+  /// refunded amount on a cancelled booking (full grandTotal minus the
+  /// cancellation fee), rather than assuming the whole bill was returned.
+  payments: {
+    select: { id: true, status: true, amount: true, refundAmount: true, createdAt: true },
+    orderBy: { createdAt: 'desc' },
+  },
+};
+
+/// The refund a customer will actually receive on a CANCELLED booking.
+/// Reads the latest payment that entered a refund state; returns null
+/// when nothing was captured (unpaid cancel) so the UI can hide the
+/// refund row instead of promising ₹0 back.
+const resolveRefund = (b) => {
+  if (b.status !== 'CANCELLED') return null;
+  const p = (b.payments ?? []).find(
+    (x) => x.refundAmount != null && ['refund_pending', 'refunded'].includes(x.status),
+  );
+  return p ? p.refundAmount : null;
 };
 
 const shape = (b) => {
   const addr = resolveBookingAddress(b);
+  const refundAmount = resolveRefund(b);
+  const amountPaid = b.grandTotal && b.grandTotal > 0 ? b.grandTotal : b.total;
   return {
   id: b.id,
   customerId: b.customerId,
@@ -441,6 +464,13 @@ const shape = (b) => {
   paymentStatus: b.paymentStatus ?? 'unpaid',
   paymentMethod: b.paymentMethod ?? null,
   paidAt: b.paidAt ?? null,
+  /// Cancellation outcome. `refundAmount` is what's actually being
+  /// returned (null when nothing was captured); `cancellationFee` is
+  /// the rupees retained per the policy tiers. Both null on
+  /// non-cancelled bookings so the app only renders them when relevant.
+  refundAmount: refundAmount,
+  cancellationFee:
+    refundAmount != null && amountPaid != null ? Math.max(0, amountPaid - refundAmount) : null,
   /// BYOP pay-after-accept window. Surfaced so the customer-app can
   /// drive the 3-minute countdown on the accepted screen. Null for
   /// non-BYOP bookings.
@@ -645,21 +675,21 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
     /// as the new booking insert so the customer can never end up
     /// with two live PENDING attempts even on race.
     if (stalePrev.length > 0) {
-      await tx.booking.updateMany({
-        where: { id: { in: stalePrev.map((b) => b.id) } },
-        data: {
-          status: 'CANCELLED',
-          dispatchStatus: 'superseded',
-          noPartnerReason: 'Customer placed a fresh booking — previous attempt superseded.',
-        },
-      });
-      /// Refund any coupon redemptions on the cancelled rows so the
+      /// Refund any coupon redemptions on the deleted rows so the
       /// customer's promo isn't burned by a back-and-retry loop.
       for (const prev of stalePrev) {
         if (prev.couponId != null) {
           await couponsService.refundForBooking({ couponId: prev.couponId, tx });
         }
       }
+      await tx.booking.deleteMany({
+        where: {
+          id: { in: stalePrev.map((b) => b.id) },
+          status: 'PENDING',
+          partnerId: null,
+          paymentStatus: { not: 'paid' },
+        },
+      });
     }
 
     let couponData = null;
@@ -764,6 +794,13 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
       await dispatcher.scheduleAllForBooking(booking);
     } catch (err) {
       console.warn(`Dispatch enqueue failed for booking ${booking.id}: ${err.message}`);
+    }
+  }
+  if (dispatchQueue.enabled() && booking.isInstant && booking.offeredPrice == null) {
+    try {
+      await dispatcher.schedulePaymentExpire(booking.id, INSTANT_PAYMENT_HOLD_MS);
+    } catch (err) {
+      console.warn(`Payment-expire enqueue failed for booking ${booking.id}: ${err.message}`);
     }
   }
 
@@ -892,37 +929,94 @@ exports.rateBooking = async ({ customerId, id, stars, comment }) => {
   };
 };
 
-exports.cancelOwn = async ({ customerId, id, reason }) => {
+/// Compute the cancellation fee for a booking the customer is about to
+/// cancel. The fee only applies to a captured payment (paymentStatus
+/// `paid`) — an unpaid booking has nothing to charge against, so the
+/// fee is zero and the refund is a no-op. Shared by `cancelOwn` and the
+/// customer-app preview endpoint (`cancellationQuote`) so the quote the
+/// customer sees and the amount actually withheld can never diverge.
+const quoteCancellation = async (b) => {
+  const amountPaid = b.grandTotal && b.grandTotal > 0 ? b.grandTotal : b.total;
+  const chargeable = b.paymentStatus === 'paid' && amountPaid > 0;
+  if (!chargeable) {
+    return {
+      chargeable: false,
+      amountPaid: chargeable ? amountPaid : 0,
+      feePercent: 0,
+      feeAmount: 0,
+      refundAmount: 0,
+      withinFreeWindow: true,
+      freeWindowMins: 0,
+      elapsedMins: 0,
+    };
+  }
+  const policy = await policyService.getCancellation();
+  const fee = policyService.computeCustomerCancelFee({
+    policy,
+    amountPaid,
+    bookedAt: b.createdAt,
+  });
+  return { chargeable: true, amountPaid, ...fee };
+};
+
+/// Read-only preview for the customer-app cancel sheet: "you'll be
+/// charged ₹X, ₹Y refunded". Validates ownership + cancellable state so
+/// the app surfaces the same errors the real cancel would.
+exports.cancellationQuote = async ({ customerId, id }) => {
   const b = await prisma.booking.findUnique({
-    where: { id },
-    select: { customerId: true, status: true, couponId: true, partnerId: true },
+    where: { id: Number(id) },
+    select: {
+      customerId: true, status: true, grandTotal: true, total: true,
+      createdAt: true, paymentStatus: true,
+    },
   });
   if (!b || b.customerId !== customerId) throw ApiError.notFound('Booking not found');
   if (!['PENDING', 'CONFIRMED'].includes(b.status)) {
     throw ApiError.badRequest('Only pending or confirmed bookings can be cancelled.');
   }
+  return quoteCancellation(b);
+};
+
+exports.cancelOwn = async ({ customerId, id, reason }) => {
+  const b = await prisma.booking.findUnique({
+    where: { id },
+    select: {
+      customerId: true, status: true, couponId: true, partnerId: true,
+      grandTotal: true, total: true, createdAt: true, paymentStatus: true,
+    },
+  });
+  if (!b || b.customerId !== customerId) throw ApiError.notFound('Booking not found');
+  if (!['PENDING', 'CONFIRMED'].includes(b.status)) {
+    throw ApiError.badRequest('Only pending or confirmed bookings can be cancelled.');
+  }
+
+  /// Resolve the fee BEFORE the cancel commits so we know how much to
+  /// refund and can record it on the booking note for the audit trail.
+  const quote = await quoteCancellation(b);
+  const baseNote = reason ? `Customer cancelled: ${reason}` : 'Customer cancelled';
+  const note =
+    quote.feeAmount > 0
+      ? `${baseNote} · Cancellation fee ₹${quote.feeAmount} (${quote.feePercent}% of ₹${quote.amountPaid}) · Refund ₹${quote.refundAmount}`
+      : baseNote;
+
   /// Wrap the cancel + coupon refund together — same reasoning as
   /// expireBroadcasts. A customer cancelling before the job runs
   /// hasn't consumed the promo, so `usedCount` should fall back.
-  const updated = await prisma.$transaction(async (tx) => {
-    const next = await tx.booking.update({
+  await prisma.$transaction(async (tx) => {
+    await tx.booking.update({
       where: { id },
-      data: {
-        status: 'CANCELLED',
-        notes: reason ? `Customer cancelled: ${reason}` : 'Customer cancelled',
-      },
-      include: BOOKING_INCLUDE,
+      data: { status: 'CANCELLED', notes: note },
     });
     if (b.couponId != null) {
       await couponsService.refundForBooking({ couponId: b.couponId, tx });
     }
-    return next;
   });
 
   /// Outside the transaction so a Razorpay outage doesn't undo the
-  /// cancel itself. tryRefund is a no-op when the booking is unpaid,
-  /// so calling unconditionally is safe.
-  await tryRefund(id, reason ?? 'Customer cancelled');
+  /// cancel itself. `refundAmount` keeps the cancellation fee (refund =
+  /// paid − fee); when the booking is unpaid `chargeable` is false and
+  /// we pass null so refundForBooking takes its safe no-op path.
+  await tryRefund(id, reason ?? 'Customer cancelled', quote.chargeable ? quote.refundAmount : null);
 
   /// Snapshot who was watching this offer BEFORE clearing Redis —
   /// cancelAllForBooking wipes the visibleTo set, so we must read
@@ -959,6 +1053,10 @@ exports.cancelOwn = async ({ customerId, id, reason }) => {
     });
   }
 
+  /// Re-read after the refund kick so the returned booking reflects the
+  /// post-refund payment rollup (paymentStatus → refund_pending) and the
+  /// actual `refundAmount` the customer shape now surfaces.
+  const updated = await prisma.booking.findUnique({ where: { id }, include: BOOKING_INCLUDE });
   return shape(updated);
 };
 
@@ -1356,17 +1454,71 @@ exports.listStuckJobs = async () => {
   });
 };
 
-exports.nearbyPartners = async (_bookingId) => {
-  void _bookingId;
-  // Verified active partners. Distance is synthesised until partner
-  // location tracking is implemented; rating + jobsCompleted are real.
+exports.nearbyPartners = async (bookingId) => {
+  /// Look up the booking's coordinates AND the service category so we
+  /// can filter to partners who actually do this category of work.
+  /// Without the category filter, an AC Uninstallation booking was
+  /// surfacing electricians + plumbers + general partners — useless
+  /// for the admin and tempting overlap.
+  const booking = bookingId
+    ? await prisma.booking.findUnique({
+        where: { id: Number(bookingId) },
+        select: {
+          lat: true,
+          lng: true,
+          customerAddress: { select: { lat: true, lng: true } },
+          items: {
+            include: { service: { select: { categoryId: true } } },
+            take: 1,
+            orderBy: { id: 'asc' },
+          },
+        },
+      })
+    : null;
+  const bookingLat = booking?.lat ?? booking?.customerAddress?.lat ?? null;
+  const bookingLng = booking?.lng ?? booking?.customerAddress?.lng ?? null;
+  const bookingCategoryId = booking?.items?.[0]?.service?.categoryId ?? null;
+
+  /// Hard filters: category match (don't show plumbers for an AC job)
+  /// + active + verified. On-duty is a SORT signal, not a filter —
+  /// manual dispatch exists precisely because the broadcast found no
+  /// acceptor, so an empty list would defeat the feature. We sort
+  /// on-duty to the top and let the admin still reach off-duty ones
+  /// at the bottom (e.g. to phone them directly).
   const partners = await prisma.partner.findMany({
-    where: { isActive: true, isVerified: true },
-    take: 8,
-    orderBy: { createdAt: 'desc' },
+    where: {
+      isActive: true,
+      isVerified: true,
+      ...(bookingCategoryId != null ? { categoryId: bookingCategoryId } : {}),
+    },
+    take: 50,
+    orderBy: [{ lastLocationAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }],
+    select: {
+      id: true,
+      name: true,
+      phone: true,
+      businessName: true,
+      categoryId: true,
+      currentLat: true,
+      currentLng: true,
+      lastLocationAt: true,
+    },
   });
   if (partners.length === 0) return [];
   const partnerIds = partners.map((p) => p.id);
+
+  /// Resolve category NAMES for display. Partner has no `category`
+  /// relation in the schema (only a nullable `categoryId`), so we
+  /// batch-fetch the names for whatever distinct category ids appear
+  /// and map them in below. One query regardless of partner count.
+  const categoryIds = [...new Set(partners.map((p) => p.categoryId).filter((id) => id != null))];
+  const categoryRows = categoryIds.length
+    ? await prisma.category.findMany({
+        where: { id: { in: categoryIds } },
+        select: { id: true, name: true },
+      })
+    : [];
+  const categoryNameById = new Map(categoryRows.map((c) => [c.id, c.name]));
 
   const [completedAgg, ratingAgg, activeAgg] = await Promise.all([
     prisma.booking.groupBy({
@@ -1387,42 +1539,83 @@ exports.nearbyPartners = async (_bookingId) => {
   ]);
   const completedByPartner = new Map(completedAgg.map((r) => [r.partnerId, r._count._all]));
   const ratingByPartner = new Map(
-    ratingAgg.map((r) => [r.partnerId, { avg: r._avg.stars ?? 0, count: r._count._all }])
+    ratingAgg.map((r) => [r.partnerId, { avg: r._avg.stars ?? 0, count: r._count._all }]),
   );
   const busyPartnerIds = new Set(activeAgg.map((b) => b.partnerId));
 
-  return partners.map((p, i) => {
-    const r = ratingByPartner.get(p.id);
-    return {
-      id: p.id,
-      name: p.name ?? p.businessName ?? 'Partner',
-      phone: p.phone,
-      distanceKm: 0.5 + i * 0.7,
-      rating: r ? Math.round(r.avg * 10) / 10 : 0,
-      ratingCount: r ? r.count : 0,
-      jobsCompleted: completedByPartner.get(p.id) ?? 0,
-      category: p.businessName ?? 'General',
-      status: busyPartnerIds.has(p.id) ? 'busy' : 'available',
-    };
-  });
-};
+  /// On-duty set + live positions from Redis presence, in one pass.
+  ///   onDutyIds      — partners with a fresh `lastseen` key (the
+  ///                    accurate "currently on duty" signal).
+  ///   livePositions  — Map<id, {lat,lng}> of each on-duty partner's
+  ///                    real-time location from the category GEO set.
+  /// Both fall back to empty when Redis is disabled.
+  const [onDutyIds, livePositions] = await Promise.all([
+    dispatchRegistry.filterOnlinePartnerIds(partnerIds),
+    bookingCategoryId != null
+      ? dispatchRegistry.getOnlinePositions(bookingCategoryId, partnerIds)
+      : Promise.resolve(new Map()),
+  ]);
 
-exports.reassign = async (bookingId, partnerId, reason) => {
-  const b = await prisma.booking.findUnique({ where: { id: bookingId } });
-  if (!b) throw ApiError.notFound('Booking not found');
-  if (b.status !== 'PENDING' && b.status !== 'CONFIRMED') {
-    throw ApiError.badRequest('Only pending or confirmed bookings can be reassigned');
-  }
-  // No partnerId column on Booking yet — log into notes for audit.
-  const updated = await prisma.booking.update({
-    where: { id: bookingId },
-    data: {
-      status: 'CONFIRMED',
-      notes: `${b.notes ?? ''}\nManual dispatch → ${partnerId} (${reason})`.trim(),
-    },
-    include: ADMIN_INCLUDE,
+  const shaped = partners
+    /// Hide busy partners entirely — clicking Assign on one would
+    /// create overlapping work. The 409 backend guard + frontend
+    /// `disabled` flag are belt-and-braces; this filter is primary.
+    .filter((p) => !busyPartnerIds.has(p.id))
+    .map((p) => {
+      const r = ratingByPartner.get(p.id);
+      const onDuty = onDutyIds.has(p.id);
+
+      /// Pick the best-known partner location for the distance calc:
+      ///   1. Redis live position (on-duty partners — most accurate)
+      ///   2. DB currentLat/Lng (last-known from their last job)
+      /// If NEITHER exists, distance is genuinely unknown — we send
+      /// `null` rather than a fabricated number so the admin UI can
+      /// show "—" instead of a misleading "0.5 km".
+      const live = livePositions.get(p.id);
+      const partnerLat = live?.lat ?? p.currentLat ?? null;
+      const partnerLng = live?.lng ?? p.currentLng ?? null;
+
+      const canMeasure =
+        bookingLat != null && bookingLng != null && partnerLat != null && partnerLng != null;
+      const distanceKm = canMeasure
+        ? Math.round(
+            haversineKm(
+              { lat: bookingLat, lng: bookingLng },
+              { lat: partnerLat, lng: partnerLng },
+            ) * 10,
+          ) / 10
+        : null;
+
+      return {
+        id: p.id,
+        name: p.name ?? p.businessName ?? 'Partner',
+        phone: p.phone,
+        distanceKm,
+        rating: r ? Math.round(r.avg * 10) / 10 : 0,
+        ratingCount: r ? r.count : 0,
+        jobsCompleted: completedByPartner.get(p.id) ?? 0,
+        /// Show the actual service category the partner is registered
+        /// for (matches the booking's category since we filtered on it).
+        /// Falls back to businessName then "General" for legacy rows
+        /// with no category assigned.
+        category:
+          (p.categoryId != null ? categoryNameById.get(p.categoryId) : null) ??
+          p.businessName ??
+          'General',
+        onDuty,
+        status: onDuty ? 'available' : 'off_duty',
+      };
+    });
+
+  /// Sort: on-duty first; within each group, partners WITH a known
+  /// distance come before unknowns, nearest first. Unknown-distance
+  /// partners sink to the bottom of their group.
+  return shaped.sort((a, z) => {
+    if (a.onDuty !== z.onDuty) return a.onDuty ? -1 : 1;
+    const ad = a.distanceKm ?? Infinity;
+    const zd = z.distanceKm ?? Infinity;
+    return ad - zd;
   });
-  return adminShape(updated);
 };
 
 exports.adminGet = async (id) => {
@@ -1449,6 +1642,17 @@ exports.reassign = async (bookingId, partnerId, reason = 'Manual assignment') =>
   });
   if (!partner) throw ApiError.notFound('Partner not found');
   const partnerLabel = partner.name ?? partner.businessName ?? `Partner ${partner.id}`;
+
+  /// Defense in depth — the admin UI now blocks Assign on busy partners
+  /// before the request fires, but server should reject too so a bug
+  /// in the UI / a direct API call can't create overlapping
+  /// assignments. `partnerHasActiveJob` matches what the partner-side
+  /// `partnerAccept` uses, so the two paths agree on "busy".
+  if (await partnerHasActiveJob(partner.id)) {
+    throw ApiError.conflict(
+      `${partnerLabel} already has an active job. Wait for them to finish or pick a different partner.`,
+    );
+  }
 
   const updated = await prisma.booking.update({
     where: { id: Number(bookingId) },
@@ -1478,6 +1682,39 @@ exports.reassign = async (bookingId, partnerId, reason = 'Manual assignment') =>
     title: 'New job assigned',
     body: `Admin assigned booking #${bookingId} to you. Open it for details.`,
     bookingId: Number(bookingId),
+  });
+
+  /// Also fire an FCM push so the partner gets a tray notification
+  /// even when their app is closed / minimized / Vivo has killed the
+  /// foreground service. Without this, the bell-icon socket event
+  /// inside notifications.create only reaches them if their socket
+  /// is still connected — which on aggressive OEMs is unreliable.
+  /// Mirrors what the dispatcher does for the normal wave path.
+  const headService = updated.items?.[0]?.serviceName ?? 'Service';
+  const amount = updated.offeredPrice ?? updated.total ?? 0;
+  try {
+    /// "New job assigned" copy (not the offer "New job request!") so the
+    /// closed-app tray notification matches the in-app alert, and tapping
+    /// it opens the booking instead of the Accept/Decline offer flow.
+    const { sendJobAssignedPush } = require('../notifications/push.service');
+    void sendJobAssignedPush(
+      prisma,
+      partner.id,
+      { bookingId: Number(bookingId), serviceName: headService, amount },
+    );
+  } catch (err) {
+    console.warn(`Admin-assign push failed for booking ${bookingId}: ${err.message}`);
+  }
+
+  /// Ring the partner-app's "New job assigned" alert (5s vibrate +
+  /// sound) over the live socket when their app is open + connected.
+  /// Distinct from the dispatch.offer path: this job is already theirs,
+  /// so there's no Accept/Decline — it's a heads-up, not an offer. The
+  /// FCM push above covers the closed-app case.
+  dispatcher.emitToPartner(partner.id, 'job.assigned', {
+    bookingId: Number(bookingId),
+    serviceName: headService,
+    amount,
   });
 
   return adminShape(updated);
@@ -1722,14 +1959,18 @@ exports.partnerIncoming = async ({ partnerId, lat, lng }) => {
         id: { in: offeredIds },
         status: 'PENDING',
         partnerId: null,
-        /// Only show bookings that are CURRENTLY broadcasting. After
-        /// the 30s wave window, dispatchStatus flips to
-        /// `needs_admin_dispatch` (or `payment_timeout` / `superseded`
-        /// for other cancel paths) — in those states the partner
-        /// shouldn't see the alert. Without this filter, a stale
-        /// entry in their offers set re-surfaces the JobAlert every
-        /// 5s and Accept fails with "not in broadcast window".
-        dispatchStatus: { in: ['waiting', 'broadcasting'] },
+        /// Keep the offer visible to already-offered partners through
+        /// `needs_admin_dispatch` too — after the 30s broadcast window
+        /// the booking is still PENDING + unassigned and `partnerAccept`
+        /// explicitly whitelists that state, so the partner can still
+        /// grab it. This is what lets multiple offers stack in the
+        /// JobOffersSheet without an older one vanishing the moment its
+        /// broadcast window closes. The TERMINAL states (payment_timeout,
+        /// superseded, no_partner_found, assigned) are excluded because
+        /// the booking is no longer acceptable — so cancelled / taken /
+        /// admin-assigned offers correctly drop out of the partner's
+        /// list on the next poll.
+        dispatchStatus: { in: ['waiting', 'broadcasting', 'needs_admin_dispatch'] },
         items: { some: { service: { categoryId: partner.categoryId } } },
       },
       include: PARTNER_INCLUDE,
@@ -1926,6 +2167,172 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
   });
   const commissionMap = await loadCommissionMap();
   return partnerShape(updated, null, commissionMap);
+};
+
+/// Partner backs out of a job they'd already accepted. The booking is
+/// RELEASED back to the dispatch pool (status → PENDING, partner
+/// cleared, fresh broadcast waves) so the customer keeps their slot and
+/// another nearby partner can pick it up. The cancelling partner incurs
+/// the policy penalty (a pending PartnerAdjustment netted from their
+/// next payout) and a strike; crossing the rolling-7-day strike limit
+/// auto-suspends their account.
+exports.partnerCancel = async ({ partnerId, id, reason }) => {
+  const bookingId = Number(id);
+  const pid = Number(partnerId);
+
+  const b = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    /// Fields scheduleAllForBooking needs to recompute the dispatch
+    /// start time, plus ownership/state guards.
+    select: {
+      id: true, partnerId: true, status: true, customerId: true, notes: true,
+      isInstant: true, offeredPrice: true, scheduledAt: true, createdAt: true,
+    },
+  });
+  if (!b || b.partnerId !== pid) throw ApiError.notFound('Booking not found');
+  /// Only a job that's accepted-but-not-started can be released. Once
+  /// IN_PROGRESS (start-OTP verified) re-broadcasting a half-done job
+  /// is unsafe — those route through support/admin instead.
+  if (b.status !== 'CONFIRMED') {
+    throw ApiError.badRequest(
+      b.status === 'IN_PROGRESS'
+        ? 'This job has already started — contact support to cancel.'
+        : 'Only an accepted booking can be cancelled.',
+    );
+  }
+
+  const policy = await policyService.getCancellation();
+  const penalty = Math.max(0, Number(policy.partnerPenalty) || 0);
+  const strikeLimit = Math.max(1, Number(policy.partnerStrikeLimit) || 1);
+  const windowStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const note = appendNote(
+    b.notes,
+    `Partner #${pid} cancelled${reason ? `: ${reason}` : ''} — released to pool`,
+  );
+
+  const { strikes, suspended } = await prisma.$transaction(async (tx) => {
+    /// Race-safe release — only flip a row still CONFIRMED + assigned to
+    /// THIS partner, so a simultaneous customer-cancel / admin-reassign
+    /// can't be clobbered.
+    const released = await tx.booking.updateMany({
+      where: { id: bookingId, partnerId: pid, status: 'CONFIRMED' },
+      data: {
+        partnerId: null,
+        status: 'PENDING',
+        dispatchStatus: 'waiting',
+        dispatchWave: 0,
+        dispatchStartedAt: null,
+        dispatchExpiresAt: null,
+        dispatchRadiusKm: null,
+        noPartnerReason: null,
+        /// BYOP pay-hold no longer applies while we hunt for a new partner.
+        paymentDeadlineAt: null,
+        notes: note,
+      },
+    });
+    if (released.count === 0) {
+      throw ApiError.conflict('This booking can no longer be cancelled.');
+    }
+
+    /// One row per cancel — written even when penalty is ₹0 so the
+    /// strike count below stays accurate regardless of the rupee amount.
+    await tx.partnerAdjustment.create({
+      data: {
+        partnerId: pid,
+        bookingId,
+        type: 'cancellation_penalty',
+        amount: penalty,
+        reason: reason
+          ? `Cancelled booking #${bookingId}: ${reason}`
+          : `Cancelled booking #${bookingId}`,
+        status: 'pending',
+      },
+    });
+
+    /// Rolling 7-day strike count, including the row just created.
+    const strikeCount = await tx.partnerAdjustment.count({
+      where: {
+        partnerId: pid,
+        type: 'cancellation_penalty',
+        createdAt: { gte: windowStart },
+      },
+    });
+
+    let didSuspend = false;
+    if (strikeCount >= strikeLimit) {
+      await tx.partner.update({
+        where: { id: pid },
+        data: {
+          isActive: false,
+          suspendReason: `Auto-suspended: ${strikeCount} cancellations in 7 days (limit ${strikeLimit}).`,
+          suspendedAt: new Date(),
+        },
+      });
+      didSuspend = true;
+    }
+
+    return { strikes: strikeCount, suspended: didSuspend };
+  });
+
+  /// Re-broadcast outside the txn. Clear any stale queue/registry state
+  /// first, then schedule fresh waves off the (now PENDING) booking.
+  /// scheduleAllForBooking no-ops when the dispatch queue is disabled —
+  /// the booking then waits in `needs_admin_dispatch`-style limbo for
+  /// manual assignment, which is the same fallback the create path has.
+  await dispatcher.cancelAllForBooking(bookingId).catch(() => {});
+  await dispatcher.scheduleAllForBooking(b).catch((err) => {
+    console.warn(`Re-dispatch after partner cancel failed for booking ${bookingId}: ${err.message}`);
+  });
+
+  /// Tell the customer their assigned partner dropped off and we're
+  /// re-matching — best-effort push, never blocks the cancel.
+  try {
+    const { sendPush } = require('../notifications/push.service');
+    const customer = await prisma.customer.findUnique({
+      where: { id: b.customerId },
+      select: { expoPushToken: true },
+    });
+    if (customer?.expoPushToken) {
+      void sendPush(customer.expoPushToken, {
+        title: 'Finding you another professional',
+        body: `Your partner couldn't make booking #${bookingId}. We're matching you with someone new.`,
+        data: { bookingId: String(bookingId), type: 'job_reassigning' },
+      });
+    }
+  } catch (err) {
+    console.warn(`Customer re-match push failed for booking ${bookingId}: ${err.message}`);
+  }
+
+  /// Partner-facing confirmations: the penalty notice, plus a suspend
+  /// notice when this cancel tipped them over the strike limit.
+  const notifications = require('../notifications/notifications.service');
+  await notifications.create({
+    partnerId: pid,
+    type: 'job_cancelled',
+    title: 'You cancelled a job',
+    body:
+      penalty > 0
+        ? `Booking #${bookingId} released. A ₹${penalty} penalty applies to your next payout.`
+        : `Booking #${bookingId} released back to the pool.`,
+    bookingId,
+  });
+  if (suspended) {
+    await notifications.create({
+      partnerId: pid,
+      type: 'system',
+      title: 'Account suspended',
+      body: `You've reached ${strikes} cancellations in 7 days. Your account is suspended — contact support.`,
+    });
+  }
+
+  return {
+    ok: true,
+    bookingId,
+    penalty,
+    strikes,
+    strikeLimit,
+    suspended,
+  };
 };
 
 exports.partnerMine = async ({ partnerId, bucket }) => {

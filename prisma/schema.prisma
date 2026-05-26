@@ -192,6 +192,7 @@ model Partner {
   bookings     Booking[]
   document     PartnerDocument?
   earnings     PartnerEarning[]
+  adjustments  PartnerAdjustment[]
   payouts      Payout[]
   notifications PartnerNotification[]
   ratings      BookingRating[]
@@ -285,12 +286,19 @@ model Admin {
   password  String
   name      String?
   isActive  Boolean  @default(true)
-  /// Admin role. SUPER sees everything across the platform.
-  /// CITY_MANAGER only sees rows in their assigned cities — every
-  /// admin list endpoint intersects this set into its WHERE clause.
-  /// Stored as a free-text column instead of an enum so we can add
-  /// roles later (STATE_MANAGER, FINANCE, etc.) without a migration.
+  /// SCOPE cache — 'SUPER' (sees everything) | 'CITY_MANAGER' (only
+  /// assigned cities). Kept as the city-scoping signal the JWT carries
+  /// and `adminScope` reads. It is now DERIVED from the assigned Role's
+  /// `scope` (global → SUPER, city → CITY_MANAGER) and synced whenever
+  /// the role changes. Authority (what an admin may DO) lives on the
+  /// Role's permissions, not here.
   role      String   @default("SUPER")
+  /// Permission role (RBAC). Drives what the admin can do via the
+  /// role's `permissions` set; nullable so legacy rows keep working
+  /// until backfilled. onDelete:SetNull so deleting a role doesn't
+  /// cascade-delete admins (they fall back to scope-only access).
+  roleId    String?
+  roleRef   Role?    @relation(fields: [roleId], references: [id], onDelete: SetNull)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -298,7 +306,36 @@ model Admin {
   auditLogs       AdminAuditLog[]
   notifications   AdminNotification[]
 
+  @@index([roleId])
   @@map("admins")
+}
+
+/// RBAC role — the permission set an admin is granted. Edited from the
+/// admin "Roles & access" page and assigned to admins on "Admin users".
+///
+/// `permissions` are `{module}.{action}` keys (see roles.validator).
+/// `scope` decides city visibility: 'global' admins see every city,
+/// 'city' admins are intersected to their AdminCityAssignment set —
+/// this is what populates the legacy SUPER/CITY_MANAGER scope on the
+/// JWT. `superAdmin` is the all-bypass flag: a role with it set passes
+/// every permission check (only the built-in Super Admin has it), which
+/// guarantees super admins can never be locked out by a misconfigured
+/// permission. `builtin` roles can't be deleted and their name is locked.
+model Role {
+  id          String   @id
+  name        String   @unique
+  description String   @default("")
+  permissions String[] @default([])
+  scope       String   @default("city")
+  superAdmin  Boolean  @default(false)
+  builtin     Boolean  @default(false)
+
+  admins      Admin[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("roles")
 }
 
 /// Junction table mapping a CITY_MANAGER admin to the cities they
@@ -782,6 +819,7 @@ model Payout {
   notes       String?
 
   earnings    PartnerEarning[]
+  adjustments PartnerAdjustment[]
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -789,6 +827,81 @@ model Payout {
   @@index([partnerId, status])
   @@index([status, createdAt])
   @@map("payouts")
+}
+
+/// A debit (or future credit) against a partner's payout that isn't a
+/// per-booking earning. Today the only `type` is `cancellation_penalty`
+/// — the fee a partner incurs when they cancel a job they'd already
+/// accepted (see partner-side rules in the admin Cancellation policy).
+///
+/// Why this is a separate table from PartnerEarning:
+///   - PartnerEarning.bookingId is @unique, but a partner cancelling
+///     releases the booking back to the dispatch pool where ANOTHER
+///     partner can accept + complete it and earn on the same bookingId.
+///     A penalty therefore can't live on the earnings row keyed by
+///     bookingId without colliding with the eventual completer's earning.
+///   - Penalties are debits (deducted), earnings are credits. Keeping
+///     them apart keeps the earnings ledger meaning "money the partner
+///     made" rather than a mixed +/- column.
+///
+/// Strike counting: the rolling 7-day cancellation count is derived by
+/// COUNTing rows of type `cancellation_penalty` in the window — one row
+/// is always written per partner-cancel (even when the configured
+/// penalty amount is ₹0) so the strike count stays accurate regardless
+/// of the rupee penalty.
+///
+/// Payout integration: `status: pending` rows are netted into the
+/// partner's next generated Payout (subtracted from the earnings sum),
+/// at which point they flip to `applied` with a `payoutId` back-pointer.
+/// Rejecting that payout releases them back to `pending`.
+model PartnerAdjustment {
+  id         Int      @id @default(autoincrement())
+  partnerId  Int
+  partner    Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  /// The booking that triggered the adjustment (the one the partner
+  /// cancelled). Nullable + intentionally NOT unique — the booking
+  /// lives on and may later earn for a different partner.
+  bookingId  Int?
+
+  /// `cancellation_penalty` today; open string so future debit/credit
+  /// types (manual_debit, bonus, etc.) don't need a migration.
+  type       String
+  /// Positive whole rupees to DEDUCT from the partner's next payout.
+  /// May be 0 (penalty disabled in policy) — the row still counts as a
+  /// strike.
+  amount     Int      @default(0)
+  reason     String?
+
+  /// pending — not yet netted into a payout
+  /// applied — rolled into a Payout (payoutId set)
+  /// reversed — admin reversed it (excluded from payout math)
+  status     String   @default("pending")
+
+  payoutId   Int?
+  payout     Payout?  @relation(fields: [payoutId], references: [id], onDelete: SetNull)
+
+  createdAt  DateTime @default(now())
+
+  @@index([partnerId, status])
+  @@index([partnerId, type, createdAt])
+  @@index([payoutId])
+  @@map("partner_adjustments")
+}
+
+/// Key-value store for platform-wide settings that don't justify their
+/// own table. `value` is free-form JSON so a setting's shape can evolve
+/// without a migration. Today it holds the cancellation + refund
+/// policies edited from the admin Policy config pages (keys
+/// `cancellation_policy` / `refund_policy`). The service layer falls
+/// back to hard-coded defaults when a key is absent, so the app keeps
+/// working before an admin has ever saved a policy.
+model PlatformSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("platform_settings")
 }
 
 enum BannerPlacement {

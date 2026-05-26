@@ -109,6 +109,56 @@ const countOnlineInCategory = async (categoryId) => {
   }, 0);
 };
 
+/// Given a list of partner ids, return the SUBSET that is currently
+/// on duty — i.e. has a live `lastseen` key (refreshed on every 15s
+/// presence ping while the app is on-duty, independent of whether
+/// they're on an active job). Used by the admin manual-dispatch
+/// modal to badge + sort On Duty partners. Returns an empty Set when
+/// Redis is disabled (presence isn't tracked) so callers fall back
+/// to whatever they consider the default — better than blocking.
+const filterOnlinePartnerIds = async (partnerIds) => {
+  if (!Array.isArray(partnerIds) || partnerIds.length === 0) return new Set();
+  return safe(async () => {
+    const keys = partnerIds.map((id) => lastSeenKey(id));
+    const values = await redis.mget(...keys);
+    const online = new Set();
+    partnerIds.forEach((id, i) => {
+      if (values[i] != null) online.add(Number(id));
+    });
+    return online;
+  }, new Set());
+};
+
+/// Return live { lat, lng } for each given partner from the category's
+/// GEO set, as a Map<partnerId, { lat, lng }>. This is the partner's
+/// real-time location as of their last presence ping — the accurate
+/// source for "how far is this partner from the booking" in the admin
+/// manual-dispatch modal. Partners not in the set (off-duty, never
+/// pinged) simply won't appear in the returned Map; the caller falls
+/// back to the DB's last-known `currentLat/Lng`. Returns an empty Map
+/// when Redis is disabled.
+const getOnlinePositions = async (categoryId, partnerIds) => {
+  if (categoryId == null || !Array.isArray(partnerIds) || partnerIds.length === 0) {
+    return new Map();
+  }
+  return safe(async () => {
+    /// GEOPOS returns [[lng, lat], null, ...] aligned to the member
+    /// order we pass. Null entries = member not in the set.
+    const positions = await redis.geopos(
+      onlineKey(categoryId),
+      ...partnerIds.map(String),
+    );
+    const map = new Map();
+    partnerIds.forEach((id, i) => {
+      const pos = positions[i];
+      if (pos && pos[0] != null && pos[1] != null) {
+        map.set(Number(id), { lat: Number(pos[1]), lng: Number(pos[0]) });
+      }
+    });
+    return map;
+  }, new Map());
+};
+
 /// Find every online partner inside the given radius of (lat, lng) for
 /// a single category, sorted by distance ascending. Defensive filter
 /// against the tiny window where a partner's GEO entry is still in the
@@ -309,6 +359,8 @@ module.exports = {
   upsertOnline,
   removeOnline,
   countOnlineInCategory,
+  filterOnlinePartnerIds,
+  getOnlinePositions,
   findOnlineNearby,
   recordVisible,
   listOffersForPartner,

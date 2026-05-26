@@ -41,6 +41,7 @@ const prisma = require('../../config/prisma');
 const ApiError = require('../../utils/ApiError');
 const logger = require('../../config/logger');
 const dispatchQueue = require('../dispatch/queue');
+const couponsService = require('../coupons/coupons.service');
 
 const KEY_ID = process.env.RAZORPAY_KEY_ID;
 const KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
@@ -116,6 +117,53 @@ const triggerDispatchIfNeeded = async (bookingId) => {
       `Post-payment dispatch enqueue failed for booking ${booking.id}: ${err.message}`,
     );
   }
+};
+
+const deleteUnpaidInstantBookingAttempt = async (tx, bookingId) => {
+  const booking = await tx.booking.findUnique({
+    where: { id: Number(bookingId) },
+    select: {
+      id: true,
+      status: true,
+      paymentStatus: true,
+      isInstant: true,
+      offeredPrice: true,
+      partnerId: true,
+      couponId: true,
+    },
+  });
+  if (
+    !booking ||
+    booking.status !== 'PENDING' ||
+    booking.paymentStatus === 'paid' ||
+    !booking.isInstant ||
+    booking.offeredPrice != null ||
+    booking.partnerId != null
+  ) {
+    return false;
+  }
+
+  const paid = await tx.payment.findFirst({
+    where: { bookingId: booking.id, status: 'paid' },
+    select: { id: true },
+  });
+  if (paid) return false;
+
+  if (booking.couponId != null) {
+    await couponsService.refundForBooking({ couponId: booking.couponId, tx });
+  }
+
+  const deleted = await tx.booking.deleteMany({
+    where: {
+      id: booking.id,
+      status: 'PENDING',
+      paymentStatus: { not: 'paid' },
+      isInstant: true,
+      offeredPrice: null,
+      partnerId: null,
+    },
+  });
+  return deleted.count > 0;
 };
 
 /// Pull the latest Payment status into Booking.paymentStatus /
@@ -363,7 +411,8 @@ exports.verifyPayment = async ({
         where: { id: payment.id },
         data: { status: 'failed', failureReason: 'Signature verification failed' },
       });
-      await syncBookingRollup(tx, booking.id);
+      const deleted = await deleteUnpaidInstantBookingAttempt(tx, booking.id);
+      if (!deleted) await syncBookingRollup(tx, booking.id);
     });
     throw ApiError.badRequest('Signature verification failed');
   }
@@ -427,7 +476,15 @@ exports.verifyPayment = async ({
 /// window where the refund was created at Razorpay but our DB write
 /// failed. That's acceptable because the next webhook will reconcile
 /// our row, and the refund itself is the source of truth.
-exports.refundForBooking = async ({ bookingId, reason } = {}, tx = null) => {
+///
+/// `refundAmount` (whole rupees) issues a PARTIAL refund — used by the
+/// customer cancel flow to keep the cancellation fee (refund = paid −
+/// fee). Omitted/null = full refund of the captured amount (the legacy
+/// behaviour, still used by adminCancel / no-partner expiry). The
+/// amount is clamped to the captured total; a non-positive amount
+/// means "fee ate the whole payment" and we skip the Razorpay call
+/// entirely (returning null) rather than asking Razorpay to refund ₹0.
+exports.refundForBooking = async ({ bookingId, reason, refundAmount = null } = {}, tx = null) => {
   if (!KEY_SECRET) {
     throw ApiError.internal('RAZORPAY_KEY_SECRET not set — cannot issue refunds');
   }
@@ -452,9 +509,22 @@ exports.refundForBooking = async ({ bookingId, reason } = {}, tx = null) => {
     return null;
   }
 
-  /// Razorpay refund API expects amount in paise. We refund the full
-  /// captured amount; partial refunds aren't part of this flow yet.
-  const amountPaise = payment.amount * 100;
+  /// Resolve how much to actually refund. `refundAmount == null` keeps
+  /// the historical full-refund behaviour; an explicit value is clamped
+  /// into [0, captured]. A non-positive resolved amount (100% fee) means
+  /// there's nothing to send back — return without touching Razorpay or
+  /// flipping the Payment into refund_pending, so the row stays `paid`
+  /// (the platform kept the whole capture as the cancellation fee).
+  const resolvedRefund =
+    refundAmount == null
+      ? payment.amount
+      : Math.min(payment.amount, Math.max(0, Math.round(refundAmount)));
+  if (resolvedRefund <= 0) {
+    return { paymentId: payment.id, razorpayRefundId: null, amount: 0, status: 'no_refund' };
+  }
+
+  /// Razorpay refund API expects amount in paise.
+  const amountPaise = resolvedRefund * 100;
   const refundResp = await client().payments.refund(payment.providerPaymentId, {
     amount: amountPaise,
     speed: 'normal',
@@ -472,7 +542,7 @@ exports.refundForBooking = async ({ bookingId, reason } = {}, tx = null) => {
       where: { id: payment.id },
       data: {
         status: 'refund_pending',
-        refundAmount: payment.amount,
+        refundAmount: resolvedRefund,
         failureReason: null,
         /// Stash the Razorpay refund id in providerPaymentId-adjacent
         /// space — re-using `providerSignature` here would be confusing,
@@ -494,7 +564,7 @@ exports.refundForBooking = async ({ bookingId, reason } = {}, tx = null) => {
   return {
     paymentId: payment.id,
     razorpayRefundId: refundResp?.id ?? null,
-    amount: payment.amount,
+    amount: resolvedRefund,
     status: 'refund_pending',
   };
 };
@@ -732,7 +802,8 @@ exports.handleWebhook = async ({ rawBody, signature }) => {
           failureReason: entity.error_description ?? 'Payment failed',
         },
       });
-      await syncBookingRollup(tx, bookingId);
+      const deleted = await deleteUnpaidInstantBookingAttempt(tx, bookingId);
+      if (!deleted) await syncBookingRollup(tx, bookingId);
     });
   }
   return { ok: true };

@@ -164,32 +164,37 @@ exports.generateAadhaarOtp = async ({ partnerId, aadhaarNumber, imageUrl, backIm
     throw ApiError.badRequest('Back-of-Aadhaar photo is required.');
   }
 
-  /// OCR gate — run BOTH checks in parallel before any QuickeKYC call:
-  ///   front: the 12-digit number must appear on the uploaded image
-  ///   back:  at least one UIDAI marker (uidai.gov.in, "Unique
-  ///          Identification Authority", or the 1947 helpline) must
-  ///          appear — the number isn't reliably printed on every back
-  ///          layout, but those strings always are.
+  /// OCR check — soft-warn, NOT a hard block. Gallery uploads
+  /// (compressed re-saves, screenshots, OEM "gallery cleaner" passes)
+  /// often degrade the image enough that tesseract can't detect the
+  /// 12-digit number even though the upload is genuinely the partner's
+  /// real card. We were blocking too many legit users.
   ///
-  /// The catch-then-found:true fallback keeps the flow alive if the
-  /// OCR worker itself crashes — a real Aadhaar with a stray OCR
-  /// failure shouldn't be blocked from generating an OTP.
+  /// The actual KYC check happens via QuickeKYC's OTP flow: the OTP
+  /// goes to the Aadhaar-linked mobile, so a partner can't fake their
+  /// way through by typing their own number + uploading someone
+  /// else's card — they wouldn't have the OTP. OCR was only here as
+  /// extra friction to catch fat-finger typos that happen to match a
+  /// different valid Aadhaar. Soft-warn keeps the audit trail without
+  /// false-blocking real uploads.
   const ocr = require('./ocr.service');
-  const [frontOcr, backOcr] = await Promise.all([
-    ocr.numberExistsInImage(imageUrl, digits).catch(() => ({ found: true })),
-    ocr.aadhaarBackMarkersInImage(backImageUrl).catch(() => ({ found: true })),
-  ]);
-  if (!frontOcr.found) {
-    throw ApiError.badRequest(
-      'Please upload a valid Aadhaar front image — the 12-digit number you entered ' +
-      'was not detected on the uploaded front photo.',
-    );
-  }
-  if (!backOcr.found) {
-    throw ApiError.badRequest(
-      'Please upload a valid Aadhaar back image — the back side with the address ' +
-      'and QR code (containing the UIDAI footer) was not detected on the uploaded photo.',
-    );
+  try {
+    const [frontOcr, backOcr] = await Promise.all([
+      ocr.numberExistsInImage(imageUrl, digits).catch(() => ({ found: true })),
+      ocr.aadhaarBackMarkersInImage(backImageUrl).catch(() => ({ found: true })),
+    ]);
+    if (!frontOcr.found) {
+      logger.warn(
+        `[kyc] OCR couldn't find digits in front image for partner ${partnerId} — proceeding anyway. OTP gate still applies.`,
+      );
+    }
+    if (!backOcr.found) {
+      logger.warn(
+        `[kyc] OCR couldn't find UIDAI markers on back image for partner ${partnerId} — proceeding anyway.`,
+      );
+    }
+  } catch (err) {
+    logger.warn(`[kyc] OCR pipeline threw for partner ${partnerId}: ${err.message}`);
   }
 
   const { body } = await post('/api/v1/aadhaar-v2/generate-otp', { id_number: digits });
@@ -431,16 +436,19 @@ exports.saveAadhaarPhotos = async ({ partnerId, imageUrl, backImageUrl }) => {
     throw ApiError.badRequest('Verify your Aadhaar via OTP before uploading photos.');
   }
 
-  /// OCR check — confirm the Aadhaar number appears in the front photo.
-  /// Aadhaar numbers can appear as "XXXX XXXX XXXX" or without spaces;
-  /// ocr.service normalises both before comparing.
+  /// OCR check — soft-warn, not a hard block. Aadhaar has already
+  /// been verified via OTP at this point (the `aadharVerifiedAt`
+  /// check above), so OCR here is purely a "the photo matches the
+  /// number we already verified" sanity check. Gallery-edited /
+  /// compressed images often fail OCR even when they're the real
+  /// card. We log the miss so admin can review if a particular row
+  /// looks fishy in the dashboard.
   if (existing.aadharNumber) {
     const ocr = require('./ocr.service');
     const ocrResult = await ocr.numberExistsInImage(imageUrl, existing.aadharNumber).catch(() => ({ found: true }));
     if (!ocrResult.found) {
-      throw ApiError.badRequest(
-        `Aadhaar number ${existing.aadharNumber} was not detected in the uploaded front photo. ` +
-        `Please upload a clear photo of your Aadhaar card — the 12-digit number must be readable.`,
+      logger.warn(
+        `[kyc] OCR couldn't find Aadhaar number ${existing.aadharNumber} on uploaded front photo for partner ${partnerId} — proceeding (Aadhaar already OTP-verified).`,
       );
     }
   }

@@ -22,6 +22,13 @@ exports.update = asyncHandler(async (req, res) => {
   success(res, data, 'Admin updated');
 });
 
+exports.remove = asyncHandler(async (req, res) => {
+  /// `req.user.sub` is the caller's own id — the service blocks
+  /// self-deletion and last-super-admin deletion.
+  const data = await service.remove(req.params.id, { actingAdminId: req.user.sub });
+  success(res, data, 'Admin deleted');
+});
+
 exports.setCities = asyncHandler(async (req, res) => {
   const data = await service.setCities(req.params.id, req.body.cityIds);
   success(res, data, 'Cities updated');

@@ -1,6 +1,6 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
-const { authenticate, requireType } = require('../../middlewares/auth');
+const { authenticate, requireType, requirePermission } = require('../../middlewares/auth');
 const {
   saveCommissionSchema,
   partnerSummariesQuerySchema,
@@ -45,25 +45,25 @@ router.post(
 );
 
 // ── Admin: Commission rules ────────────────────────────────────────────────
-router.get('/commission', adminOnly, controller.getCommission);
-router.put('/commission', adminOnly, validate(saveCommissionSchema), controller.saveCommission);
+router.get('/commission', adminOnly, requirePermission('commission.view'), controller.getCommission);
+router.put('/commission', adminOnly, requirePermission('commission.edit'), validate(saveCommissionSchema), controller.saveCommission);
 
 // ── Admin: Partner earnings ────────────────────────────────────────────────
 // Top-level summary list drives the Payout management table. The two
 // per-partner endpoints power the drill-in / partner detail page.
-router.get('/earnings/partners', adminOnly, validate(partnerSummariesQuerySchema), controller.listPartnerSummaries);
-router.get('/earnings/partners/:id/summary', adminOnly, controller.getPartnerSummary);
-router.get('/earnings/partners/:id', adminOnly, validate(partnerEarningsQuerySchema), controller.listPartnerEarnings);
+router.get('/earnings/partners', adminOnly, requirePermission('payouts.view'), validate(partnerSummariesQuerySchema), controller.listPartnerSummaries);
+router.get('/earnings/partners/:id/summary', adminOnly, requirePermission('payouts.view'), controller.getPartnerSummary);
+router.get('/earnings/partners/:id', adminOnly, requirePermission('payouts.view'), validate(partnerEarningsQuerySchema), controller.listPartnerEarnings);
 
 // ── Admin: Payouts ─────────────────────────────────────────────────────────
-router.post('/payouts', adminOnly, validate(generatePayoutSchema), controller.generatePayout);
-router.get('/payouts', adminOnly, validate(payoutListQuerySchema), controller.listPayouts);
-router.get('/payouts/:id', adminOnly, controller.getPayout);
-router.post('/payouts/:id/approve', adminOnly, validate(approvePayoutSchema), controller.approvePayout);
-router.post('/payouts/:id/mark-paid', adminOnly, validate(markPaidSchema), controller.markPayoutPaid);
-router.post('/payouts/:id/reject', adminOnly, validate(rejectPayoutSchema), controller.rejectPayout);
+router.post('/payouts', adminOnly, requirePermission('payouts.view'), validate(generatePayoutSchema), controller.generatePayout);
+router.get('/payouts', adminOnly, requirePermission('payouts.view'), validate(payoutListQuerySchema), controller.listPayouts);
+router.get('/payouts/:id', adminOnly, requirePermission('payouts.view'), controller.getPayout);
+router.post('/payouts/:id/approve', adminOnly, requirePermission('payouts.approve'), validate(approvePayoutSchema), controller.approvePayout);
+router.post('/payouts/:id/mark-paid', adminOnly, requirePermission('payouts.mark_paid'), validate(markPaidSchema), controller.markPayoutPaid);
+router.post('/payouts/:id/reject', adminOnly, requirePermission('payouts.reject'), validate(rejectPayoutSchema), controller.rejectPayout);
 
 // ── Admin: Ledger (legacy view, unchanged) ─────────────────────────────────
-router.get('/ledger', adminOnly, validate(ledgerQuerySchema), controller.listLedger);
+router.get('/ledger', adminOnly, requirePermission('payments.view'), validate(ledgerQuerySchema), controller.listLedger);
 
 module.exports = router;

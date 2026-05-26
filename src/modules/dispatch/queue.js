@@ -153,6 +153,38 @@ const ensureReconcilerScheduled = async () => {
   );
 };
 
+/// Recurring notification cleanup — installs a repeatable job that
+/// prunes admin + partner notifications older than the retention window
+/// (see notifications.cleanup). Same idempotent pattern as the
+/// reconciler: BullMQ dedupes by the stable jobId, so calling this from
+/// both the API and the standalone worker is safe. Every 6h is plenty —
+/// a notification is removed within 6h of crossing the 7-day mark.
+const NOTIFICATION_CLEANUP_EVERY_MS = 6 * 60 * 60 * 1000;
+const ensureNotificationCleanupScheduled = async () => {
+  if (!dispatchQueue) return;
+  try {
+    const existing = await dispatchQueue.getRepeatableJobs();
+    for (const job of existing) {
+      if (job.name === 'notification_cleanup') {
+        await dispatchQueue.removeRepeatableByKey(job.key).catch(() => {});
+      }
+    }
+  } catch (err) {
+    logger.warn(`Failed to clean up old notification-cleanup schedules: ${err.message}`);
+  }
+
+  await dispatchQueue.add(
+    'notification_cleanup',
+    {},
+    {
+      repeat: { every: NOTIFICATION_CLEANUP_EVERY_MS },
+      jobId: 'notification_cleanup__repeat',
+      removeOnComplete: { count: 1 },
+      removeOnFail: { count: 10 },
+    },
+  );
+};
+
 /// Cancel any pending wave/expiry jobs for a booking — used when a
 /// partner accepts (we don't need future waves to fire) or when admin
 /// cancels manually. Best-effort: if the job already moved to active
@@ -200,6 +232,7 @@ module.exports = {
   enqueueAdminTimeout,
   enqueuePaymentExpire,
   ensureReconcilerScheduled,
+  ensureNotificationCleanupScheduled,
   cancelJobsForBooking,
   close,
 };

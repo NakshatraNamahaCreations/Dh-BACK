@@ -22,6 +22,7 @@ const geographyRoutes = require('../modules/geography/geography.routes');
 const adminsRoutes = require('../modules/admins/admins.routes');
 const accountDeletionRoutes = require('../modules/account-deletion/account-deletion.routes');
 const kycRoutes = require('../modules/kyc/kyc.routes');
+const kycAdminRoutes = require('../modules/kyc/kyc.admin.routes');
 const partnerNotificationRoutes = require('../modules/notifications/notifications.routes');
 const pushBroadcastRoutes = require('../modules/push-broadcasts/push-broadcasts.routes');
 
@@ -54,6 +55,14 @@ router.use('/geography', geographyRoutes);
 router.use('/admins', adminsRoutes);
 router.use('/account-deletion-requests', accountDeletionRoutes);
 router.use('/kyc', kycRoutes);
+/// Admin-side KYC for in-house partner creation — `:partnerId` is in
+/// the path so the admin wizard can target a specific partner. Order
+/// matters: this MUST be mounted before any wildcard `/partners/:id`
+/// route in partnersRoutes that might shadow it. The Express router
+/// in partners.routes.js uses `/:id` at the top level, but Express
+/// mounts these as separate routers so they don't collide — each
+/// `router.use(path, ...)` is matched independently.
+router.use('/partners/:partnerId/kyc', kycAdminRoutes);
 router.use('/partners/me/notifications', partnerNotificationRoutes);
 router.use('/push-broadcasts', pushBroadcastRoutes);
 

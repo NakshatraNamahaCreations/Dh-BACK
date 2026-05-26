@@ -1,6 +1,26 @@
-// In-memory policy storage. Move to a Settings table when ready.
+const prisma = require('../../config/prisma');
+const logger = require('../../config/logger');
 
-let cancellationPolicy = {
+/**
+ * Cancellation + refund policy, persisted in the `platform_settings`
+ * key-value table and edited from the admin Policy config pages.
+ *
+ * Reads fall back to the defaults below when the key is absent (fresh
+ * install, admin never saved) OR when the table itself is missing
+ * (migration not yet applied) — so the app keeps serving the previous
+ * hard-coded behaviour instead of 500ing. Saves upsert the JSON blob.
+ *
+ * The policy is now actually enforced:
+ *   - `computeCustomerCancelFee` is called from bookings.cancelOwn to
+ *     turn a cancel into a partial refund (paid − fee).
+ *   - `partnerPenalty` / `partnerStrikeLimit` drive bookings.partnerCancel
+ *     (penalty ledger row + rolling 7-day strike → auto-suspend).
+ */
+
+const CANCELLATION_KEY = 'cancellation_policy';
+const REFUND_KEY = 'refund_policy';
+
+const DEFAULT_CANCELLATION = {
   freeWindowMins: 5,
   customerTiers: [
     { fromMins: 5, feePercent: 25 },
@@ -11,7 +31,7 @@ let cancellationPolicy = {
   partnerStrikeLimit: 3,
 };
 
-let refundPolicy = {
+const DEFAULT_REFUND = {
   autoApproveBelow: 500,
   manualReviewAbove: 2000,
   processingDaysBank: 5,
@@ -20,14 +40,88 @@ let refundPolicy = {
   reasonRequired: true,
 };
 
-exports.getCancellation = async () => cancellationPolicy;
-exports.saveCancellation = async (policy) => {
-  cancellationPolicy = { ...policy };
-  return cancellationPolicy;
+/// Read a settings key, falling back to `fallback` on absence or any
+/// DB error (e.g. the platform_settings table not existing yet). We
+/// merge over the defaults so a partially-saved blob can't drop a field
+/// the rest of the code relies on.
+const readSetting = async (key, fallback) => {
+  try {
+    const row = await prisma.platformSetting.findUnique({ where: { key } });
+    if (!row || row.value == null || typeof row.value !== 'object') return { ...fallback };
+    return { ...fallback, ...row.value };
+  } catch (err) {
+    logger.warn(`[policy] read "${key}" failed, using defaults: ${err.message}`);
+    return { ...fallback };
+  }
 };
 
-exports.getRefund = async () => refundPolicy;
-exports.saveRefund = async (policy) => {
-  refundPolicy = { ...policy };
-  return refundPolicy;
+const writeSetting = async (key, value) => {
+  const row = await prisma.platformSetting.upsert({
+    where: { key },
+    create: { key, value },
+    update: { value },
+  });
+  return row.value;
 };
+
+exports.getCancellation = async () => readSetting(CANCELLATION_KEY, DEFAULT_CANCELLATION);
+exports.saveCancellation = async (policy) => writeSetting(CANCELLATION_KEY, policy);
+
+exports.getRefund = async () => readSetting(REFUND_KEY, DEFAULT_REFUND);
+exports.saveRefund = async (policy) => writeSetting(REFUND_KEY, policy);
+
+/// Pure fee math, exported separately so it's unit-testable without a
+/// DB and reusable by both the cancel flow and the customer-app quote
+/// endpoint. Pass the live policy in so callers that already loaded it
+/// don't double-read.
+///
+/// Rules (mirrors the admin "Customer-side rules" card):
+///   - elapsed ≤ freeWindowMins      → no fee, full refund
+///   - otherwise pick the tier with the LARGEST `fromMins` that is
+///     still ≤ elapsed, and charge that tier's `feePercent` of the
+///     amount paid. Tiers are sorted defensively in case the admin
+///     entered them out of order.
+///
+/// `amountPaid` is the customer-facing grandTotal that was captured —
+/// the fee (and therefore the refund) is computed against what they
+/// actually paid, not the partner-facing job `total`.
+const computeCustomerCancelFee = ({ policy, amountPaid, bookedAt, now = new Date() }) => {
+  const freeWindowMins = policy?.freeWindowMins ?? 0;
+  const tiers = [...(policy?.customerTiers ?? [])].sort((a, b) => a.fromMins - b.fromMins);
+
+  const elapsedMs = now.getTime() - new Date(bookedAt).getTime();
+  const elapsedMins = Math.max(0, Math.floor(elapsedMs / 60000));
+
+  if (elapsedMins <= freeWindowMins || tiers.length === 0) {
+    return {
+      elapsedMins,
+      freeWindowMins,
+      withinFreeWindow: true,
+      feePercent: 0,
+      feeAmount: 0,
+      refundAmount: amountPaid,
+    };
+  }
+
+  let feePercent = 0;
+  for (const t of tiers) {
+    if (elapsedMins >= t.fromMins) feePercent = t.feePercent;
+  }
+
+  /// Round the fee to whole rupees and clamp the refund to [0, paid] so
+  /// a misconfigured >100% tier can never produce a negative refund or
+  /// a refund larger than the capture.
+  const feeAmount = Math.min(amountPaid, Math.max(0, Math.round((amountPaid * feePercent) / 100)));
+  return {
+    elapsedMins,
+    freeWindowMins,
+    withinFreeWindow: false,
+    feePercent,
+    feeAmount,
+    refundAmount: Math.max(0, amountPaid - feeAmount),
+  };
+};
+
+exports.computeCustomerCancelFee = computeCustomerCancelFee;
+exports.DEFAULT_CANCELLATION = DEFAULT_CANCELLATION;
+exports.DEFAULT_REFUND = DEFAULT_REFUND;

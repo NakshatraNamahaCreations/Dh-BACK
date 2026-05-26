@@ -208,11 +208,24 @@ const partnerMineQuerySchema = z.object({
   }),
 });
 
+/// Partner backing out of an accepted job. Reason is optional (the
+/// partner-app offers a quick reason list but lets them skip it) and
+/// capped like the customer cancel reason.
+const partnerCancelSchema = z.object({
+  params: z.object({ id: z.coerce.number().int().positive() }),
+  body: z
+    .object({
+      reason: z.string().trim().min(1).max(200).optional(),
+    })
+    .optional(),
+});
+
 module.exports = {
   idParam,
   createSchema,
   listMineQuerySchema,
   cancelSchema,
+  partnerCancelSchema,
   adminListQuerySchema,
   disputesListQuerySchema,
   resolveDisputeSchema,

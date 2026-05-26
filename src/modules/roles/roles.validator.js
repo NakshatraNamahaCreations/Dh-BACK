@@ -55,6 +55,10 @@ const createSchema = z.object({
     name: z.string().trim().min(1).max(80),
     description: z.string().trim().max(300).optional(),
     permissions: z.array(permission).default([]),
+    /// 'city' (default) = scoped to the admin's assigned cities;
+    /// 'global' = sees every city. Custom roles can't be made superAdmin
+    /// through the API — only the built-in Super Admin carries that.
+    scope: z.enum(['global', 'city']).optional(),
   }),
 });
 
@@ -65,6 +69,7 @@ const updateSchema = z.object({
       name: z.string().trim().min(1).max(80).optional(),
       description: z.string().trim().max(300).optional(),
       permissions: z.array(permission).optional(),
+      scope: z.enum(['global', 'city']).optional(),
     })
     .refine((v) => Object.keys(v).length > 0, { message: 'No fields to update' }),
 });

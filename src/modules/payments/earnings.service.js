@@ -275,7 +275,7 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
 
   /// Single grouped aggregate per metric — far cheaper than running
   /// the three queries above per-partner.
-  const [pending, lifetime, lastPaid] = await Promise.all([
+  const [pending, lifetime, lastPaid, pendingAdj] = await Promise.all([
     prisma.partnerEarning.groupBy({
       by: ['partnerId'],
       where: { partnerId: { in: partnerIds }, status: 'pending' },
@@ -293,16 +293,27 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
       where: { partnerId: { in: partnerIds }, status: 'paid' },
       _max: { paidAt: true },
     }),
+    /// Pending debits (cancellation penalties) that will net against the
+    /// next payout — subtracted from the displayed pending so the admin
+    /// sees the real settle amount, not the gross earnings.
+    prisma.partnerAdjustment.groupBy({
+      by: ['partnerId'],
+      where: { partnerId: { in: partnerIds }, status: 'pending' },
+      _sum: { amount: true },
+    }),
   ]);
 
   const pendingByPid = new Map(pending.map((r) => [r.partnerId, r]));
   const lifetimeByPid = new Map(lifetime.map((r) => [r.partnerId, r]));
   const lastPaidByPid = new Map(lastPaid.map((r) => [r.partnerId, r]));
+  const pendingAdjByPid = new Map(pendingAdj.map((r) => [r.partnerId, r]));
 
   const data = partners.map((p) => {
     const pe = pendingByPid.get(p.id);
     const lt = lifetimeByPid.get(p.id);
     const lp = lastPaidByPid.get(p.id);
+    const adj = pendingAdjByPid.get(p.id);
+    const pendingDeductions = adj?._sum.amount ?? 0;
     return {
       partnerId: p.id,
       partner: p.name ?? p.businessName ?? `Partner ${p.id}`,
@@ -311,8 +322,11 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
       city: p.cityRef?.name ?? p.city ?? null,
       state: p.cityRef?.state?.name ?? null,
       stateCode: p.cityRef?.state?.code ?? null,
-      pendingAmount: pe?._sum.earnedAmount ?? 0,
+      pendingAmount: (pe?._sum.earnedAmount ?? 0) - pendingDeductions,
       pendingJobs: pe?._count._all ?? 0,
+      /// Surfaced so the payout table can show "−₹X penalties" alongside
+      /// the net pending figure.
+      pendingDeductions,
       lifetimeAmount: lt?._sum.earnedAmount ?? 0,
       lifetimeJobs: lt?._count._all ?? 0,
       lastPaidAt: lp?._max.paidAt ?? null,

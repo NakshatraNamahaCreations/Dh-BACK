@@ -18,13 +18,31 @@ const prisma = require('../../config/prisma');
 const ApiError = require('../../utils/ApiError');
 const { hashPassword, comparePassword } = require('../../utils/password');
 
-const ROLES = ['SUPER', 'CITY_MANAGER'];
+/// Shared read shape — every admin query pulls its city assignments and
+/// its assigned RBAC role so the response can surface both scope and
+/// role name.
+const ADMIN_INCLUDE = {
+  cityAssignments: { include: { city: { select: { id: true, name: true, stateId: true } } } },
+  roleRef: { select: { id: true, name: true, scope: true, superAdmin: true } },
+};
+
+/// Scope ('SUPER' = all cities | 'CITY_MANAGER' = assigned cities)
+/// derived from the assigned role, falling back to the legacy column for
+/// rows not yet backfilled.
+const scopeOf = (a) =>
+  a.roleRef ? (a.roleRef.scope === 'global' ? 'SUPER' : 'CITY_MANAGER') : (a.role || 'SUPER');
 
 const adminShape = (a) => ({
   id: a.id,
   email: a.email,
   name: a.name ?? null,
-  role: a.role || 'SUPER',
+  /// `role` keeps the SCOPE value the admin panel already keys off
+  /// ('SUPER' → shows "All cities"); `roleId`/`roleName`/`scope`
+  /// describe the RBAC role itself.
+  role: scopeOf(a),
+  roleId: a.roleId ?? a.roleRef?.id ?? null,
+  roleName: a.roleRef?.name ?? (scopeOf(a) === 'SUPER' ? 'Super Admin' : 'City Manager'),
+  scope: a.roleRef?.scope ?? (scopeOf(a) === 'SUPER' ? 'global' : 'city'),
   isActive: a.isActive,
   cities: (a.cityAssignments ?? []).map((c) => ({
     id: c.city.id,
@@ -35,9 +53,12 @@ const adminShape = (a) => ({
   updatedAt: a.updatedAt,
 });
 
-exports.list = async ({ search, role, status, page = 1, pageSize = 50 } = {}) => {
+exports.list = async ({ search, roleId, role, status, page = 1, pageSize = 50 } = {}) => {
   const where = {};
-  if (role && ROLES.includes(role)) where.role = role;
+  /// Primary filter is the RBAC role id; `role` (scope) is still
+  /// accepted for backward compatibility with older clients.
+  if (roleId) where.roleId = roleId;
+  else if (role === 'SUPER' || role === 'CITY_MANAGER') where.role = role;
   if (status === 'active') where.isActive = true;
   else if (status === 'inactive') where.isActive = false;
   if (search) {
@@ -53,11 +74,7 @@ exports.list = async ({ search, role, status, page = 1, pageSize = 50 } = {}) =>
       orderBy: [{ isActive: 'desc' }, { createdAt: 'desc' }],
       skip: (page - 1) * pageSize,
       take: pageSize,
-      include: {
-        cityAssignments: {
-          include: { city: { select: { id: true, name: true, stateId: true } } },
-        },
-      },
+      include: ADMIN_INCLUDE,
     }),
     prisma.admin.count({ where }),
   ]);
@@ -70,29 +87,33 @@ exports.list = async ({ search, role, status, page = 1, pageSize = 50 } = {}) =>
 exports.get = async (id) => {
   const a = await prisma.admin.findUnique({
     where: { id: Number(id) },
-    include: {
-      cityAssignments: {
-        include: { city: { select: { id: true, name: true, stateId: true } } },
-      },
-    },
+    include: ADMIN_INCLUDE,
   });
   if (!a) throw ApiError.notFound('Admin not found');
   return adminShape(a);
 };
 
-exports.create = async ({ email, password, name, role, cityIds }) => {
-  if (!ROLES.includes(role)) throw ApiError.badRequest('Invalid role');
+exports.create = async ({ email, password, name, roleId, cityIds }) => {
+  const role = await prisma.role.findUnique({ where: { id: roleId } });
+  if (!role) throw ApiError.badRequest('Invalid role');
   const existing = await prisma.admin.findUnique({ where: { email } });
   if (existing) throw ApiError.conflict('An admin with this email already exists');
   const hashed = await hashPassword(password);
+  /// Keep the legacy scope column in sync with the role so adminScope
+  /// and any legacy reads stay correct.
+  const scope = role.scope === 'global' ? 'SUPER' : 'CITY_MANAGER';
   const data = {
     email,
     password: hashed,
     name: name || null,
-    role,
+    roleId: role.id,
+    role: scope,
     isActive: true,
   };
-  if (role === 'CITY_MANAGER' && Array.isArray(cityIds) && cityIds.length > 0) {
+  /// City assignments only apply to city-scoped roles. Global roles
+  /// (Super Admin, Sub Admin, …) see every city, so any cityIds sent
+  /// for them are ignored.
+  if (role.scope === 'city' && Array.isArray(cityIds) && cityIds.length > 0) {
     /// Validate the city IDs up-front — `createMany` would fail with
     /// a foreign-key error otherwise and the rollback would leave us
     /// in an awkward state where the admin was created but with no
@@ -108,23 +129,19 @@ exports.create = async ({ email, password, name, role, cityIds }) => {
       create: cityIds.map((cityId) => ({ cityId: Number(cityId) })),
     };
   }
-  const created = await prisma.admin.create({
-    data,
-    include: {
-      cityAssignments: {
-        include: { city: { select: { id: true, name: true, stateId: true } } },
-      },
-    },
-  });
+  const created = await prisma.admin.create({ data, include: ADMIN_INCLUDE });
   return adminShape(created);
 };
 
-exports.update = async (id, { name, role, isActive }) => {
+exports.update = async (id, { name, roleId, isActive }) => {
   const partial = {};
   if (name !== undefined) partial.name = name || null;
-  if (role !== undefined) {
-    if (!ROLES.includes(role)) throw ApiError.badRequest('Invalid role');
-    partial.role = role;
+  if (roleId !== undefined) {
+    const role = await prisma.role.findUnique({ where: { id: roleId } });
+    if (!role) throw ApiError.badRequest('Invalid role');
+    partial.roleId = role.id;
+    /// Re-sync the scope cache whenever the role changes.
+    partial.role = role.scope === 'global' ? 'SUPER' : 'CITY_MANAGER';
   }
   if (isActive !== undefined) partial.isActive = Boolean(isActive);
   if (Object.keys(partial).length === 0) {
@@ -134,11 +151,7 @@ exports.update = async (id, { name, role, isActive }) => {
     const updated = await prisma.admin.update({
       where: { id: Number(id) },
       data: partial,
-      include: {
-        cityAssignments: {
-          include: { city: { select: { id: true, name: true, stateId: true } } },
-        },
-      },
+      include: ADMIN_INCLUDE,
     });
     return adminShape(updated);
   } catch (err) {
@@ -188,6 +201,47 @@ exports.setCities = async (id, cityIds) => {
   });
 
   return exports.get(adminId);
+};
+
+/// Hard-delete an admin. Cascades their city assignments + notifications
+/// (FK onDelete:Cascade) and nulls their audit-log author pointer
+/// (SetNull) so history survives. Two guards keep an operator from
+/// shooting themselves in the foot:
+///   - you can't delete your own account
+///   - you can't delete the LAST active super admin (would lock everyone
+///     out of access control)
+exports.remove = async (id, { actingAdminId } = {}) => {
+  const adminId = Number(id);
+  if (actingAdminId != null && Number(actingAdminId) === adminId) {
+    throw ApiError.badRequest('You cannot delete your own account.');
+  }
+  const admin = await prisma.admin.findUnique({
+    where: { id: adminId },
+    include: { roleRef: { select: { superAdmin: true } } },
+  });
+  if (!admin) throw ApiError.notFound('Admin not found');
+
+  const isSuper = admin.roleRef?.superAdmin || (!admin.roleId && admin.role === 'SUPER');
+  if (isSuper) {
+    const otherSupers = await prisma.admin.count({
+      where: {
+        id: { not: adminId },
+        isActive: true,
+        OR: [{ roleRef: { superAdmin: true } }, { roleId: null, role: 'SUPER' }],
+      },
+    });
+    if (otherSupers === 0) {
+      throw ApiError.badRequest('Cannot delete the last super admin.');
+    }
+  }
+
+  try {
+    await prisma.admin.delete({ where: { id: adminId } });
+  } catch (err) {
+    if (err.code === 'P2025') throw ApiError.notFound('Admin not found');
+    throw err;
+  }
+  return { id: adminId };
 };
 
 exports.resetPassword = async (id, newPassword) => {

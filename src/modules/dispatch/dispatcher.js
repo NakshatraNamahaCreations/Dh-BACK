@@ -153,6 +153,16 @@ const broadcastClaimed = (audience, payload) => {
   }
 };
 
+/// Emit an event straight to one partner's connected sockets. Used for
+/// admin-assigned jobs (`job.assigned`) so the partner-app can ring the
+/// "New job assigned" alert without going through the broadcast/offer
+/// path. No-op when the socket gateway isn't wired or the partner has
+/// no live socket (the FCM push from the caller covers that case).
+const emitToPartner = (partnerId, event, payload) => {
+  if (!socketEmitter || partnerId == null) return;
+  socketEmitter(event, Number(partnerId), payload);
+};
+
 /// One wave: find candidates, mark them visible, push to sockets.
 const handleWave = async ({ bookingId, wave: waveNumber }) => {
   const waveSpec = DISPATCH_WAVES.find((w) => w.wave === waveNumber);
@@ -328,6 +338,14 @@ const handleReconcile = async () => {
   logger.info(`reconciler: re-queued expire for ${orphans.length} orphaned PENDING bookings`);
 };
 
+/// Repeatable job — prune admin + partner notifications past the
+/// retention window (7 days). Lazy-required to avoid pulling the
+/// notifications module into the dispatcher's import graph at load time.
+const handleNotificationCleanup = async () => {
+  const { pruneExpired } = require('../notifications/notifications.cleanup');
+  return pruneExpired();
+};
+
 /// BYOP pay-after-accept expiry. Fires 3 min after the partner
 /// accepts a booking with `offeredPrice` set. If the customer still
 /// hasn't paid, the booking auto-cancels back to CANCELLED (with a
@@ -347,15 +365,24 @@ const handlePaymentExpire = async ({ bookingId }) => {
       paymentStatus: true,
       partnerId: true,
       offeredPrice: true,
+      isInstant: true,
+      couponId: true,
       paymentDeadlineAt: true,
       customerId: true,
     },
   });
   if (!booking) return;
-  if (booking.status !== 'CONFIRMED' || booking.paymentStatus === 'paid') {
+  if (booking.paymentStatus === 'paid') {
     /// Already paid, already cancelled, or otherwise out of scope.
     return;
   }
+  const isByopTimeout = booking.status === 'CONFIRMED' && booking.offeredPrice != null;
+  const isInstantPayTimeout =
+    booking.status === 'PENDING' &&
+    booking.isInstant &&
+    booking.offeredPrice == null &&
+    booking.partnerId == null;
+  if (!isByopTimeout && !isInstantPayTimeout) return;
   /// Defensive guard against the job firing slightly early — fall
   /// through if we're somehow before the deadline (clock drift,
   /// re-enqueue with smaller delay, etc.).
@@ -363,27 +390,27 @@ const handlePaymentExpire = async ({ bookingId }) => {
     return;
   }
 
-  const result = await prisma.booking.updateMany({
-    where: {
-      id: booking.id,
-      status: 'CONFIRMED',
-      paymentStatus: { not: 'paid' },
-    },
-    data: {
-      status: 'CANCELLED',
-      dispatchStatus: 'payment_timeout',
-      noPartnerReason: 'Customer did not pay within the 3-minute window after partner accepted.',
-      partnerId: null,
-    },
+  const result = await prisma.$transaction(async (tx) => {
+    if (booking.couponId != null) {
+      await couponsService.refundForBooking({ couponId: booking.couponId, tx });
+    }
+    return tx.booking.deleteMany({
+      where: {
+        id: booking.id,
+        status: booking.status,
+        paymentStatus: { not: 'paid' },
+      },
+    });
   });
   if (result.count === 0) return;
 
+  await registry.clearBooking(bookingId);
   if (socketEmitter) {
     socketEmitter('booking.payment_expired', `customer:${booking.customerId}`, {
       bookingId: booking.id,
     });
   }
-  logger.info(`payment_expire: booking ${bookingId} cancelled (3-min pay window elapsed)`);
+  logger.info(`payment_expire: booking ${bookingId} deleted (unpaid attempt expired)`);
 };
 
 /// Wave expiry. After the 7km / wave-3 broadcast also passes without
@@ -484,6 +511,7 @@ const handleAdminTimeout = async ({ bookingId }) => {
       status: true,
       partnerId: true,
       dispatchStatus: true,
+      paymentStatus: true,
       couponId: true,
       customerId: true,
     },
@@ -498,28 +526,41 @@ const handleAdminTimeout = async ({ bookingId }) => {
   }
 
   let didCancel = false;
+  let didDelete = false;
   await prisma.$transaction(async (tx) => {
-    const result = await tx.booking.updateMany({
-      where: {
-        id: booking.id,
-        status: 'PENDING',
-        partnerId: null,
-        dispatchStatus: 'needs_admin_dispatch',
-      },
-      data: {
-        status: 'CANCELLED',
-        dispatchStatus: 'no_partner_found',
-        noPartnerReason:
-          'No partner found within broadcast window; admin grace period elapsed without manual dispatch.',
-      },
-    });
-    if (result.count > 0) {
-      didCancel = true;
+    if (booking.paymentStatus === 'paid') {
+      const result = await tx.booking.updateMany({
+        where: {
+          id: booking.id,
+          status: 'PENDING',
+          partnerId: null,
+          dispatchStatus: 'needs_admin_dispatch',
+        },
+        data: {
+          status: 'CANCELLED',
+          dispatchStatus: 'no_partner_found',
+          noPartnerReason:
+            'No partner found within broadcast window; admin grace period elapsed without manual dispatch.',
+        },
+      });
+      didCancel = result.count > 0;
+    } else {
       if (booking.couponId != null) {
         await couponsService.refundForBooking({ couponId: booking.couponId, tx });
       }
+      const result = await tx.booking.deleteMany({
+        where: {
+          id: booking.id,
+          status: 'PENDING',
+          partnerId: null,
+          dispatchStatus: 'needs_admin_dispatch',
+          paymentStatus: { not: 'paid' },
+        },
+      });
+      didDelete = result.count > 0;
     }
   });
+  if (!didCancel && !didDelete) return;
 
   if (didCancel) {
     try {
@@ -538,7 +579,18 @@ const handleAdminTimeout = async ({ bookingId }) => {
     }
   }
 
-  logger.info(`admin_timeout: booking ${bookingId} cancelled (admin grace elapsed)`);
+  if (didDelete) {
+    await registry.clearBooking(bookingId);
+    if (socketEmitter) {
+      socketEmitter('booking.expired', `customer:${booking.customerId}`, {
+        bookingId: booking.id,
+      });
+    }
+  }
+
+  logger.info(
+    `admin_timeout: booking ${bookingId} ${didDelete ? 'deleted' : 'cancelled'} (admin grace elapsed)`,
+  );
 };
 
 /// Boot the worker. Called once from server.js. Returns null if the
@@ -564,6 +616,8 @@ const start = () => {
           return handlePaymentExpire(job.data);
         case 'reconcile':
           return handleReconcile();
+        case 'notification_cleanup':
+          return handleNotificationCleanup();
         default:
           logger.warn(`dispatch worker: unknown job name "${job.name}"`);
       }
@@ -589,6 +643,16 @@ const start = () => {
     logger.warn(`Failed to schedule reconciler: ${err.message}`);
   });
 
+  /// Install the recurring notification-cleanup schedule, and run one
+  /// pass immediately so anything already past the retention window is
+  /// pruned on boot instead of waiting for the first interval.
+  queue.ensureNotificationCleanupScheduled().catch((err) => {
+    logger.warn(`Failed to schedule notification cleanup: ${err.message}`);
+  });
+  handleNotificationCleanup().catch((err) => {
+    logger.warn(`Initial notification cleanup failed: ${err.message}`);
+  });
+
   logger.info('Dispatch worker started (push mode enabled)');
   return worker;
 };
@@ -611,6 +675,7 @@ module.exports = {
   cancelAllForBooking,
   schedulePaymentExpire,
   broadcastClaimed,
+  emitToPartner,
   setSocketEmitter,
   start,
   stop,

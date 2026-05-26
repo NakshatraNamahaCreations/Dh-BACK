@@ -60,9 +60,30 @@ exports.generateForPartner = async ({ partnerId, notes = null }) => {
       throw ApiError.badRequest('No pending earnings to settle for this partner');
     }
 
-    const amount = earnings.reduce((s, e) => s + e.earnedAmount, 0);
+    /// Pending debits (cancellation penalties, etc.) net against the
+    /// earnings sum so the payout reflects what the partner is actually
+    /// owed. They're attached to this payout and flipped to `applied`;
+    /// rejecting the payout releases them back to `pending` for the next
+    /// cycle. `amount` can go negative when penalties exceed earnings —
+    /// that's intentional (the partner carries a debit), and the admin
+    /// sees it on the payout row rather than the penalty silently
+    /// vanishing.
+    const adjustments = await tx.partnerAdjustment.findMany({
+      where: { partnerId: Number(partnerId), status: 'pending', payoutId: null },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const earningsTotal = earnings.reduce((s, e) => s + e.earnedAmount, 0);
+    const adjustmentsTotal = adjustments.reduce((s, a) => s + a.amount, 0);
+    const amount = earningsTotal - adjustmentsTotal;
     const periodStart = earnings[0].createdAt;
     const periodEnd = earnings[earnings.length - 1].createdAt;
+    const payoutNotes =
+      adjustmentsTotal > 0
+        ? [notes, `Includes −₹${adjustmentsTotal} in cancellation penalties (${adjustments.length}).`]
+            .filter(Boolean)
+            .join(' ')
+        : notes;
 
     const payout = await tx.payout.create({
       data: {
@@ -71,7 +92,7 @@ exports.generateForPartner = async ({ partnerId, notes = null }) => {
         earningsCount: earnings.length,
         periodStart,
         periodEnd,
-        notes,
+        notes: payoutNotes,
       },
     });
 
@@ -79,6 +100,12 @@ exports.generateForPartner = async ({ partnerId, notes = null }) => {
       where: { id: { in: earnings.map((e) => e.id) } },
       data: { payoutId: payout.id },
     });
+    if (adjustments.length > 0) {
+      await tx.partnerAdjustment.updateMany({
+        where: { id: { in: adjustments.map((a) => a.id) } },
+        data: { payoutId: payout.id, status: 'applied' },
+      });
+    }
 
     return tx.payout.findUnique({
       where: { id: payout.id },
@@ -165,6 +192,12 @@ exports.reject = async ({ payoutId, notes }) => {
     await tx.partnerEarning.updateMany({
       where: { payoutId: id },
       data: { payoutId: null },
+    });
+    /// Same for any netted adjustments — back to `pending` so the next
+    /// payout re-deducts them.
+    await tx.partnerAdjustment.updateMany({
+      where: { payoutId: id },
+      data: { payoutId: null, status: 'pending' },
     });
     return tx.payout.update({
       where: { id },

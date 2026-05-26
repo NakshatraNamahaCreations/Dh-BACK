@@ -1,4 +1,24 @@
 const prisma = require('../../config/prisma');
+const { applyScopeToWhere, applyScopeToRelation } = require('../../middlewares/adminScope');
+
+// ── Scope helpers ────────────────────────────────────────────────────────────
+//
+// Every query in this module is filtered to the requesting admin's
+// cities. Bookings and partners carry a `cityId` directly; customers
+// don't, so they're scoped through their bookings' city. All three are
+// no-ops for a SUPER admin (scope.cityIds === null) — they see the whole
+// platform exactly as before.
+
+/// Booking / partner WHERE (both have a cityId column).
+const withCityScope = (where, scope) => {
+  if (scope) applyScopeToWhere(where, scope);
+  return where;
+};
+/// Customer WHERE — scoped via the related bookings' cityId.
+const withCustomerScope = (where, scope) => {
+  if (scope) applyScopeToRelation(where, scope, 'bookings');
+  return where;
+};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -17,20 +37,20 @@ const fmtDay = (d) =>
 
 // ── Dashboard summary ──────────────────────────────────────────────────────
 
-exports.summary = async () => {
+exports.summary = async (scope) => {
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
   const yesterdayStart = new Date(todayStart); yesterdayStart.setDate(yesterdayStart.getDate() - 1);
 
   const [todayBookings, yesterdayBookings, activePartners] = await Promise.all([
     prisma.booking.findMany({
-      where: { createdAt: { gte: todayStart } },
+      where: withCityScope({ createdAt: { gte: todayStart } }, scope),
       select: { total: true, status: true },
     }),
     prisma.booking.findMany({
-      where: { createdAt: { gte: yesterdayStart, lt: todayStart } },
+      where: withCityScope({ createdAt: { gte: yesterdayStart, lt: todayStart } }, scope),
       select: { total: true },
     }),
-    prisma.partner.count({ where: { isActive: true } }),
+    prisma.partner.count({ where: withCityScope({ isActive: true }, scope) }),
   ]);
 
   const todayRevenue = todayBookings
@@ -47,7 +67,7 @@ exports.summary = async () => {
   // in the last 7 days at 75% of total (rough partner share).
   const sevenDaysAgo = new Date(); sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
   const recentCompleted = await prisma.booking.aggregate({
-    where: { status: 'COMPLETED', updatedAt: { gte: sevenDaysAgo } },
+    where: withCityScope({ status: 'COMPLETED', updatedAt: { gte: sevenDaysAgo } }, scope),
     _sum: { total: true },
   });
   const pendingPayouts = Math.round(((recentCompleted._sum.total ?? 0) * 0.75));
@@ -64,11 +84,11 @@ exports.summary = async () => {
 
 // ── Revenue series ─────────────────────────────────────────────────────────
 
-exports.revenueSeries = async ({ range = '7d' } = {}) => {
+exports.revenueSeries = async ({ range = '7d' } = {}, scope) => {
   const { from, days } = dateFromRange(range);
 
   const bookings = await prisma.booking.findMany({
-    where: { createdAt: { gte: from }, status: { not: 'CANCELLED' } },
+    where: withCityScope({ createdAt: { gte: from }, status: { not: 'CANCELLED' } }, scope),
     select: { total: true, createdAt: true },
   });
 
@@ -92,11 +112,11 @@ exports.revenueSeries = async ({ range = '7d' } = {}) => {
 
 // ── Booking analytics ──────────────────────────────────────────────────────
 
-exports.bookingAnalytics = async ({ range = '7d' } = {}) => {
+exports.bookingAnalytics = async ({ range = '7d' } = {}, scope) => {
   const { from } = dateFromRange(range);
 
   const bookings = await prisma.booking.findMany({
-    where: { createdAt: { gte: from } },
+    where: withCityScope({ createdAt: { gte: from } }, scope),
     include: {
       items: {
         include: { service: { include: { category: { select: { id: true, name: true } } } } },
@@ -169,12 +189,12 @@ exports.bookingAnalytics = async ({ range = '7d' } = {}) => {
 
 // ── Revenue report ─────────────────────────────────────────────────────────
 
-exports.revenueReport = async ({ range = '30d' } = {}) => {
+exports.revenueReport = async ({ range = '30d' } = {}, scope) => {
   const { from } = dateFromRange(range);
-  const series = await exports.revenueSeries({ range });
+  const series = await exports.revenueSeries({ range }, scope);
 
   const bookings = await prisma.booking.findMany({
-    where: { createdAt: { gte: from } },
+    where: withCityScope({ createdAt: { gte: from } }, scope),
     include: {
       items: {
         include: { service: { include: { category: { select: { name: true } } } } },
@@ -225,12 +245,15 @@ exports.revenueReport = async ({ range = '30d' } = {}) => {
 
 // ── Partner performance ────────────────────────────────────────────────────
 
-exports.partnerPerformance = async ({ range = '30d' } = {}) => {
+exports.partnerPerformance = async ({ range = '30d' } = {}, scope) => {
   const { from, days } = dateFromRange(range);
   const priorFrom = new Date(from.getTime() - days * 24 * 60 * 60 * 1000);
 
+  /// Scope the partner SET to the admin's cities; every downstream
+  /// query filters by `partnerId IN (this set)`, so bookings/earnings/
+  /// ratings inherit the scope automatically.
   const partners = await prisma.partner.findMany({
-    where: { isActive: true },
+    where: withCityScope({ isActive: true }, scope),
     select: { id: true, name: true, businessName: true, categoryId: true },
   });
   if (partners.length === 0) return { rows: [], topPerformers: [], atRisk: [] };
@@ -331,15 +354,18 @@ exports.partnerPerformance = async ({ range = '30d' } = {}) => {
 
 // ── Customer insights ──────────────────────────────────────────────────────
 
-exports.customerInsights = async ({ range = '90d' } = {}) => {
+exports.customerInsights = async ({ range = '90d' } = {}, scope) => {
   const { from, days } = dateFromRange(range);
 
+  /// Customers have no city of their own — a city manager's "customers"
+  /// are those who booked in their city, so scope via the bookings
+  /// relation. SUPER admins (null scope) see every customer.
   const customers = await prisma.customer.findMany({
-    where: { createdAt: { gte: from } },
+    where: withCustomerScope({ createdAt: { gte: from } }, scope),
     select: { id: true, createdAt: true },
   });
   const allBookings = await prisma.booking.findMany({
-    where: { createdAt: { gte: from } },
+    where: withCityScope({ createdAt: { gte: from } }, scope),
     select: { customerId: true, total: true, createdAt: true },
   });
 
@@ -383,6 +409,7 @@ exports.customerInsights = async ({ range = '90d' } = {}) => {
   // and KPIs above.
   const COHORT_LOOKBACK_MONTHS = 6;
   const cohortHistory = await prisma.booking.findMany({
+    where: withCityScope({}, scope),
     select: { customerId: true, createdAt: true },
   });
   /// firstBookingByCustomer: customerId → epoch-ms of first booking
@@ -465,11 +492,11 @@ exports.customerInsights = async ({ range = '90d' } = {}) => {
   const sixtyAgo = new Date(); sixtyAgo.setDate(sixtyAgo.getDate() - 60);
   const recentBookers = new Set(
     (await prisma.booking.findMany({
-      where: { createdAt: { gte: sixtyAgo } },
+      where: withCityScope({ createdAt: { gte: sixtyAgo } }, scope),
       select: { customerId: true },
     })).map((b) => b.customerId),
   );
-  const allActive = await prisma.customer.count({ where: { isActive: true } });
+  const allActive = await prisma.customer.count({ where: withCustomerScope({ isActive: true }, scope) });
   const churnRiskCount = Math.max(0, allActive - recentBookers.size);
 
   return {

@@ -116,25 +116,53 @@ exports.cities = async () => {
 // ── Public coverage check ────────────────────────────────────────────────
 //
 // Used by the customer app at launch to decide whether to show the home
-// experience or a "Coming soon" screen. Match logic:
+// experience or a "Coming soon" screen. Match logic, in priority order:
 //
-//   1. Find an active ServiceArea where city matches (case-insensitive).
-//   2. If none → not serviceable.
+//   1. Pincode-first: if the supplied pincode appears in ANY active area's
+//      `pincodes` whitelist, the customer is serviceable — regardless of
+//      what their geocoder calls the city. Handles the "440016 is admin-
+//      entered under Hingna but the phone says Nagpur" case where the
+//      city-name path would fail.
+//   2. City match: cityResolver.resolve() → cityId lookup → free-text
+//      fallback. Picks the first active area for that city.
 //   3. If found and area.pincodes is empty → serviceable (whole city).
 //   4. If found and pincode supplied is in area.pincodes → serviceable.
 //   5. Else → not serviceable, but we still hint the city *is* a launch
 //      market so the UI can say "we're in Bengaluru but not your pincode yet".
 exports.check = async ({ city, pincode }) => {
   const cityKey = String(city ?? '').trim();
+  const pin = String(pincode ?? '').trim();
+
+  /// Step 1 — pincode-first. If admin has explicitly whitelisted this
+  /// pincode under any active service area, the customer is serviceable
+  /// regardless of what their phone's geocoder calls the surrounding
+  /// city. This is the path that fixes "I added 440016 under Hingna but
+  /// the customer's geocoder returns Nagpur — they're being told no
+  /// service" — pincodes are unambiguous, city names aren't.
+  if (pin) {
+    const pinMatch = await prisma.serviceArea.findFirst({
+      where: { pincodes: { has: pin }, active: true },
+      select: { id: true, city: true, pincodes: true, categoryIds: true },
+    });
+    if (pinMatch) {
+      return {
+        serviceable: true,
+        city: pinMatch.city,
+        pincode: pin,
+        categoryIds: pinMatch.categoryIds,
+      };
+    }
+  }
+
   if (!cityKey) {
     return { serviceable: false, reason: 'no_city', message: 'Enable location to check availability.' };
   }
 
-  /// Prefer cityId-based lookup when the resolver matches the
-  /// free-text input to a real City row — this is exact, indexed,
+  /// Step 2 — city match. Prefer cityId-based lookup when the resolver
+  /// matches the free-text input to a real City row — exact, indexed,
   /// and not fooled by spelling drift. Fall back to the legacy
-  /// case-insensitive substring on `service_areas.city` when the
-  /// resolver returns null (city not yet in the geography table).
+  /// case-insensitive lookup on `service_areas.city` when the resolver
+  /// returns null (city not yet in the geography table).
   const cityResolver = require('../geography/city-resolver');
   const cityId = await cityResolver.resolve(cityKey);
 
@@ -168,12 +196,11 @@ exports.check = async ({ city, pincode }) => {
     return {
       serviceable: true,
       city: area.city,
-      pincode: pincode ?? null,
+      pincode: pin || null,
       categoryIds: area.categoryIds,
     };
   }
 
-  const pin = String(pincode ?? '').trim();
   if (pin && area.pincodes.includes(pin)) {
     return { serviceable: true, city: area.city, pincode: pin, categoryIds: area.categoryIds };
   }

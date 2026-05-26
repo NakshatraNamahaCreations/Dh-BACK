@@ -4,6 +4,7 @@ const { signToken } = require('../../utils/jwt');
 const { comparePassword } = require('../../utils/password');
 const otpService = require('./otp.service');
 const auditLogs = require('../audit-logs/audit-logs.service');
+const rolesService = require('../roles/roles.service');
 
 const stripPassword = ({ password, ...rest }) => rest;
 
@@ -71,26 +72,42 @@ const partnerVerifyOtp = async ({ phone, code, name }) => {
 // -------- Admin (email + password) --------
 
 const adminLogin = async ({ email, password }) => {
+  /// Make sure the built-in roles exist and legacy admins are backfilled
+  /// before we resolve access. Non-fatal: if the roles table isn't
+  /// migrated yet, `resolveAccess` falls back to the legacy scope column
+  /// so login keeps working.
+  await rolesService.ensureSeeded().catch(() => {});
+
   const admin = await prisma.admin.findUnique({
     where: { email },
-    include: { cityAssignments: { select: { cityId: true } } },
+    include: { cityAssignments: { select: { cityId: true } }, roleRef: true },
   });
   if (!admin || !admin.isActive) throw ApiError.unauthorized('Invalid credentials');
 
   const ok = await comparePassword(password, admin.password);
   if (!ok) throw ApiError.unauthorized('Invalid credentials');
 
-  /// Bake the role + city scope straight into the JWT so route
-  /// middlewares can scope queries without an extra DB hop. CITY_MANAGER
-  /// with zero cities is intentional — they see nothing until a SUPER
-  /// admin assigns at least one, which mirrors the principle of least
-  /// privilege ("locked out by default, not opened by default").
+  /// Bake scope + permissions straight into the JWT so route middlewares
+  /// can authorize without an extra DB hop. `super` admins carry the
+  /// bypass flag (and an empty `perms` to keep the token small — the
+  /// bypass makes the list irrelevant); everyone else carries their
+  /// role's concrete permission list. CITY_MANAGER scope with zero
+  /// cities is intentional — they see nothing until a SUPER assigns at
+  /// least one (locked-out-by-default).
   const cityIds = admin.cityAssignments.map((a) => a.cityId);
+  const access = rolesService.resolveAccess(admin);
   const token = signToken({
     sub: admin.id,
     type: 'ADMIN',
-    role: admin.role || 'SUPER',
+    /// Identity, surfaced in the admin-panel topbar so it shows the
+    /// actual signed-in admin + their role (not a generic "Admin").
+    name: admin.name ?? null,
+    email: admin.email,
+    roleName: access.roleName,
+    role: access.scope,
     cityIds,
+    super: access.isSuper,
+    perms: access.isSuper ? [] : access.permissions,
   });
   auditLogs.write({
     adminId: admin.id,
@@ -136,27 +153,37 @@ const me = async ({ sub, type }) => {
     return { type, user: { ...user, categoryName } };
   }
   if (type === 'ADMIN') {
+    await rolesService.ensureSeeded().catch(() => {});
     const user = await prisma.admin.findUnique({
       where: { id: sub },
       include: {
         cityAssignments: {
           include: { city: { select: { id: true, name: true, stateId: true } } },
         },
+        roleRef: true,
       },
     });
     if (!user) throw ApiError.notFound('Admin not found');
     /// Flatten the scope into shapes the admin panel can consume
     /// directly — `cityIds` for filter intersections, `cities` for
-    /// the assignment chips on the Admin Users page.
+    /// the assignment chips on the Admin Users page. `permissions` +
+    /// `super` drive the panel's permission-based UI gating; `role`
+    /// (scope) is kept for backward compatibility.
     const cities = user.cityAssignments.map((a) => a.city);
     const cityIds = cities.map((c) => c.id);
+    const access = rolesService.resolveAccess(user);
     const safe = stripPassword(user);
     delete safe.cityAssignments;
+    delete safe.roleRef;
     return {
       type,
       user: {
         ...safe,
-        role: user.role || 'SUPER',
+        role: access.scope,
+        roleId: access.roleId,
+        roleName: access.roleName,
+        super: access.isSuper,
+        permissions: access.isSuper ? rolesService.ALL_PERMISSIONS : access.permissions,
         cityIds,
         cities,
       },
