@@ -50,6 +50,10 @@ const updateMeSchema = z.object({
       bankPassbookUrl: z.string().url().optional(),
       selfieUrl: z.string().url().optional(),
       expoPushToken: z.string().max(200).optional(),
+      /// Direct FCM device token (raw, no `ExponentPushToken[` prefix).
+      /// Wider max because raw FCM tokens are ~150–200 chars on average
+      /// but vendor-extended ones can run longer.
+      fcmToken: z.string().max(400).optional(),
     })
     .refine((v) => Object.keys(v).length > 0, { message: 'No fields to update' }),
 });

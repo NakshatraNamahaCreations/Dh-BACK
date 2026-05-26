@@ -18,3 +18,10 @@ build/
 .idea/
 
 prisma/migrations/dev.db*
+
+# Firebase Admin service-account credentials — never commit. Generate
+# from Firebase Console → Project Settings → Service Accounts → Generate
+# new private key, save the JSON here (or point FIREBASE_SERVICE_ACCOUNT
+# env var at a path outside the repo).
+firebase-service-account.json
+

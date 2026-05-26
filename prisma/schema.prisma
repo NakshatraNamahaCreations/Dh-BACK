@@ -167,6 +167,14 @@ model Partner {
   /// Used by the dispatcher to push `dispatch.offer` to the device
   /// even when the app is closed or minimised.
   expoPushToken String?
+  /// Direct Firebase Cloud Messaging device token. Preferred over
+  /// `expoPushToken` for job alerts on aggressive Android OEMs (Vivo,
+  /// Oppo, Xiaomi) — Expo's relay adds latency and is throttled when
+  /// the app is swiped away. A direct FCM data message lets the device
+  /// wake the JS background handler, which fires the notifee
+  /// full-screen alert (lock-screen takeover). Backend prefers this
+  /// when present, falling back to expoPushToken when null.
+  fcmToken      String?
   /// Denormalised rating aggregate — recomputed after every BookingRating
   /// upsert so admin/partner reads never need a GROUP BY aggregation.
   avgRating    Float   @default(0)
