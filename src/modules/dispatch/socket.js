@@ -62,6 +62,15 @@ const removePartnerSocket = (partnerId, socketId) => {
   return false;
 };
 
+/// True when the partner has at least one live socket right now. The
+/// dispatcher uses this to skip the FCM fallback for partners who'll get
+/// the in-app `dispatch.offer` over their open socket, so they don't see
+/// a duplicate device notification on top of the rich in-app alert.
+const isPartnerConnected = (partnerId) => {
+  const set = partnerSockets.get(Number(partnerId));
+  return !!set && set.size > 0;
+};
+
 /// Emitter the dispatcher uses. Two address types:
 ///   - numeric partnerId → resolves to that partner's sockets
 ///   - 'customer:{id}'   → resolves to a per-customer room on the
@@ -221,6 +230,10 @@ const start = (httpServer) => {
   /// straight to the right sockets without socket.io knowledge inside
   /// the dispatcher.
   dispatcher.setSocketEmitter(emit);
+  /// Let the dispatcher (and the admin-assign push path, via
+  /// dispatcher.isPartnerConnected) see who has a live socket, so the
+  /// hybrid FCM fallback only fires for partners the socket can't reach.
+  dispatcher.setSocketConnectionChecker(isPartnerConnected);
   /// Same hook for the notifications service — every `create` writes
   /// a row and pushes `notification.new` to the partner so the bell
   /// badge updates instantly.

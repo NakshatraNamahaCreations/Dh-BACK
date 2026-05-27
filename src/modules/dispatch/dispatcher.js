@@ -84,6 +84,7 @@ const ADMIN_DISPATCH_GRACE_MS = 2 * 60 * 60 * 1000;
 
 let worker = null;
 let socketEmitter = null;
+let socketConnectionChecker = null;
 
 /// Allow the socket gateway to register itself for offer pushes.
 /// Decoupled so the dispatcher module doesn't import socket.io
@@ -91,6 +92,22 @@ let socketEmitter = null;
 const setSocketEmitter = (fn) => {
   socketEmitter = fn;
 };
+
+/// Same decoupled-injection pattern for "does this partner have a live
+/// socket right now". The gateway owns the connection map; it registers
+/// this checker so the dispatcher (and other callers, via the export
+/// below) can suppress the FCM fallback for partners who'll receive the
+/// in-app socket event — otherwise the hybrid OS-rendered push would
+/// double-alert on top of the in-app one.
+const setSocketConnectionChecker = (fn) => {
+  socketConnectionChecker = fn;
+};
+
+/// True when the partner has at least one connected socket. Returns
+/// false when no checker is wired (gateway not started) — callers then
+/// send the push, since a possible duplicate beats a missed job.
+const isPartnerConnected = (partnerId) =>
+  socketConnectionChecker ? !!socketConnectionChecker(Number(partnerId)) : false;
 
 /// Computes the moment dispatch starts for a booking. For instant
 /// bookings (and BYOP offers) it's `createdAt`; for scheduled jobs
@@ -290,15 +307,20 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
     }
   }
 
-  /// Background push notifications — reach partners whose app is
-  /// closed or minimised. Fires after the socket emit so the
-  /// connected partners get the in-app alert first; disconnected
-  /// partners get the device notification instead.
-  void sendJobOfferPushes(
-    prisma,
-    candidates.map((c) => c.partnerId),
-    { bookingId: booking.id, serviceName, amount },
-  );
+  /// Background push notifications — reach ONLY partners without a live
+  /// socket. The connected ones already got `dispatch.offer` above and
+  /// render the rich in-app alert from it; the FCM push is now the
+  /// hybrid OS-rendered form (so it shows even on a frozen/killed
+  /// device), which would double-alert a connected partner. Gating on
+  /// connection here is what keeps it to exactly one alert per partner.
+  const offlineCandidates = candidates.filter((c) => !isPartnerConnected(c.partnerId));
+  if (offlineCandidates.length > 0) {
+    void sendJobOfferPushes(
+      prisma,
+      offlineCandidates.map((c) => c.partnerId),
+      { bookingId: booking.id, serviceName, amount },
+    );
+  }
 
   logger.info(
     `dispatch wave ${waveNumber} for booking ${bookingId}: ${candidates.length} candidate${candidates.length === 1 ? '' : 's'}`,
@@ -677,6 +699,8 @@ module.exports = {
   broadcastClaimed,
   emitToPartner,
   setSocketEmitter,
+  setSocketConnectionChecker,
+  isPartnerConnected,
   start,
   stop,
 };

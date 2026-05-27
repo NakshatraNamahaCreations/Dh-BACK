@@ -1747,30 +1747,36 @@ exports.reassign = async (bookingId, partnerId, reason = 'Manual assignment') =>
   /// Mirrors what the dispatcher does for the normal wave path.
   const headService = updated.items?.[0]?.serviceName ?? 'Service';
   const amount = updated.offeredPrice ?? updated.total ?? 0;
-  try {
-    /// "New job assigned" copy (not the offer "New job request!") so the
-    /// closed-app tray notification matches the in-app alert, and tapping
-    /// it opens the booking instead of the Accept/Decline offer flow.
-    const { sendJobAssignedPush } = require('../notifications/push.service');
-    void sendJobAssignedPush(
-      prisma,
-      partner.id,
-      { bookingId: Number(bookingId), serviceName: headService, amount },
-    );
-  } catch (err) {
-    console.warn(`Admin-assign push failed for booking ${bookingId}: ${err.message}`);
-  }
-
   /// Ring the partner-app's "New job assigned" alert (5s vibrate +
   /// sound) over the live socket when their app is open + connected.
   /// Distinct from the dispatch.offer path: this job is already theirs,
-  /// so there's no Accept/Decline — it's a heads-up, not an offer. The
-  /// FCM push above covers the closed-app case.
-  dispatcher.emitToPartner(partner.id, 'job.assigned', {
-    bookingId: Number(bookingId),
-    serviceName: headService,
-    amount,
-  });
+  /// so there's no Accept/Decline — it's a heads-up, not an offer.
+  const partnerConnected = dispatcher.isPartnerConnected(partner.id);
+  if (partnerConnected) {
+    dispatcher.emitToPartner(partner.id, 'job.assigned', {
+      bookingId: Number(bookingId),
+      serviceName: headService,
+      amount,
+    });
+  } else {
+    /// No live socket — the partner's app is closed/frozen, so reach them
+    /// with the hybrid OS-rendered FCM push instead. Gating on connection
+    /// keeps it to one alert: a connected partner gets the socket ring
+    /// above, a disconnected one gets the device notification here.
+    /// "New job assigned" copy (not the offer "New job request!") so the
+    /// tray notification matches the in-app alert, and tapping it opens
+    /// the booking instead of the Accept/Decline offer flow.
+    try {
+      const { sendJobAssignedPush } = require('../notifications/push.service');
+      void sendJobAssignedPush(
+        prisma,
+        partner.id,
+        { bookingId: Number(bookingId), serviceName: headService, amount },
+      );
+    } catch (err) {
+      console.warn(`Admin-assign push failed for booking ${bookingId}: ${err.message}`);
+    }
+  }
 
   return adminShape(updated);
 };
