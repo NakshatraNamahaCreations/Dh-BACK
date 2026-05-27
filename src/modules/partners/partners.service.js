@@ -299,12 +299,39 @@ exports.get = async (id) => {
   const stats = await bookingStats([p.id]);
   const s = stats.get(p.id) ?? { jobs: 0, earnings: 0 };
 
+  /// Last 5 terminal jobs for the "Recent jobs" panel. Restricted to
+  /// COMPLETED / CANCELLED because the admin UI only renders a
+  /// Completed-or-Cancelled badge — an in-flight job surfaced here would
+  /// be mislabelled "Cancelled". (This used to be a hard-coded `[]`,
+  /// which is why the panel always showed "No recent jobs".)
+  const recent = await prisma.booking.findMany({
+    where: { partnerId: p.id, status: { in: ['COMPLETED', 'CANCELLED'] } },
+    orderBy: { createdAt: 'desc' },
+    take: 5,
+    select: {
+      id: true,
+      status: true,
+      total: true,
+      grandTotal: true,
+      jobCompletedAt: true,
+      createdAt: true,
+      items: { select: { serviceName: true }, take: 1 },
+    },
+  });
+
   return {
     ...enrichPartner(p, categoryById, s.jobs, s.earnings),
     documents: documentsForPartner(p),
     documentDetails: documentDetailsForPartner(p),
     stages: stagesForPartner(p),
-    recentJobs: [],
+    recentJobs: recent.map((b) => ({
+      id: String(b.id),
+      /// ISO string — the admin renders it through formatDateTimeIST.
+      date: (b.jobCompletedAt ?? b.createdAt).toISOString(),
+      service: b.items[0]?.serviceName ?? 'Service',
+      amount: b.grandTotal || b.total,
+      status: b.status === 'COMPLETED' ? 'completed' : 'cancelled',
+    })),
   };
 };
 

@@ -254,6 +254,11 @@ const addressShape = (a) => ({
   pincode: a.pincode,
   lat: a.lat,
   lng: a.lng,
+  floor: a.floor ?? null,
+  building: a.building ?? null,
+  landmark: a.landmark ?? null,
+  receiverName: a.receiverName ?? null,
+  receiverPhone: a.receiverPhone ?? null,
   isDefault: a.isDefault,
   createdAt: a.createdAt,
   updatedAt: a.updatedAt,
@@ -304,6 +309,11 @@ exports.createAddress = async (customerId, payload) => {
         pincode: payload.pincode ?? null,
         lat: payload.lat ?? null,
         lng: payload.lng ?? null,
+        floor: payload.floor ?? null,
+        building: payload.building ?? null,
+        landmark: payload.landmark ?? null,
+        receiverName: payload.receiverName ?? null,
+        receiverPhone: payload.receiverPhone ?? null,
         isDefault: wantsDefault,
       },
     });
@@ -344,6 +354,11 @@ exports.updateAddress = async (customerId, addressId, payload) => {
         ...(payload.pincode !== undefined && { pincode: payload.pincode }),
         ...(payload.lat !== undefined && { lat: payload.lat }),
         ...(payload.lng !== undefined && { lng: payload.lng }),
+        ...(payload.floor !== undefined && { floor: payload.floor }),
+        ...(payload.building !== undefined && { building: payload.building }),
+        ...(payload.landmark !== undefined && { landmark: payload.landmark }),
+        ...(payload.receiverName !== undefined && { receiverName: payload.receiverName }),
+        ...(payload.receiverPhone !== undefined && { receiverPhone: payload.receiverPhone }),
         /// `isDefault: false` is a no-op explicitly — we never let the
         /// customer remove the default flag without choosing another
         /// row, otherwise the customer would have zero defaults.

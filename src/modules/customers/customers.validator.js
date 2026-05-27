@@ -30,6 +30,16 @@ const addressBody = z.object({
     .optional(),
   lat: z.number().min(-90).max(90).optional(),
   lng: z.number().min(-180).max(180).optional(),
+  /// Structured detail captured on the "Add address details" screen.
+  /// All optional + length-capped; the app composes the visible
+  /// `addressLine` from these, so they're supplementary.
+  floor: z.string().trim().max(40).optional(),
+  building: z.string().trim().max(120).optional(),
+  landmark: z.string().trim().max(120).optional(),
+  receiverName: z.string().trim().max(80).optional(),
+  /// Loose check — the app enforces a real phone format in the UI; we
+  /// just guard length so a stray paste can't bloat the column.
+  receiverPhone: z.string().trim().max(20).optional(),
   /// When true, the create/update endpoint clears any other default for
   /// this customer atomically.
   isDefault: z.boolean().optional(),

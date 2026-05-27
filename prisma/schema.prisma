@@ -87,6 +87,18 @@ model CustomerAddress {
   lat         Float?
   lng         Float?
 
+  /// Structured parts captured on the customer-app "Add address details"
+  /// screen. `addressLine` stays the single-line composite used for
+  /// display + delivery routing; these break out the editable pieces so
+  /// the form can be re-populated and a partner sees them cleanly.
+  floor         String?
+  building      String?
+  landmark      String?
+  /// Who the partner should contact at this address. Defaults to the
+  /// customer, but a booking can be for someone else (parent, office…).
+  receiverName  String?
+  receiverPhone String?
+
   /// Exactly one row per customer should have isDefault=true. The
   /// service enforces this invariant by clearing the previous default
   /// inside a transaction whenever a new default is set.
