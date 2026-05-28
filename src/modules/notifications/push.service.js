@@ -2,6 +2,8 @@ const logger = require('../../config/logger');
 const firebase = require('../../config/firebase');
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+const JOB_OFFER_PUSH_TTL_SECONDS = 190;
+const JOB_OFFER_PUSH_TTL_MS = JOB_OFFER_PUSH_TTL_SECONDS * 1000;
 
 /// MUST match `CHANNEL_ID` in partner-app/src/services/notifications.ts —
 /// the MAX-importance channel (ringtone-length custom sound, strong
@@ -45,15 +47,16 @@ const sendPush = async (token, { title, body, data = {} } = {}) => {
         /// backend has to follow or pushes land in an old / non-existent
         /// channel and never alert (or vibrate) the partner.
         channelId: 'job-alerts-v6',
-        /// 180s = the full dispatch window (3 waves × 60s — see
-        /// DISPATCH_TOTAL_MS in dispatch/dispatcher.js). A device in a Doze
+        /// 190s = the full dispatch window (six 30s attempts with five
+        /// 2s gaps — see DISPATCH_TOTAL_MS in dispatch/dispatcher.js).
+        /// A device in a Doze
         /// maintenance gap can be unreachable for more than a minute; the
         /// old 60s TTL meant FCM/Expo discarded the offer before the phone
         /// next woke, so the partner never saw a job that was still live.
         /// Matching the dispatch window means the offer is delivered for as
         /// long as it could still be accepted, and no longer (a stale accept
         /// past expiry is rejected gracefully via `dispatch.claimed`).
-        ttl: 180,
+        ttl: JOB_OFFER_PUSH_TTL_SECONDS,
       }),
     });
     if (!res.ok) {
@@ -111,14 +114,14 @@ const sendFcmDataMessage = async (token, data, notification = null) => {
       data: stringData,
       android: {
         priority: 'high',
-        /// TTL = the full 3-minute dispatch window (DISPATCH_TOTAL_MS in
-        /// dispatch/dispatcher.js). A phone in Doze can be unreachable for
+        /// TTL = the full 190-second dispatch window (DISPATCH_TOTAL_MS
+        /// in dispatch/dispatcher.js). A phone in Doze can be unreachable for
         /// well over a minute; the old 60s TTL meant FCM dropped the offer
         /// before the device's next maintenance window, so the partner
         /// missed a job that was still live. Delivering for the whole
         /// window is the right bound — a late accept past expiry is
         /// rejected gracefully (`dispatch.claimed`).
-        ttl: 180_000,
+        ttl: JOB_OFFER_PUSH_TTL_MS,
       },
       apns: {
         headers: {
@@ -164,17 +167,18 @@ const sendFcmDataMessage = async (token, data, notification = null) => {
 /**
  * Send job-offer push notifications to a list of partners.
  *
- * Callers pass ONLY partners without a live socket (the dispatcher
- * delivers the in-app offer to connected ones). Prefers a hybrid
- * direct-FCM message when the partner has an `fcmToken` — the OS renders
- * it even on a frozen/killed device — and falls back to the legacy Expo
- * push when only `expoPushToken` is set.
+ * The dispatcher passes every eligible partner, including socket-
+ * connected partners. A socket can look alive on the server while the
+ * mobile OS has suspended the app, so socket-only delivery can miss the
+ * real phone alert. Prefers a hybrid direct-FCM message when the partner
+ * has an `fcmToken` — the OS renders it even on a frozen/killed device —
+ * and falls back to the legacy Expo push when only `expoPushToken` is set.
  *
  * @param {object} prisma
  * @param {number[]} partnerIds  - offline partners only (see dispatcher)
- * @param {{ bookingId: number, serviceName: string, amount: number }} jobInfo
+ * @param {{ bookingId: number, serviceName: string, amount: number, dispatchWave?: number }} jobInfo
  */
-const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, amount }) => {
+const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, amount, dispatchWave }) => {
   if (!partnerIds || partnerIds.length === 0) return;
   try {
     const partners = await prisma.partner.findMany({
@@ -186,11 +190,10 @@ const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, 
         if (p.fcmToken) {
           const sent = await sendFcmDataMessage(
             p.fcmToken,
-            { type: 'job_request', bookingId, serviceName, amount },
-            /// Hybrid form — callers pass only OFFLINE partners here (the
-            /// dispatcher already sent connected ones the in-app offer),
-            /// so the OS-rendered notification can reach a frozen/killed
-            /// device without double-alerting anyone.
+            { type: 'job_request', bookingId, serviceName, amount, dispatchWave },
+            /// Hybrid form — reaches frozen/killed devices. Foreground
+            /// app instances ignore job-request FCM echoes and use the
+            /// socket-driven in-app popup instead.
             { title: 'New job request!', body: `${serviceName} · ₹${amount} near you` },
           );
           /// Direct FCM is the reliable path — only fall back to Expo
@@ -202,7 +205,11 @@ const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, 
           await sendPush(p.expoPushToken, {
             title: 'New job request!',
             body: `${serviceName} · ₹${amount} near you`,
-            data: { bookingId: String(bookingId), type: 'job_request' },
+            data: {
+              bookingId: String(bookingId),
+              type: 'job_request',
+              ...(dispatchWave != null ? { dispatchWave: String(dispatchWave) } : {}),
+            },
           });
         }
       }),

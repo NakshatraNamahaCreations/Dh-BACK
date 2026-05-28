@@ -13,11 +13,14 @@ const { sendJobOfferPushes } = require('../notifications/push.service');
  * Replaces the lazy `expireBroadcasts()` + per-poll haversine model
  * with a push-style flow:
  *
- *   1. `bookings.create` enqueues four delayed jobs:
+ *   1. `bookings.create` enqueues seven delayed jobs:
  *        wave 1 → fires at +0   s   (3 km)
- *        wave 2 → fires at +30  s   (5 km)
- *        wave 3 → fires at +60  s   (7 km)
- *        expire → fires at +90  s   (no-partner-found if still PENDING)
+ *        wave 2 → fires at +32  s   (3 km retry)
+ *        wave 3 → fires at +64  s   (5 km)
+ *        wave 4 → fires at +96  s   (5 km retry)
+ *        wave 5 → fires at +128 s   (7 km)
+ *        wave 6 → fires at +160 s   (7 km retry)
+ *        expire → fires at +190 s   (manual-dispatch handoff if still PENDING)
  *
  *      Scheduled (non-instant) bookings shift the timeline so the
  *      first wave fires `SCHEDULE_DISPATCH_LEAD_MS` before the slot
@@ -37,9 +40,8 @@ const { sendJobOfferPushes } = require('../notifications/push.service');
  *
  *   3. The expire handler:
  *        - re-reads the booking
- *        - if still PENDING + unassigned, transitions to CANCELLED
- *          with `dispatchStatus: 'no_partner_found'` and refunds the
- *          coupon if one was redeemed
+ *        - if still PENDING + unassigned, transitions to
+ *          `needs_admin_dispatch` so ops can assign manually
  *        - clears the Redis booking keys
  *
  * Idempotency: the queue uses `wave:{bookingId}:{n}` and
@@ -49,32 +51,34 @@ const { sendJobOfferPushes } = require('../notifications/push.service');
  * so a wave that fires after a partner already accepted is a no-op.
  */
 
-/// Dispatch cadence for the customer-facing "within 10 min" promise.
+/// Dispatch cadence: every radius gets one 30s attempt, then a 2s
+/// quiet gap, then one retry at the same radius before the next ring
+/// opens. The retry waves deliberately re-emit socket/push alerts to
+/// the same eligible partners instead of only widening the search.
 ///
-/// We fan out across the three rings *fast* (0s / 15s / 30s) so a
-/// partner in the closest ring gets a real shot first, then the 5km
-/// and 7km rings open up before any meaningful wait. After the third
-/// wave fires, the 7km offer stays live for the rest of the 10-min
-/// window — any partner who comes online in that radius can still
-/// accept up until expiry.
-///
-///   Wave 1 (0:00)   — 3km, partner alert (1-min window to accept)
-///   Wave 2 (1:00)   — 5km, partner alert (1-min window to accept)
-///   Wave 3 (2:00)   — 7km, partner alert (1-min window to accept)
-///   Expiry (3:00)   — booking flips to `needs_admin_dispatch`,
+///   Wave 1 (0:00)   — 3km initial attempt, 30s active
+///   Wave 2 (0:32)   — 3km retry attempt, 30s active
+///   Wave 3 (1:04)   — 5km initial attempt, 30s active
+///   Wave 4 (1:36)   — 5km retry attempt, 30s active
+///   Wave 5 (2:08)   — 7km initial attempt, 30s active
+///   Wave 6 (2:40)   — 7km retry attempt, 30s active
+///   Expiry (3:10)   — booking flips to `needs_admin_dispatch`,
 ///                     ops takes over from here.
-///
-/// Per-wave window is 60s — each radius gets a full minute to surface
-/// an acceptor before the next ring opens up. After wave 3's window
-/// elapses with no acceptance, the booking moves to manual dispatch.
+const DISPATCH_WINDOW_MS = 30 * 1000;
+const DISPATCH_RETRY_GAP_MS = 2 * 1000;
+const DISPATCH_STEP_MS = DISPATCH_WINDOW_MS + DISPATCH_RETRY_GAP_MS;
 const DISPATCH_WAVES = [
-  { wave: 1, radiusKm: 3, offsetMs: 0 },
-  { wave: 2, radiusKm: 5, offsetMs: 60 * 1000 },
-  { wave: 3, radiusKm: 7, offsetMs: 120 * 1000 },
+  { wave: 1, radiusKm: 3, offsetMs: 0, retry: false },
+  { wave: 2, radiusKm: 3, offsetMs: DISPATCH_STEP_MS, retry: true },
+  { wave: 3, radiusKm: 5, offsetMs: DISPATCH_STEP_MS * 2, retry: false },
+  { wave: 4, radiusKm: 5, offsetMs: DISPATCH_STEP_MS * 3, retry: true },
+  { wave: 5, radiusKm: 7, offsetMs: DISPATCH_STEP_MS * 4, retry: false },
+  { wave: 6, radiusKm: 7, offsetMs: DISPATCH_STEP_MS * 5, retry: true },
 ];
-const DISPATCH_TOTAL_MS = 3 * 60 * 1000;
+const FINAL_DISPATCH_WAVE = DISPATCH_WAVES[DISPATCH_WAVES.length - 1];
+const DISPATCH_TOTAL_MS = FINAL_DISPATCH_WAVE.offsetMs + DISPATCH_WINDOW_MS;
 const SCHEDULE_DISPATCH_LEAD_MS = 30 * 60 * 1000;
-/// When all three waves elapse without acceptance, the booking is
+/// When all six waves elapse without acceptance, the booking is
 /// handed off to admin (status stays PENDING, dispatchStatus flips
 /// to `needs_admin_dispatch`). This is how long admin has to take
 /// action before a safety-net auto-cancel kicks in. Keep this long
@@ -84,7 +88,6 @@ const ADMIN_DISPATCH_GRACE_MS = 2 * 60 * 60 * 1000;
 
 let worker = null;
 let socketEmitter = null;
-let socketConnectionChecker = null;
 
 /// Allow the socket gateway to register itself for offer pushes.
 /// Decoupled so the dispatcher module doesn't import socket.io
@@ -93,21 +96,16 @@ const setSocketEmitter = (fn) => {
   socketEmitter = fn;
 };
 
-/// Same decoupled-injection pattern for "does this partner have a live
-/// socket right now". The gateway owns the connection map; it registers
-/// this checker so the dispatcher (and other callers, via the export
-/// below) can suppress the FCM fallback for partners who'll receive the
-/// in-app socket event — otherwise the hybrid OS-rendered push would
-/// double-alert on top of the in-app one.
-const setSocketConnectionChecker = (fn) => {
-  socketConnectionChecker = fn;
+/// True when the partner has at least one live socket right now —
+/// resolved from the cross-instance Redis counter (set by the socket
+/// gateway's connect/disconnect handlers), so it's correct no matter
+/// which API instance the partner is connected to. Used to suppress the
+/// hybrid FCM fallback for partners who'll get the in-app `dispatch.offer`
+/// (avoids double-alerting). Async now; callers await it.
+const isPartnerConnected = async (partnerId) => {
+  const set = await registry.connectedPartnerIds([Number(partnerId)]);
+  return set.has(Number(partnerId));
 };
-
-/// True when the partner has at least one connected socket. Returns
-/// false when no checker is wired (gateway not started) — callers then
-/// send the push, since a possible duplicate beats a missed job.
-const isPartnerConnected = (partnerId) =>
-  socketConnectionChecker ? !!socketConnectionChecker(Number(partnerId)) : false;
 
 /// Computes the moment dispatch starts for a booking. For instant
 /// bookings (and BYOP offers) it's `createdAt`; for scheduled jobs
@@ -120,7 +118,7 @@ const dispatchStartAt = (booking) => {
   return new Date(new Date(booking.scheduledAt).getTime() - SCHEDULE_DISPATCH_LEAD_MS);
 };
 
-/// Schedule all four jobs for a booking. Called from bookings.create
+/// Schedule all dispatch jobs for a booking. Called from bookings.create
 /// right after the row is inserted. Negative delays (i.e. dispatch
 /// should already have started — happens for scheduled bookings whose
 /// dispatch lead-time has already passed by the time of insert) are
@@ -139,7 +137,7 @@ const scheduleAllForBooking = async (booking) => {
 };
 
 /// Cancel scheduled jobs for a booking — used when a partner accepts
-/// (no need for waves 2 + 3 or the expirer to fire) or when admin
+/// (no need for later waves or the expirer to fire) or when admin
 /// cancels manually.
 const cancelAllForBooking = async (bookingId) => {
   if (!queue.enabled()) return;
@@ -201,6 +199,12 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       scheduledAt: true,
       createdAt: true,
       total: true,
+      /// `grandTotal` (customer-facing all-in) is what the partner-app
+      /// renders inside the job-request screen — surface the SAME number
+      /// in the push payload so the notification doesn't say one price
+      /// (₹1583 / `total`) and the in-app screen another (₹1899 /
+      /// `grandTotal`).
+      grandTotal: true,
       items: {
         select: {
           service: { select: { categoryId: true, name: true } },
@@ -226,6 +230,7 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
   logger.info(
     `dispatch wave ${waveNumber} for booking ${bookingId}: ` +
       `anchor=(${booking.lat}, ${booking.lng}) radius=${waveSpec.radiusKm}km ` +
+      `retry=${waveSpec.retry ? 'yes' : 'no'} ` +
       `categories=[${categoryIds.join(',')}]`,
   );
 
@@ -289,7 +294,13 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
   /// call when backgrounded — so we ship `serviceName` + `amount` in
   /// the socket payload itself, matching what the FCM push carries.
   const serviceName = booking.items[0]?.service?.name ?? 'Job request';
-  const amount = booking.offeredPrice ?? booking.total ?? 0;
+  /// Use grandTotal (customer-facing all-in) so the push notification,
+  /// the socket dispatch.offer payload, and the in-app job-request
+  /// screen all quote the SAME number. BYOP (`offeredPrice`) — partner
+  /// set their own price — takes precedence; otherwise fall through to
+  /// `grandTotal`, then `total` for old rows that pre-date the
+  /// grand-total column being populated.
+  const amount = booking.offeredPrice ?? booking.grandTotal ?? booking.total ?? 0;
 
   /// Push to connected partners. The gateway's emitter is responsible
   /// for figuring out which candidates have a live socket; the rest
@@ -300,6 +311,8 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
         bookingId: booking.id,
         wave: waveSpec.wave,
         radiusKm: waveSpec.radiusKm,
+        retry: waveSpec.retry,
+        activeForSec: DISPATCH_WINDOW_MS / 1000,
         distanceKm: c.distanceKm,
         serviceName,
         amount,
@@ -307,18 +320,18 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
     }
   }
 
-  /// Background push notifications — reach ONLY partners without a live
-  /// socket. The connected ones already got `dispatch.offer` above and
-  /// render the rich in-app alert from it; the FCM push is now the
-  /// hybrid OS-rendered form (so it shows even on a frozen/killed
-  /// device), which would double-alert a connected partner. Gating on
-  /// connection here is what keeps it to exactly one alert per partner.
-  const offlineCandidates = candidates.filter((c) => !isPartnerConnected(c.partnerId));
-  if (offlineCandidates.length > 0) {
+  /// Background push notifications. Send to every eligible partner,
+  /// not just those without a socket: mobile sockets can remain
+  /// "connected" on the server while Android has already suspended the
+  /// app, which makes socket-only delivery look successful but produces
+  /// no phone alert. The partner app ignores foreground FCM job-request
+  /// echoes while active, so the socket path still owns the in-app popup
+  /// without duplicate foreground alerts.
+  if (candidates.length > 0) {
     void sendJobOfferPushes(
       prisma,
-      offlineCandidates.map((c) => c.partnerId),
-      { bookingId: booking.id, serviceName, amount },
+      candidates.map((c) => c.partnerId),
+      { bookingId: booking.id, serviceName, amount, dispatchWave: waveSpec.wave },
     );
   }
 
@@ -435,7 +448,7 @@ const handlePaymentExpire = async ({ bookingId }) => {
   logger.info(`payment_expire: booking ${bookingId} deleted (unpaid attempt expired)`);
 };
 
-/// Wave expiry. After the 7km / wave-3 broadcast also passes without
+/// Wave expiry. After the 7km retry broadcast also passes without
 /// an acceptance, we DON'T cancel the booking — instead it transitions
 /// to `dispatchStatus: 'needs_admin_dispatch'` while keeping
 /// `status: 'PENDING'`. The admin's Manual Dispatch queue picks it up
@@ -463,11 +476,11 @@ const handleExpire = async ({ bookingId }) => {
     where: { id: booking.id, status: 'PENDING', partnerId: null },
     data: {
       dispatchStatus: 'needs_admin_dispatch',
-      dispatchRadiusKm: 7,
-      dispatchWave: 3,
+      dispatchRadiusKm: FINAL_DISPATCH_WAVE.radiusKm,
+      dispatchWave: FINAL_DISPATCH_WAVE.wave,
       dispatchExpiresAt: new Date(Date.now() + ADMIN_DISPATCH_GRACE_MS),
       noPartnerReason:
-        'No partner accepted within 3km, 5km, or 7km broadcast windows — awaiting admin dispatch.',
+        'No partner accepted within 3km, 5km, or 7km broadcast and retry windows — awaiting admin dispatch.',
     },
   });
   if (result.count === 0) return;
@@ -505,7 +518,7 @@ const handleExpire = async ({ bookingId }) => {
     void adminNotifs.notifyAllAdmins({
       type: adminNotifs.TYPES.BOOKING_DISPATCH_NEEDED,
       title: `Manual dispatch needed for #${booking.id}`,
-      body: 'No partner accepted in the 3 km / 5 km / 7 km broadcast windows. Assign one before the 2-hour grace elapses.',
+      body: 'No partner accepted in the 3 km / 5 km / 7 km broadcast and retry windows. Assign one before the 2-hour grace elapses.',
       href: '/bookings/manual-dispatch',
       bookingId: booking.id,
     });
@@ -562,7 +575,7 @@ const handleAdminTimeout = async ({ bookingId }) => {
           status: 'CANCELLED',
           dispatchStatus: 'no_partner_found',
           noPartnerReason:
-            'No partner found within broadcast window; admin grace period elapsed without manual dispatch.',
+            'No partner found within broadcast and retry windows; admin grace period elapsed without manual dispatch.',
         },
       });
       didCancel = result.count > 0;
@@ -699,7 +712,6 @@ module.exports = {
   broadcastClaimed,
   emitToPartner,
   setSocketEmitter,
-  setSocketConnectionChecker,
   isPartnerConnected,
   start,
   stop,

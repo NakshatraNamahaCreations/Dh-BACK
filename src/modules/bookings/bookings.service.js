@@ -102,14 +102,46 @@ const haversineKm = (a, b) => {
 
 /// Mirror of `dispatcher.DISPATCH_WAVES` for the legacy pull path
 /// (used when Redis isn't configured). Keep these two in sync —
-/// they encode the same 10s/10s/10s cadence so a dev env without
-/// Redis behaves the same as the production push path.
+/// they encode the same 30s attempt + 2s gap cadence so a dev env
+/// without Redis behaves the same as the production push path.
+const DISPATCH_WINDOW_MS = 30 * 1000;
+const DISPATCH_RETRY_GAP_MS = 2 * 1000;
+const DISPATCH_STEP_MS = DISPATCH_WINDOW_MS + DISPATCH_RETRY_GAP_MS;
 const DISPATCH_WAVES = [
-  { wave: 1, radiusKm: 3, startsAtSec: 0, endsAtSec: 10 },
-  { wave: 2, radiusKm: 5, startsAtSec: 10, endsAtSec: 20 },
-  { wave: 3, radiusKm: 7, startsAtSec: 20, endsAtSec: 30 },
+  { wave: 1, radiusKm: 3, startsAtMs: 0, endsAtMs: DISPATCH_WINDOW_MS },
+  {
+    wave: 2,
+    radiusKm: 3,
+    startsAtMs: DISPATCH_STEP_MS,
+    endsAtMs: DISPATCH_STEP_MS + DISPATCH_WINDOW_MS,
+  },
+  {
+    wave: 3,
+    radiusKm: 5,
+    startsAtMs: DISPATCH_STEP_MS * 2,
+    endsAtMs: DISPATCH_STEP_MS * 2 + DISPATCH_WINDOW_MS,
+  },
+  {
+    wave: 4,
+    radiusKm: 5,
+    startsAtMs: DISPATCH_STEP_MS * 3,
+    endsAtMs: DISPATCH_STEP_MS * 3 + DISPATCH_WINDOW_MS,
+  },
+  {
+    wave: 5,
+    radiusKm: 7,
+    startsAtMs: DISPATCH_STEP_MS * 4,
+    endsAtMs: DISPATCH_STEP_MS * 4 + DISPATCH_WINDOW_MS,
+  },
+  {
+    wave: 6,
+    radiusKm: 7,
+    startsAtMs: DISPATCH_STEP_MS * 5,
+    endsAtMs: DISPATCH_STEP_MS * 5 + DISPATCH_WINDOW_MS,
+  },
 ];
-const DISPATCH_TOTAL_MS = 30 * 1000;
+const FINAL_DISPATCH_WAVE = DISPATCH_WAVES[DISPATCH_WAVES.length - 1];
+const DISPATCH_TOTAL_MS = FINAL_DISPATCH_WAVE.endsAtMs;
 const SCHEDULE_DISPATCH_LEAD_MS = 30 * 60 * 1000;
 
 const broadcastStartFor = (booking) => {
@@ -122,8 +154,7 @@ const dispatchWindowFor = (booking, now = new Date()) => {
   const elapsedMs = now.getTime() - start.getTime();
   if (elapsedMs < 0) return null;
   if (elapsedMs >= DISPATCH_TOTAL_MS) return null;
-  const elapsedSec = elapsedMs / 1000;
-  return DISPATCH_WAVES.find((w) => elapsedSec >= w.startsAtSec && elapsedSec < w.endsAtSec) ?? null;
+  return DISPATCH_WAVES.find((w) => elapsedMs >= w.startsAtMs && elapsedMs < w.endsAtMs) ?? null;
 };
 
 const expireBroadcasts = async (now = new Date()) => {
@@ -172,9 +203,9 @@ const expireBroadcasts = async (now = new Date()) => {
         data: {
           status: 'CANCELLED',
           dispatchStatus: 'no_partner_found',
-          dispatchRadiusKm: 7,
-          dispatchWave: 3,
-          noPartnerReason: 'No partner accepted within 3km, 5km, or 7km broadcast windows.',
+          dispatchRadiusKm: FINAL_DISPATCH_WAVE.radiusKm,
+          dispatchWave: FINAL_DISPATCH_WAVE.wave,
+          noPartnerReason: 'No partner accepted within 3km, 5km, or 7km broadcast and retry windows.',
         },
       });
       if (result.count > 0) {
@@ -192,7 +223,7 @@ const expireBroadcasts = async (now = new Date()) => {
     try {
       await razorpayService.refundForBooking({
         bookingId: bid,
-        reason: 'No partner found within broadcast window',
+        reason: 'No partner found within broadcast and retry windows',
       });
     } catch (err) {
       console.warn(`Refund kick failed for booking ${bid}: ${err.message}`);
@@ -1521,7 +1552,8 @@ exports.nearbyPartners = async (bookingId) => {
         select: {
           lat: true,
           lng: true,
-          customerAddress: { select: { lat: true, lng: true } },
+          cityId: true,
+          customerAddress: { select: { lat: true, lng: true, cityId: true } },
           items: {
             include: { service: { select: { categoryId: true } } },
             take: 1,
@@ -1533,18 +1565,28 @@ exports.nearbyPartners = async (bookingId) => {
   const bookingLat = booking?.lat ?? booking?.customerAddress?.lat ?? null;
   const bookingLng = booking?.lng ?? booking?.customerAddress?.lng ?? null;
   const bookingCategoryId = booking?.items?.[0]?.service?.categoryId ?? null;
+  /// Booking's city — prefer the row's own cityId, fall back to the
+  /// snapshotted customer-address cityId. Used to scope nearbyPartners
+  /// to the same city as the order so a Nagpur partner can't surface
+  /// for a Bangalore booking.
+  const bookingCityId = booking?.cityId ?? booking?.customerAddress?.cityId ?? null;
 
   /// Hard filters: category match (don't show plumbers for an AC job)
-  /// + active + verified. On-duty is a SORT signal, not a filter —
-  /// manual dispatch exists precisely because the broadcast found no
-  /// acceptor, so an empty list would defeat the feature. We sort
-  /// on-duty to the top and let the admin still reach off-duty ones
-  /// at the bottom (e.g. to phone them directly).
+  /// + active + verified + same city as the booking. On-duty is a SORT
+  /// signal, not a filter — manual dispatch exists precisely because the
+  /// broadcast found no acceptor, so an empty list would defeat the
+  /// feature. We sort on-duty to the top and let the admin still reach
+  /// off-duty ones at the bottom (e.g. to phone them directly).
+  ///
+  /// `cityId` is nullable on both Partner and Booking; when the booking
+  /// has no city set (legacy rows), we skip the city filter so the admin
+  /// still sees a usable list rather than nothing.
   const partners = await prisma.partner.findMany({
     where: {
       isActive: true,
       isVerified: true,
       ...(bookingCategoryId != null ? { categoryId: bookingCategoryId } : {}),
+      ...(bookingCityId != null ? { cityId: bookingCityId } : {}),
     },
     take: 50,
     orderBy: [{ lastLocationAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }],
@@ -1557,6 +1599,12 @@ exports.nearbyPartners = async (bookingId) => {
       currentLat: true,
       currentLng: true,
       lastLocationAt: true,
+      /// City for the dispatch modal — prefer the canonical Geography
+      /// FK (cityRef.name), fall back to the legacy free-text `city`
+      /// column so partners predating the geography backfill still
+      /// surface something the admin can verify.
+      city: true,
+      cityRef: { select: { name: true } },
     },
   });
   if (partners.length === 0) return [];
@@ -1657,6 +1705,9 @@ exports.nearbyPartners = async (bookingId) => {
           (p.categoryId != null ? categoryNameById.get(p.categoryId) : null) ??
           p.businessName ??
           'General',
+        /// Canonical city from Geography first, free-text fallback for
+        /// partners that predate the geography backfill.
+        city: p.cityRef?.name ?? p.city ?? null,
         onDuty,
         status: onDuty ? 'available' : 'off_duty',
       };
@@ -1746,12 +1797,16 @@ exports.reassign = async (bookingId, partnerId, reason = 'Manual assignment') =>
   /// is still connected — which on aggressive OEMs is unreliable.
   /// Mirrors what the dispatcher does for the normal wave path.
   const headService = updated.items?.[0]?.serviceName ?? 'Service';
-  const amount = updated.offeredPrice ?? updated.total ?? 0;
+  /// Same single-source-of-truth pricing as the dispatcher: grandTotal
+  /// is the customer-facing all-in amount the partner-app surfaces
+  /// inside the job-request screen, so the assign notification quotes
+  /// the same number. BYOP wins, grandTotal next, legacy `total` last.
+  const amount = updated.offeredPrice ?? updated.grandTotal ?? updated.total ?? 0;
   /// Ring the partner-app's "New job assigned" alert (5s vibrate +
   /// sound) over the live socket when their app is open + connected.
   /// Distinct from the dispatch.offer path: this job is already theirs,
   /// so there's no Accept/Decline — it's a heads-up, not an offer.
-  const partnerConnected = dispatcher.isPartnerConnected(partner.id);
+  const partnerConnected = await dispatcher.isPartnerConnected(partner.id);
   if (partnerConnected) {
     dispatcher.emitToPartner(partner.id, 'job.assigned', {
       bookingId: Number(bookingId),
@@ -2021,12 +2076,12 @@ exports.partnerIncoming = async ({ partnerId, lat, lng }) => {
         status: 'PENDING',
         partnerId: null,
         /// Keep the offer visible to already-offered partners through
-        /// `needs_admin_dispatch` too — after the 30s broadcast window
-        /// the booking is still PENDING + unassigned and `partnerAccept`
-        /// explicitly whitelists that state, so the partner can still
-        /// grab it. This is what lets multiple offers stack in the
-        /// JobOffersSheet without an older one vanishing the moment its
-        /// broadcast window closes. The TERMINAL states (payment_timeout,
+        /// `needs_admin_dispatch` too — after the automated broadcast
+        /// attempts finish, the booking is still PENDING + unassigned
+        /// and `partnerAccept` explicitly whitelists that state, so the
+        /// partner can still grab it. This is what lets multiple offers
+        /// stack in the JobOffersSheet without an older one vanishing the
+        /// moment the automated window closes. The TERMINAL states (payment_timeout,
         /// superseded, no_partner_found, assigned) are excluded because
         /// the booking is no longer acceptable — so cancelled / taken /
         /// admin-assigned offers correctly drop out of the partner's
@@ -2143,11 +2198,10 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
   const categoryMatches = b.items.some((i) => i.service?.categoryId === partner.categoryId);
   if (!categoryMatches) throw ApiError.forbidden('Booking category does not match your profile');
   /// Previously we required the booking to be inside the formal
-  /// broadcast window (`dispatchWindowFor` returns a wave only while
-  /// elapsed < DISPATCH_TOTAL_MS). With 10s waves that's only ~30s
-  /// end-to-end — a partner who saw the alert at second 28 and tapped
-  /// Accept at second 31 was getting "not currently in broadcast
-  /// window" with no recourse.
+  /// broadcast window (`dispatchWindowFor` returns a wave only during
+  /// active attempts). A partner who saw an alert near the edge of an
+  /// attempt and tapped Accept just after it rolled over was getting
+  /// "not currently in broadcast window" with no recourse.
   ///
   /// Acceptance is fine as long as the booking is still assignable:
   /// PENDING + partnerId null + dispatchStatus in a non-terminal

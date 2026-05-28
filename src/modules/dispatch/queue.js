@@ -77,8 +77,8 @@ const enqueueExpire = async (bookingId, delayMs) => {
 };
 
 /// Admin-timeout job. Fires `ADMIN_DISPATCH_GRACE_MS` after a booking
-/// enters `needs_admin_dispatch` (i.e. all three wave radii expired
-/// with no acceptance) and auto-cancels the booking if admin still
+/// enters `needs_admin_dispatch` (i.e. all radius attempts and retries
+/// expired with no acceptance) and auto-cancels the booking if admin still
 /// hasn't dispatched it manually. Without this safety net, an
 /// unattended needs-admin booking would sit in the queue forever.
 const enqueueAdminTimeout = async (bookingId, delayMs) => {
@@ -193,9 +193,7 @@ const ensureNotificationCleanupScheduled = async () => {
 const cancelJobsForBooking = async (bookingId) => {
   if (!dispatchQueue) return;
   const ids = [
-    `wave__${bookingId}__1`,
-    `wave__${bookingId}__2`,
-    `wave__${bookingId}__3`,
+    ...Array.from({ length: 6 }, (_, index) => `wave__${bookingId}__${index + 1}`),
     `expire__${bookingId}`,
     `admin_timeout__${bookingId}`,
   ];

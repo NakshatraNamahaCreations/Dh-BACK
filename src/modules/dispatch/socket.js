@@ -1,6 +1,9 @@
 const { Server } = require('socket.io');
+const { createAdapter } = require('@socket.io/redis-adapter');
+const Redis = require('ioredis');
 const { verifyToken } = require('../../utils/jwt');
 const prisma = require('../../config/prisma');
+const env = require('../../config/env');
 const logger = require('../../config/logger');
 const dispatcher = require('./dispatcher');
 const registry = require('./registry');
@@ -62,28 +65,19 @@ const removePartnerSocket = (partnerId, socketId) => {
   return false;
 };
 
-/// True when the partner has at least one live socket right now. The
-/// dispatcher uses this to skip the FCM fallback for partners who'll get
-/// the in-app `dispatch.offer` over their open socket, so they don't see
-/// a duplicate device notification on top of the rich in-app alert.
-const isPartnerConnected = (partnerId) => {
-  const set = partnerSockets.get(Number(partnerId));
-  return !!set && set.size > 0;
-};
-
 /// Emitter the dispatcher uses. Two address types:
-///   - numeric partnerId → resolves to that partner's sockets
-///   - 'customer:{id}'   → resolves to a per-customer room on the
-///     customers namespace
+///   - numeric partnerId → the `partner:{id}` room
+///   - 'customer:{id}'   → a per-customer room on the customers namespace
+///
+/// Both go through ROOMS rather than per-socket ids so the Redis adapter
+/// (when enabled) routes the emit to whichever instance actually holds
+/// the target's socket. This is what makes multi-instance delivery work
+/// — a partner connected to instance B still receives a `dispatch.offer`
+/// emitted from instance A.
 const emit = (event, target, payload) => {
   if (!io) return;
   if (typeof target === 'number') {
-    const set = partnerSockets.get(target);
-    if (!set || set.size === 0) return;
-    const ns = io.of('/partners');
-    for (const socketId of set) {
-      ns.to(socketId).emit(event, payload);
-    }
+    io.of('/partners').to(`partner:${target}`).emit(event, payload);
     return;
   }
   if (typeof target === 'string' && target.startsWith('customer:')) {
@@ -103,9 +97,28 @@ const start = (httpServer) => {
     /// future web partner portal would need a real allowlist.
     cors: { origin: '*' },
     /// Long-poll fallback off — every client we control supports
-    /// websockets natively. Cuts a bunch of HTTP-poll noise.
+    /// websockets natively. Cuts a bunch of HTTP-poll noise. (Also means
+    /// no sticky-session requirement at the load balancer: the websocket
+    /// stays pinned to one instance for its lifetime after the upgrade.)
     transports: ['websocket'],
   });
+
+  /// Multi-instance fan-out. With the Redis adapter, a room emit on ANY
+  /// instance (e.g. `dispatch.offer` to `partner:42`) reaches that
+  /// partner's socket wherever it lives — so we can run N API instances
+  /// behind a load balancer and still deliver every event. Without it,
+  /// emits only reach sockets on the local process (fine for a single
+  /// instance, which is exactly the fallback when REDIS_URL is unset).
+  if (env.REDIS_URL) {
+    try {
+      const pubClient = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
+      const subClient = pubClient.duplicate();
+      io.adapter(createAdapter(pubClient, subClient));
+      logger.info('Socket.io: Redis adapter enabled — multi-instance fan-out ready');
+    } catch (err) {
+      logger.warn(`Socket.io: Redis adapter setup failed, single-instance only: ${err.message}`);
+    }
+  }
 
   /// PARTNER NAMESPACE -----------------------------------------------------
   const partnerNs = io.of('/partners');
@@ -129,30 +142,53 @@ const start = (httpServer) => {
   partnerNs.on('connection', async (socket) => {
     const partnerId = socket.data.partnerId;
     addPartnerSocket(partnerId, socket.id);
+    /// Join the per-partner room so the Redis adapter can route emits to
+    /// this socket from any instance, and bump the cross-instance live-
+    /// socket counter so the dispatcher knows this partner is reachable.
+    socket.join(`partner:${partnerId}`);
+    await registry.incrSocketConn(partnerId).catch(() => {});
+
+    /// Resolve the partner's dispatch-relevant fields ONCE, here, instead
+    /// of on every presence ping. At 5k on-duty partners pinging ~every
+    /// 15s, a per-ping `findUnique` was ~350 DB queries/sec of pure
+    /// overhead; category / active / verified barely change within a
+    /// session, so caching them on the socket removes that load entirely.
+    /// (A mid-session suspend forces the app off-duty + a reconnect,
+    /// which re-runs this lookup.)
+    try {
+      const partner = await prisma.partner.findUnique({
+        where: { id: partnerId },
+        select: { categoryId: true, isActive: true, isVerified: true },
+      });
+      socket.data.categoryId = partner?.categoryId ?? null;
+      socket.data.dispatchable =
+        !!partner?.isActive && !!partner?.isVerified && partner?.categoryId != null;
+    } catch (err) {
+      socket.data.dispatchable = false;
+      logger.warn(`socket connect lookup failed for partner ${partnerId}: ${err.message}`);
+    }
 
     /// We don't GEOADD on connect — connect doesn't carry coords.
     /// First `presence` event with a location flips the partner into
     /// the online registry. Until then they're "connected but not
     /// dispatchable", which is the right state for someone whose app
     /// is still resolving GPS.
-
     socket.on('presence', async (msg) => {
       const lat = Number(msg?.lat);
       const lng = Number(msg?.lng);
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+      /// No DB hit on the hot path — read the cached fields set on
+      /// connect. Refresh the socket-conn TTL so a long-lived socket's
+      /// counter doesn't expire under it.
+      if (!socket.data.dispatchable || socket.data.categoryId == null) return;
       try {
-        const partner = await prisma.partner.findUnique({
-          where: { id: partnerId },
-          select: { categoryId: true, isActive: true, isVerified: true },
-        });
-        if (!partner?.isActive || !partner?.isVerified || !partner.categoryId) return;
         await registry.upsertOnline({
           partnerId,
-          categoryId: partner.categoryId,
+          categoryId: socket.data.categoryId,
           lat,
           lng,
         });
-        socket.data.categoryId = partner.categoryId;
+        await registry.touchSocketConn(partnerId).catch(() => {});
       } catch (err) {
         logger.warn(`socket presence failed: ${err.message}`);
       }
@@ -190,8 +226,14 @@ const start = (httpServer) => {
     });
 
     socket.on('disconnect', async () => {
-      const wasLast = removePartnerSocket(partnerId, socket.id);
-      if (wasLast && socket.data.categoryId != null) {
+      removePartnerSocket(partnerId, socket.id); // local stats only
+      /// Decrement the CROSS-INSTANCE counter — only pull the partner out
+      /// of the online registry when their last socket anywhere is gone.
+      /// (The old `wasLast` was per-instance, so on a multi-instance
+      /// deploy it would have wrongly marked a partner offline while they
+      /// still had a socket on another box.)
+      const remaining = await registry.decrSocketConn(partnerId).catch(() => 0);
+      if (remaining <= 0 && socket.data.categoryId != null) {
         await registry.removeOnline({
           partnerId,
           categoryId: socket.data.categoryId,
@@ -230,10 +272,10 @@ const start = (httpServer) => {
   /// straight to the right sockets without socket.io knowledge inside
   /// the dispatcher.
   dispatcher.setSocketEmitter(emit);
-  /// Let the dispatcher (and the admin-assign push path, via
-  /// dispatcher.isPartnerConnected) see who has a live socket, so the
-  /// hybrid FCM fallback only fires for partners the socket can't reach.
-  dispatcher.setSocketConnectionChecker(isPartnerConnected);
+  /// (Live-socket presence is now tracked in Redis by the connect/
+  /// disconnect handlers above; the dispatcher reads it directly via the
+  /// registry — no in-memory checker injection needed, which also makes
+  /// it correct across instances.)
   /// Same hook for the notifications service — every `create` writes
   /// a row and pushes `notification.new` to the partner so the bell
   /// badge updates instantly.

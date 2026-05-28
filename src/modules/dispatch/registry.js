@@ -35,7 +35,7 @@ const logger = require('../../config/logger');
  *      Key: `booking:claim:{bookingId}` — string lock with NX so only
  *           the first partner-accept wins; the second sees the lock
  *           and gets a 409.
- *      TTL: 5 minutes — covers the 90s dispatch window plus accept
+ *      TTL: 5 minutes — covers the 190s dispatch window plus accept
  *      latency and a buffer. Cleared when the booking transitions out
  *      of PENDING.
  */
@@ -126,6 +126,59 @@ const filterOnlinePartnerIds = async (partnerIds) => {
       if (values[i] != null) online.add(Number(id));
     });
     return online;
+  }, new Set());
+};
+
+// ── Live socket presence (cross-instance, for FCM gating) ───────────
+//
+// A per-partner counter of currently-open sockets ACROSS every API
+// instance. Distinct from the lastseen/online geo set (a 90s "recently
+// pinged" signal): this is real-time socket liveness, used by the
+// dispatcher to decide whether a partner will receive the in-app
+// `dispatch.offer` — so the hybrid FCM push can be skipped for them and
+// nobody gets double-alerted. INCR on connect, DECR on disconnect; the
+// short TTL (refreshed on every presence ping) means a crashed
+// instance's counters self-heal instead of pinning a partner
+// "connected" forever. Replaces the old in-memory Map that only knew
+// about sockets on the local process.
+const SOCKET_CONN_TTL_S = 120;
+const socketConnKey = (partnerId) => `partner:sock:${partnerId}`;
+
+const incrSocketConn = async (partnerId) =>
+  safe(async () => {
+    const key = socketConnKey(partnerId);
+    const n = await redis.incr(key);
+    await redis.expire(key, SOCKET_CONN_TTL_S);
+    return n;
+  }, 1);
+
+/// Refresh the TTL so a long-lived socket's counter doesn't expire out
+/// from under it. Called on each presence ping (cheap, no DB).
+const touchSocketConn = async (partnerId) =>
+  safe(async () => {
+    await redis.expire(socketConnKey(partnerId), SOCKET_CONN_TTL_S);
+  });
+
+const decrSocketConn = async (partnerId) =>
+  safe(async () => {
+    const key = socketConnKey(partnerId);
+    const n = await redis.decr(key);
+    if (n <= 0) await redis.del(key);
+    return Math.max(0, n);
+  }, 0);
+
+/// Given partner ids, return the SUBSET with at least one live socket.
+/// Empty Set when Redis is down — callers then send the push (a possible
+/// duplicate beats a missed job).
+const connectedPartnerIds = async (partnerIds) => {
+  if (!Array.isArray(partnerIds) || partnerIds.length === 0) return new Set();
+  return safe(async () => {
+    const values = await redis.mget(...partnerIds.map(socketConnKey));
+    const set = new Set();
+    partnerIds.forEach((id, i) => {
+      if (values[i] != null && Number(values[i]) > 0) set.add(Number(id));
+    });
+    return set;
   }, new Set());
 };
 
@@ -360,6 +413,10 @@ module.exports = {
   removeOnline,
   countOnlineInCategory,
   filterOnlinePartnerIds,
+  incrSocketConn,
+  decrSocketConn,
+  touchSocketConn,
+  connectedPartnerIds,
   getOnlinePositions,
   findOnlineNearby,
   recordVisible,
