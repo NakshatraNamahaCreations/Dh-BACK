@@ -76,6 +76,48 @@ exports.postLocation = async ({ partnerId, lat, lng, accuracy }) => {
   };
 };
 
+/// Explicit On Duty / Off Duty toggle from the partner app. This is the
+/// AUTHORITATIVE duty signal the dispatcher was previously missing —
+/// before this, the server only inferred availability from socket
+/// presence + a 90s TTL, so a socket reconnect (e.g. after a device
+/// location change) could silently re-register an off-duty partner and
+/// they'd keep getting offers. Now:
+///
+///   OFF → set the `partner:offduty` guard flag AND immediately remove
+///         the partner from the online geo set, so dispatch stops
+///         offering to them within one round-trip (not after 90s). The
+///         flag makes every presence path (socket ping, legacy poll,
+///         background task) refuse to re-add them.
+///   ON  → clear the flag so the app's next presence ping re-registers
+///         them as available.
+///
+/// Best-effort against Redis — if Redis is down the registry helpers
+/// no-op and we still return success (presence-based behaviour is the
+/// fallback, same as before this endpoint existed).
+exports.setDuty = async ({ partnerId, onDuty }) => {
+  const registry = require('../dispatch/registry');
+  /// Look up the partner's category so the OFF path can ZREM them from
+  /// the right per-category online set immediately. Not load-bearing
+  /// (the off-duty flag + lastseen-liveness filter already block
+  /// offers) but it keeps the geo set clean rather than waiting for the
+  /// next sweep.
+  const partner = await prisma.partner.findUnique({
+    where: { id: Number(partnerId) },
+    select: { categoryId: true },
+  });
+
+  if (onDuty) {
+    await registry.clearOffDuty(Number(partnerId));
+  } else {
+    await registry.setOffDuty({
+      partnerId: Number(partnerId),
+      categoryId: partner?.categoryId ?? null,
+    });
+  }
+
+  return { partnerId: Number(partnerId), onDuty: Boolean(onDuty) };
+};
+
 exports.getForBooking = async ({ customerId, bookingId }) => {
   const booking = await prisma.booking.findUnique({
     where: { id: Number(bookingId) },

@@ -22,4 +22,13 @@ const locationBody = z.object({
   }),
 });
 
-module.exports = { bookingIdParam, locationBody };
+/// Explicit duty toggle from the partner app — `onDuty:true` to start
+/// receiving offers, `false` to stop. Booleans only; the service maps
+/// these to the Redis off-duty guard flag.
+const dutyBody = z.object({
+  body: z.object({
+    onDuty: z.boolean(),
+  }),
+});
+
+module.exports = { bookingIdParam, locationBody, dutyBody };

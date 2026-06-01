@@ -168,6 +168,17 @@ const start = (httpServer) => {
       logger.warn(`socket connect lookup failed for partner ${partnerId}: ${err.message}`);
     }
 
+    /// Opening a socket is itself an authoritative "I'm on duty" signal:
+    /// the partner app only connects the socket when the duty toggle is
+    /// ON. Clear any lingering off-duty guard flag here so the first
+    /// presence ping isn't rejected by `upsertOnline` — this avoids a
+    /// race with the slower HTTP `POST /tracking/me/duty` call the app
+    /// fires in parallel when toggling on. (Going off duty disconnects
+    /// the socket, so no connect happens to wrongly clear the flag.)
+    if (socket.data.dispatchable) {
+      await registry.clearOffDuty(partnerId).catch(() => {});
+    }
+
     /// We don't GEOADD on connect — connect doesn't carry coords.
     /// First `presence` event with a location flips the partner into
     /// the online registry. Until then they're "connected but not

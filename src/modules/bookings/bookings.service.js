@@ -30,6 +30,40 @@ const tryRefund = async (bookingId, reason, refundAmount = null) => {
 /// string when the customer reads it out and the partner types it.
 const generateOtp = () => String(1000 + crypto.randomInt(0, 9000));
 
+/// "DDMMYY" date component of the human-facing Booking ID, in
+/// Asia/Kolkata so the date a customer sees on their ref matches the
+/// IST business day regardless of where the server runs. `en-GB`
+/// yields day/month/year order; we strip the slashes to get DDMMYY.
+const istDayKey = (now = new Date()) => {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: '2-digit',
+    year: '2-digit',
+  }).formatToParts(now);
+  const get = (t) => parts.find((p) => p.type === t)?.value ?? '';
+  return `${get('day')}${get('month')}${get('year')}`;
+};
+
+/// Generate the next collision-free Booking ID inside the create
+/// transaction. Atomically bumps the per-day counter (UPSERT … seq =
+/// seq + 1) so two concurrent bookings on the same day can never read
+/// the same number — Postgres serialises the conflicting row update.
+/// Pads to 3 digits for the common case (001) but naturally grows to
+/// 4+ digits past 999/day, so a high-volume day never breaks. MUST be
+/// called with the same `tx` as the booking insert so a rolled-back
+/// booking doesn't strand a consumed sequence number.
+const generateBookingRef = async (tx, now = new Date()) => {
+  const day = istDayKey(now);
+  const counter = await tx.bookingRefCounter.upsert({
+    where: { day },
+    create: { day, seq: 1 },
+    update: { seq: { increment: 1 } },
+    select: { seq: true },
+  });
+  return `DHND${day}${String(counter.seq).padStart(3, '0')}`;
+};
+
 const findServiceAreaForAddress = async ({ city, pincode, cityId }) => {
   const pin = String(pincode ?? '').trim();
   if (pin) {
@@ -383,6 +417,8 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
 
   return {
     id: String(b.id),
+    /// Human-facing Booking ID shared across customer/partner/admin.
+    bookingRef: b.bookingRef ?? `#${b.id}`,
     service: b.items?.[0]?.serviceName ?? 'Service',
     services,
     customerName: b.customer?.name ?? 'Customer',
@@ -506,6 +542,9 @@ const shape = (b) => {
   const amountPaid = b.grandTotal && b.grandTotal > 0 ? b.grandTotal : b.total;
   return {
   id: b.id,
+  /// Human-facing Booking ID (DHND…). Falls back to "#<id>" only for
+  /// legacy rows that somehow lack a ref, so the UI always has a label.
+  bookingRef: b.bookingRef ?? `#${b.id}`,
   customerId: b.customerId,
   status: b.status,
   scheduledAt: b.scheduledAt,
@@ -799,9 +838,14 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
       offeredPrice: payload.offeredPrice ?? null,
     });
 
+    /// Reserve the human-facing Booking ID in the same txn so the
+    /// sequence is only consumed if the booking actually commits.
+    const bookingRef = await generateBookingRef(tx);
+
     return tx.booking.create({
       data: {
         customerId,
+        bookingRef,
         status: 'PENDING',
         scheduledAt: new Date(payload.scheduledAt),
         slotLabel: payload.slotLabel,
@@ -910,7 +954,7 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
     const headService = booking.items?.[0]?.serviceName ?? 'a service';
     void adminNotifs.notifyAllAdmins({
       type: adminNotifs.TYPES.BOOKING_NEW,
-      title: `New booking #${booking.id}`,
+      title: `New booking ${booking.bookingRef ?? `#${booking.id}`}`,
       body: `${booking.customer?.name ?? 'A customer'} booked ${headService}${
         booking.isInstant ? ' (Instant)' : ` for ${booking.slotLabel ?? 'a slot'}`
       }.`,
@@ -1229,6 +1273,9 @@ const adminShape = (b) => {
 
   return {
     id: b.id,
+    /// Human-facing Booking ID (DHND…) shown across the admin panel,
+    /// manual dispatch, and booking details.
+    bookingRef: b.bookingRef ?? `#${b.id}`,
     customerId: b.customerId,
     customer: b.customer?.name ?? 'Customer',
     customerPhone: b.customer?.phone ?? '',
@@ -1367,7 +1414,18 @@ exports.adminList = async ({
   /// matches against phone numbers or other rows the way the legacy
   /// `search` did.
   if (bookingId != null) {
-    where.id = Number(bookingId);
+    /// The Booking ID filter accepts either the human-facing ref
+    /// (DHND290526001 — typed in full or partially) or the raw
+    /// internal numeric id. A pure-digit input still matches by id so
+    /// existing deep links / internal references keep working; any
+    /// non-numeric input is matched (case-insensitive, substring)
+    /// against `bookingRef`.
+    const raw = String(bookingId).trim();
+    if (/^\d+$/.test(raw)) {
+      where.id = Number(raw);
+    } else {
+      where.bookingRef = { contains: raw, mode: 'insensitive' };
+    }
   }
   if (customer) {
     where.customer = {
@@ -1396,6 +1454,7 @@ exports.adminList = async ({
       { partner: { name: { contains: search, mode: 'insensitive' } } },
       { partner: { phone: { contains: search, mode: 'insensitive' } } },
       { items: { some: { serviceName: { contains: search, mode: 'insensitive' } } } },
+      { bookingRef: { contains: search, mode: 'insensitive' } },
     ];
     // If the search string is a pure integer, also match by booking id.
     const idMatch = /^\d+$/.test(search) ? Number(search) : null;
@@ -1451,9 +1510,9 @@ exports.liveJobs = async ({ scope } = {}) => {
   /// CONFIRMED row without a partner still renders something.
   return items.map((b) => {
     const shaped = adminShape(b);
-    const minsAgo = Math.floor((Date.now() - new Date(b.updatedAt).getTime()) / 60000);
     return {
       id: b.id,
+      bookingRef: shaped.bookingRef,
       partner: shaped.partner ?? 'Unassigned',
       partnerId: b.partnerId != null ? String(b.partnerId) : '',
       customer: shaped.customer,
@@ -1463,10 +1522,20 @@ exports.liveJobs = async ({ scope } = {}) => {
       city: shaped.cityName,
       state: shaped.state,
       stateCode: shaped.stateCode,
-      status: b.status === 'IN_PROGRESS' ? 'in_progress' : (minsAgo % 2 === 0 ? 'enroute' : 'arrived'),
-      startedAt: new Date(b.updatedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
-      lastUpdateMinsAgo: Math.max(0, Math.min(20, minsAgo)),
-      etaMins: b.status === 'IN_PROGRESS' ? 0 : 5 + (minsAgo % 15),
+      /// REAL status only — CONFIRMED partners are en route, IN_PROGRESS
+      /// are working. We no longer fabricate an "arrived" state or an
+      /// ETA from minute parity (there's no live partner-location ETA
+      /// source yet; surfacing a made-up number was misleading).
+      status: b.status === 'IN_PROGRESS' ? 'in_progress' : 'enroute',
+      isInstant: b.isInstant ?? false,
+      /// Raw timestamps — the admin UI computes "X ago" live between the
+      /// 5s refreshes and formats the scheduled/booked dates itself, so
+      /// the values can't go stale or clamp the way the old server-side
+      /// `lastUpdateMinsAgo` did (it was capped at 20).
+      updatedAt: b.updatedAt,
+      createdAt: b.createdAt,
+      scheduledAt: b.scheduledAt,
+      jobStartedAt: b.jobStartedAt ?? null,
       amount: b.total,
     };
   });
@@ -2044,13 +2113,24 @@ exports.partnerIncoming = async ({ partnerId, lat, lng }) => {
   });
   if (!partner?.isActive || !partner?.isVerified || !partner.categoryId) return [];
 
+  /// Authoritative off-duty gate. A partner who toggled off duty must
+  /// never receive offers, even if their app is still polling (e.g. a
+  /// background poll that slips through before the toggle's teardown
+  /// completes, or a stale request after a location change). Return an
+  /// empty list AND skip the upsertOnline below so this poll can't
+  /// re-register them as available.
+  if (dispatchRegistry.enabled() && (await dispatchRegistry.isOffDuty(partnerId))) {
+    return [];
+  }
+
   const coords = lat != null && lng != null ? { lat: Number(lat), lng: Number(lng) } : null;
   if (!coords) return [];
 
   /// Push-mode side-effect: every poll counts as a presence ping. So
   /// even if the partner-app hasn't been converted to Socket.io yet,
   /// the dispatcher's GEOSEARCH still finds them. Refreshes the
-  /// last-seen TTL on each call.
+  /// last-seen TTL on each call. (upsertOnline itself also re-checks
+  /// the off-duty flag as a final guard.)
   if (dispatchRegistry.enabled()) {
     await dispatchRegistry.upsertOnline({
       partnerId: Number(partnerId),
@@ -2183,7 +2263,17 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
 
   const b = await prisma.booking.findUnique({
     where: { id },
-    include: {
+    /// `lat/lng` + `dispatchRadiusKm` are pulled so we can re-enforce
+    /// the dispatch radius as a HARD cap at accept-time (see below).
+    select: {
+      id: true,
+      status: true,
+      partnerId: true,
+      lat: true,
+      lng: true,
+      dispatchStatus: true,
+      dispatchRadiusKm: true,
+      offeredPrice: true,
       items: { include: { service: { select: { categoryId: true } } } },
     },
   });
@@ -2192,11 +2282,66 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
   if (b.partnerId !== null) throw ApiError.conflict('Booking already accepted by another partner');
   const partner = await prisma.partner.findUnique({
     where: { id: Number(partnerId) },
-    select: { categoryId: true, isActive: true, isVerified: true },
+    /// `currentLat/currentLng` are the DB fallback for the accept-time
+    /// radius check when the partner has no live Redis presence position.
+    select: {
+      categoryId: true,
+      isActive: true,
+      isVerified: true,
+      currentLat: true,
+      currentLng: true,
+    },
   });
   if (!partner?.isActive || !partner?.isVerified) throw ApiError.forbidden('Partner is not active');
   const categoryMatches = b.items.some((i) => i.service?.categoryId === partner.categoryId);
   if (!categoryMatches) throw ApiError.forbidden('Booking category does not match your profile');
+
+  /// HARD accept-time radius cap. The dispatch waves only enforce the
+  /// 3/5/7km radius at BROADCAST time, against the coordinate the
+  /// partner's app reported in its presence ping — which can be stale,
+  /// cached, or a hardcoded default. That let a partner who is actually
+  /// ~22km away (but reported a nearby coordinate) both receive AND
+  /// accept an instant 7km booking. This is the last line of defense:
+  /// recompute the real distance at accept-time and refuse if the
+  /// partner is beyond the booking's radius (+ a small GPS-jitter
+  /// buffer so a partner sitting right on the boundary isn't bounced).
+  ///
+  /// `partnerAccept` is only ever a PARTNER self-claim (admin assignment
+  /// goes through `reassign`), so there's no admin actor to exempt.
+  /// We skip the check only when we genuinely can't locate one side —
+  /// failing open there preserves the legacy behaviour rather than
+  /// blocking an accept on missing data.
+  const ACCEPT_RADIUS_BUFFER_KM = 1.5;
+  const capRadiusKm = (b.dispatchRadiusKm ?? FINAL_DISPATCH_WAVE.radiusKm) + ACCEPT_RADIUS_BUFFER_KM;
+  /// Prefer the partner's LIVE presence position (Redis geo set, set by
+  /// the last presence ping) over the DB `currentLat/Lng` snapshot —
+  /// the live one is what dispatch actually matched against. Fall back
+  /// to the DB columns when there's no live entry.
+  let partnerCoords = null;
+  if (partner.categoryId != null) {
+    const positions = await dispatchRegistry
+      .getOnlinePositions(partner.categoryId, [Number(partnerId)])
+      .catch(() => new Map());
+    partnerCoords = positions.get(Number(partnerId)) ?? null;
+  }
+  if (!partnerCoords && partner.currentLat != null && partner.currentLng != null) {
+    partnerCoords = { lat: partner.currentLat, lng: partner.currentLng };
+  }
+  if (
+    partnerCoords &&
+    b.lat != null &&
+    b.lng != null
+  ) {
+    const distanceKm = haversineKm(partnerCoords, { lat: b.lat, lng: b.lng });
+    if (distanceKm > capRadiusKm) {
+      /// Release the Redis claim we grabbed above so another (nearer)
+      /// partner can still take this booking.
+      await dispatchRegistry.clearBooking(id).catch(() => {});
+      throw ApiError.forbidden(
+        `You're too far from this booking (${distanceKm.toFixed(1)} km away, limit ${b.dispatchRadiusKm ?? FINAL_DISPATCH_WAVE.radiusKm} km).`,
+      );
+    }
+  }
   /// Previously we required the booking to be inside the formal
   /// broadcast window (`dispatchWindowFor` returns a wave only during
   /// active attempts). A partner who saw an alert near the edge of an

@@ -63,7 +63,13 @@ const adminListQuerySchema = z.object({
     /// Targeted filters. When set, each one ANDs into the WHERE clause
     /// — typing "51" into bookingId returns only booking #51, not
     /// every row whose phone happens to contain "51".
-    bookingId: z.coerce.number().int().positive().optional(),
+    ///
+    /// Accepts the human-facing Booking ID (e.g. "DHND290526001", full
+    /// or partial) OR the raw numeric id. The service matches a
+    /// pure-digit value by `id` and anything else against `bookingRef`
+    /// (case-insensitive substring), so this is a bounded string rather
+    /// than a coerced number.
+    bookingId: z.string().trim().max(40).optional(),
     customer: z.string().trim().max(100).optional(),
     partner: z.string().trim().max(100).optional(),
     partnerId: z.coerce.number().int().positive().optional(),

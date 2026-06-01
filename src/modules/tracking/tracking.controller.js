@@ -12,6 +12,14 @@ exports.postLocation = asyncHandler(async (req, res) => {
   success(res, data, 'Location updated');
 });
 
+exports.setDuty = asyncHandler(async (req, res) => {
+  const data = await service.setDuty({
+    partnerId: req.user.sub,
+    onDuty: req.body.onDuty,
+  });
+  success(res, data, data.onDuty ? 'You are now on duty' : 'You are now off duty');
+});
+
 exports.getForBooking = asyncHandler(async (req, res) => {
   const data = await service.getForBooking({
     customerId: req.user.sub,

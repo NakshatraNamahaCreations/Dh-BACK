@@ -306,11 +306,13 @@ const partnerPaymentDone = async (partnerId) => {
 };
 
 const registerPushToken = async ({ sub, type }, token) => {
-  if (!token || !token.startsWith('ExponentPushToken[')) return;
+  if (!token) return;
+  const isExpo = token.startsWith('ExponentPushToken[');
+  const data = isExpo ? { expoPushToken: token } : { fcmToken: token };
   if (type === 'CUSTOMER') {
-    await prisma.customer.update({ where: { id: sub }, data: { expoPushToken: token } });
+    await prisma.customer.update({ where: { id: sub }, data });
   } else if (type === 'PARTNER') {
-    await prisma.partner.update({ where: { id: sub }, data: { expoPushToken: token } });
+    await prisma.partner.update({ where: { id: sub }, data });
   }
 };
 

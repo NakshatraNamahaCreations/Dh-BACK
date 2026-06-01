@@ -56,6 +56,10 @@ model Customer {
   email         String?
   isActive      Boolean   @default(true)
   expoPushToken String?
+  /// Direct FCM device token (raw, no `ExponentPushToken[` prefix).
+  /// Same role as Partner.fcmToken — preferred over expoPushToken when
+  /// present so customer pushes can wake the device directly.
+  fcmToken      String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
@@ -495,6 +499,16 @@ enum BookingStatus {
 
 model Booking {
   id              Int           @id @default(autoincrement())
+  /// Human-facing Booking ID shown in the customer app, admin panel,
+  /// manual dispatch, and notifications. Format: DHND + DDMMYY +
+  /// zero-padded daily sequence, e.g. "DHND290526001". Generated
+  /// atomically at create time via the BookingRefCounter row for the
+  /// day (see bookings.service `generateBookingRef`). The internal
+  /// autoincrement `id` stays the FK / URL key; this is display-only
+  /// but uniquely indexed so it can be searched and never collides.
+  /// Nullable only so the additive migration can add the column before
+  /// the backfill populates every existing row.
+  bookingRef      String?       @unique
   customerId      Int
   customer        Customer      @relation(fields: [customerId], references: [id])
   partnerId       Int?
@@ -632,6 +646,21 @@ model Booking {
   @@index([paymentStatus])
   @@index([cityId, createdAt])
   @@map("bookings")
+}
+
+/// Per-day sequence source for the human-facing Booking ID
+/// (`Booking.bookingRef`). One row per calendar day, keyed by the
+/// "DDMMYY" date string. `seq` is incremented atomically inside the
+/// booking-create transaction (UPSERT … seq = seq + 1) so concurrent
+/// creates on the same day each get a distinct, gap-free number even
+/// under load — Postgres serialises the row update. Old rows are
+/// harmless to keep; they're tiny and double as a per-day volume audit.
+model BookingRefCounter {
+  /// "DDMMYY" — same date component used in the ref itself.
+  day  String @id
+  seq  Int    @default(0)
+
+  @@map("booking_ref_counters")
 }
 
 model BookingItem {

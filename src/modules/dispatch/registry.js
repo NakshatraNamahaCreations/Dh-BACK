@@ -58,6 +58,19 @@ const safe = async (op, fallback) => {
 
 const onlineKey = (categoryId) => `partners:online:cat:${categoryId}`;
 const lastSeenKey = (partnerId) => `partner:lastseen:${partnerId}`;
+/// Authoritative "partner explicitly went off duty" flag. Set by the
+/// duty endpoint when the partner toggles OFF, cleared when they toggle
+/// ON. While present, `upsertOnline` refuses to re-add the partner to
+/// the online geo set — this is what closes the reconnect-after-
+/// location-change race where a socket reconnect or background poll
+/// would otherwise re-register an off-duty partner as available.
+///
+/// Long TTL (12h) so the flag outlives any reconnect storm, app
+/// relaunch, or background poll cycle; a partner coming back on duty
+/// clears it explicitly, and a stale flag from a partner who never
+/// returns simply ages out so it can't pin them off-duty forever.
+const OFFDUTY_TTL_S = 12 * 60 * 60;
+const offDutyKey = (partnerId) => `partner:offduty:${partnerId}`;
 const visibleToKey = (bookingId) => `booking:visibleTo:${bookingId}`;
 const claimKey = (bookingId) => `booking:claim:${bookingId}`;
 /// Reverse index: every booking a partner has been offered. Written
@@ -71,15 +84,73 @@ const partnerOffersKey = (partnerId) => `partner:offers:${partnerId}`;
 /// location ping, and on every legacy partnerIncoming poll (so the
 /// existing partner-app keeps working even before it's converted to
 /// the socket flow).
+/// Legacy partner-app builds defaulted presence to this exact
+/// Bengaluru/HSR coordinate when GPS was cold, which registered
+/// far-away partners inside the dispatch radius of HSR-area bookings.
+/// The app no longer sends it (it now skips presence without a real
+/// fix), but we reject it server-side too so any un-updated build in
+/// the wild can't keep poisoning the geo set. The tiny epsilon guards
+/// against float-format drift in the exact constant.
+const SENTINEL_DEFAULT_LAT = 12.9352;
+const SENTINEL_DEFAULT_LNG = 77.6245;
+const isSentinelDefaultCoord = (lat, lng) =>
+  Math.abs(Number(lat) - SENTINEL_DEFAULT_LAT) < 1e-4 &&
+  Math.abs(Number(lng) - SENTINEL_DEFAULT_LNG) < 1e-4;
+
 const upsertOnline = async ({ partnerId, categoryId, lat, lng }) => {
   if (categoryId == null || lat == null || lng == null) return;
+  /// Reject the known hardcoded default — see isSentinelDefaultCoord.
+  /// A real partner who happens to be within ~11m of this exact point
+  /// will be re-registered by their next genuine fix moments later, so
+  /// dropping this one ping is harmless.
+  if (isSentinelDefaultCoord(lat, lng)) return;
   return safe(async () => {
+    /// HARD GATE: never re-register a partner who has explicitly gone
+    /// off duty. Every presence path (socket `presence`, legacy
+    /// partnerIncoming poll, background task) funnels through here, so
+    /// this one check blocks ALL of them — including the socket
+    /// reconnect a device location change triggers, which was the
+    /// root cause of off-duty partners still receiving offers.
+    const offDuty = await redis.exists(offDutyKey(partnerId));
+    if (offDuty) return;
     await redis
       .multi()
       .geoadd(onlineKey(categoryId), Number(lng), Number(lat), String(partnerId))
       .set(lastSeenKey(partnerId), Date.now(), 'EX', PRESENCE_TTL_S)
       .exec();
   });
+};
+
+/// Mark a partner explicitly OFF duty: set the guard flag AND remove
+/// them from the online registry in one shot, so dispatch stops
+/// offering to them immediately (not after the 90s presence TTL). The
+/// flag then prevents any racing presence ping from re-adding them.
+/// `categoryId` is optional — the flag is category-independent, and we
+/// best-effort ZREM from the category set when we know it.
+const setOffDuty = async ({ partnerId, categoryId = null }) => {
+  return safe(async () => {
+    const pipe = redis.multi().set(offDutyKey(partnerId), Date.now(), 'EX', OFFDUTY_TTL_S);
+    if (categoryId != null) pipe.zrem(onlineKey(categoryId), String(partnerId));
+    pipe.del(lastSeenKey(partnerId));
+    await pipe.exec();
+  });
+};
+
+/// Clear the off-duty flag when a partner comes back ON duty. The next
+/// presence ping (fired immediately by the app on toggle-on) then
+/// re-adds them to the online set via `upsertOnline`.
+const clearOffDuty = async (partnerId) => {
+  return safe(async () => {
+    await redis.del(offDutyKey(partnerId));
+  });
+};
+
+/// Whether a partner currently holds the explicit off-duty flag. Used
+/// by the legacy poll path to short-circuit before doing any work.
+const isOffDuty = async (partnerId) => {
+  return safe(async () => {
+    return (await redis.exists(offDutyKey(partnerId))) === 1;
+  }, false);
 };
 
 /// Drop a partner from the online registry — called on socket
@@ -411,6 +482,9 @@ module.exports = {
   PRESENCE_TTL_S,
   upsertOnline,
   removeOnline,
+  setOffDuty,
+  clearOffDuty,
+  isOffDuty,
   countOnlineInCategory,
   filterOnlinePartnerIds,
   incrSocketConn,

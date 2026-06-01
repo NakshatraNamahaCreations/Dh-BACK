@@ -14,7 +14,7 @@
  * process embed the worker (the default `DISPATCH_WORKER_MODE=embedded`).
  */
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 const env = require('./config/env');
 const logger = require('./config/logger');
 const prisma = require('./config/prisma');
