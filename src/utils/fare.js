@@ -5,8 +5,9 @@
  *
  * **Pricing model is INCLUSIVE.** The price the customer sees in the
  * cart (and the BYOP offer) IS what they pay end-to-end. GST and the
- * platform fee are extracted *from* that amount — they're not added on
- * top.
+ * platform fee are extracted *from* that amount — they're NOT added on
+ * top. So for a ₹1,699 offer, the customer pays exactly ₹1,699, and
+ * GST + platform fee + partner base ADD UP TO ₹1,699.
  *
  * Splits, given a cart-value V (customer-facing total):
  *

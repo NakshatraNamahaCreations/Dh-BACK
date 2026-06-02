@@ -32,8 +32,11 @@ const { sendJobOfferPushes } = require('../notifications/push.service');
  *        - pulls the booking + items
  *        - GEOSEARCHes `partners:online:cat:{categoryId}` for each
  *          item-category (deduped) within the wave's radius
- *        - drops partners who already have an active job (Redis-side
- *          via the `partner:active:{id}` flag set on accept)
+ *        - drops partners who already have an active job: the
+ *          `partner:active:{id}` flag (set on accept, cleared on
+ *          complete/cancel) keeps them out of the geo set via the
+ *          upsertOnline guard, and handleWave filters the candidate
+ *          list against it as defense-in-depth
  *        - SADDs survivors to `booking:visibleTo:{bookingId}`
  *        - emits a `dispatch.offer` event to each candidate's socket
  *          (when connected) and writes to the booking's wave columns
@@ -262,6 +265,26 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       if (seen.has(r.partnerId)) continue;
       seen.add(r.partnerId);
       candidates.push(r);
+    }
+  }
+
+  /// Defense-in-depth: drop any candidate currently on an active job.
+  /// The upsertOnline guard already keeps busy partners OUT of the geo
+  /// set, so this normally removes nothing — but it's the belt to that
+  /// suspenders against a missed removeOnline / a flag set mid-wave, so
+  /// a partner finishing a job never gets a NEW push/socket offer.
+  if (candidates.length > 0) {
+    const busy = await registry
+      .filterActivePartnerIds(candidates.map((c) => c.partnerId))
+      .catch(() => new Set());
+    if (busy.size > 0) {
+      const before = candidates.length;
+      for (let i = candidates.length - 1; i >= 0; i -= 1) {
+        if (busy.has(candidates[i].partnerId)) candidates.splice(i, 1);
+      }
+      logger.info(
+        `dispatch wave ${waveNumber} for booking ${bookingId}: dropped ${before - candidates.length} busy partner(s)`,
+      );
     }
   }
 

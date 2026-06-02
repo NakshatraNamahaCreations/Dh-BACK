@@ -71,6 +71,19 @@ const lastSeenKey = (partnerId) => `partner:lastseen:${partnerId}`;
 /// returns simply ages out so it can't pin them off-duty forever.
 const OFFDUTY_TTL_S = 12 * 60 * 60;
 const offDutyKey = (partnerId) => `partner:offduty:${partnerId}`;
+/// "Partner is on an active accepted job" flag. Set when a partner
+/// accepts a booking, cleared when that job completes or is cancelled.
+/// While present, `upsertOnline` refuses to re-add the partner to the
+/// online geo set — so a partner who keeps sending presence pings while
+/// driving to / doing a job is NOT offered (push + socket) new jobs.
+/// `removeOnline` on accept pulls them out once; this flag is what keeps
+/// them out against their own 15s presence re-adds.
+///
+/// TTL is a safety net: if the clear-on-complete somehow doesn't fire
+/// (crash, missed webhook), the flag ages out so the partner isn't
+/// pinned "busy" forever. 4h comfortably covers any real job.
+const ACTIVE_JOB_TTL_S = 4 * 60 * 60;
+const activeJobKey = (partnerId) => `partner:active:${partnerId}`;
 const visibleToKey = (bookingId) => `booking:visibleTo:${bookingId}`;
 const claimKey = (bookingId) => `booking:claim:${bookingId}`;
 /// Reverse index: every booking a partner has been offered. Written
@@ -105,14 +118,18 @@ const upsertOnline = async ({ partnerId, categoryId, lat, lng }) => {
   /// dropping this one ping is harmless.
   if (isSentinelDefaultCoord(lat, lng)) return;
   return safe(async () => {
-    /// HARD GATE: never re-register a partner who has explicitly gone
-    /// off duty. Every presence path (socket `presence`, legacy
-    /// partnerIncoming poll, background task) funnels through here, so
-    /// this one check blocks ALL of them — including the socket
-    /// reconnect a device location change triggers, which was the
-    /// root cause of off-duty partners still receiving offers.
-    const offDuty = await redis.exists(offDutyKey(partnerId));
-    if (offDuty) return;
+    /// HARD GATES — never re-register a partner who is either:
+    ///   (a) explicitly OFF DUTY, or
+    ///   (b) on an ACTIVE accepted job (busy).
+    /// Every presence path (socket `presence`, legacy partnerIncoming
+    /// poll, background task) funnels through here, so these two checks
+    /// block ALL of them. (b) is what stops a partner from getting NEW
+    /// job offers (push + socket) while they're still finishing the job
+    /// they accepted — their app keeps pinging presence as they drive,
+    /// and without this they'd be re-added to the pool ~15s after accept.
+    /// One EXISTS over both keys keeps this a single round-trip.
+    const blocked = await redis.exists(offDutyKey(partnerId), activeJobKey(partnerId));
+    if (blocked > 0) return;
     await redis
       .multi()
       .geoadd(onlineKey(categoryId), Number(lng), Number(lat), String(partnerId))
@@ -151,6 +168,52 @@ const isOffDuty = async (partnerId) => {
   return safe(async () => {
     return (await redis.exists(offDutyKey(partnerId))) === 1;
   }, false);
+};
+
+/// Mark a partner as ON an active job (busy). Set on accept so they
+/// stop being offered new jobs while they finish the current one. The
+/// flag + `removeOnline` together pull them out and keep them out
+/// against their own presence pings. TTL is a self-healing safety net.
+const setActiveJob = async (partnerId) => {
+  return safe(async () => {
+    await redis.set(activeJobKey(partnerId), Date.now(), 'EX', ACTIVE_JOB_TTL_S);
+  });
+};
+
+/// Clear the busy flag when the job completes / is cancelled, so the
+/// partner's next presence ping re-adds them to the dispatch pool.
+const clearActiveJob = async (partnerId) => {
+  return safe(async () => {
+    await redis.del(activeJobKey(partnerId));
+  });
+};
+
+/// Whether a partner is currently on an active job. Used by the legacy
+/// poll path as a fast short-circuit (the DB `partnerHasActiveJob` is
+/// the authoritative check; this avoids the query on the hot path).
+const isOnActiveJob = async (partnerId) => {
+  return safe(async () => {
+    return (await redis.exists(activeJobKey(partnerId))) === 1;
+  }, false);
+};
+
+/// Given partner ids, return the SUBSET currently on an active job.
+/// Used by the dispatcher to drop busy partners from a wave's candidate
+/// list as defense-in-depth (the upsertOnline guard already keeps them
+/// out of the geo set, but a flag set mid-wave or a missed removeOnline
+/// could leave one in — this is the belt to that suspenders). Empty Set
+/// when Redis is down so the dispatcher fails open (offers go out; the
+/// DB-side guards on accept still prevent a double-assignment).
+const filterActivePartnerIds = async (partnerIds) => {
+  if (!Array.isArray(partnerIds) || partnerIds.length === 0) return new Set();
+  return safe(async () => {
+    const values = await redis.mget(...partnerIds.map((id) => activeJobKey(id)));
+    const busy = new Set();
+    partnerIds.forEach((id, i) => {
+      if (values[i] != null) busy.add(Number(id));
+    });
+    return busy;
+  }, new Set());
 };
 
 /// Drop a partner from the online registry — called on socket
@@ -509,6 +572,10 @@ module.exports = {
   setOffDuty,
   clearOffDuty,
   isOffDuty,
+  setActiveJob,
+  clearActiveJob,
+  isOnActiveJob,
+  filterActivePartnerIds,
   shouldMirrorLocation,
   countOnlineInCategory,
   filterOnlinePartnerIds,

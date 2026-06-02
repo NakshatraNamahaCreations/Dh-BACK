@@ -1173,6 +1173,9 @@ exports.cancelOwn = async ({ customerId, id, reason }) => {
   /// row vanishes from /partner/mine — a notification lands instantly
   /// and gives them context for why.
   if (b.partnerId) {
+    /// Free the partner — their job was cancelled out from under them,
+    /// so clear the BUSY flag and let them receive new offers again.
+    await dispatchRegistry.clearActiveJob(b.partnerId).catch(() => {});
     const notifications = require('../notifications/notifications.service');
     await notifications.create({
       partnerId: b.partnerId,
@@ -1954,6 +1957,12 @@ exports.adminCancel = async (id, reason) => {
     await tryRefund(bookingId, `Admin cancelled: ${reason}`);
   }
 
+  /// Free the assigned partner (if any) — clear the BUSY flag so they
+  /// can receive new offers again after an admin pulls their job.
+  if (b.partnerId) {
+    await dispatchRegistry.clearActiveJob(b.partnerId).catch(() => {});
+  }
+
   return adminShape(updated);
 };
 
@@ -2409,12 +2418,21 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
     throw ApiError.conflict('Booking already accepted by another partner');
   }
 
+  /// Mark the partner BUSY so subsequent dispatch waves for OTHER
+  /// bookings stop offering jobs to them while they finish this one.
+  /// `removeOnline` (below) pulls them out of the geo set once, but
+  /// their app keeps sending presence pings as they drive — without
+  /// this flag `upsertOnline` would re-add them ~15s later and they'd
+  /// get new push/socket offers mid-job. Cleared on completion / cancel.
+  /// Set regardless of queue mode so the legacy poll path benefits too.
+  await dispatchRegistry.setActiveJob(partnerId).catch(() => {});
+
   /// Cancel the queued wave + expiry jobs and clear Redis state — no
   /// need to fan out further or expire something that's now in flight.
   /// Also pull the partner from the online geo-set so subsequent waves
   /// for OTHER bookings don't keep offering jobs to someone who's now
-  /// busy. They'll be re-added on their next presence ping after the
-  /// job completes.
+  /// busy. The `partner:active` flag set above keeps them out against
+  /// their own presence pings until the job completes.
   ///
   /// For BYOP bookings, also enqueue a delayed `payment_expire` job
   /// that auto-cancels the booking if the customer hasn't paid by
@@ -2548,6 +2566,10 @@ exports.partnerCancel = async ({ partnerId, id, reason }) => {
 
     return { strikes: strikeCount, suspended: didSuspend };
   });
+
+  /// Partner is no longer on this job — clear the BUSY flag so they can
+  /// be offered new jobs again (their next presence ping re-adds them).
+  await dispatchRegistry.clearActiveJob(pid).catch(() => {});
 
   /// Re-broadcast outside the txn. Clear any stale queue/registry state
   /// first, then schedule fresh waves off the (now PENDING) booking.
@@ -2700,6 +2722,10 @@ exports.partnerUpdateStatus = async ({ bookingId, partnerId, status, otp }) => {
     } catch (err) {
       console.warn(`Earning credit failed for booking ${id}: ${err.message}`);
     }
+    /// Job done — clear the BUSY flag so the partner's next presence
+    /// ping re-adds them to the dispatch pool and they can be offered
+    /// new jobs again.
+    await dispatchRegistry.clearActiveJob(partnerId).catch(() => {});
   }
 
   const commissionMap = await loadCommissionMap();
