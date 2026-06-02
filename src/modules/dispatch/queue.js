@@ -185,6 +185,46 @@ const ensureNotificationCleanupScheduled = async () => {
   );
 };
 
+/// Recurring dispatch sweep — DURABLE safety net for scheduled
+/// bookings. The per-booking wave jobs are enqueued ONCE at create
+/// time; if that enqueue is lost (Redis/DB blip), or the worker is
+/// restarted while stale jobs from a previous lead-config are still
+/// queued, a scheduled booking can end up stranded — its broadcast
+/// window arrives but no wave ever fires (it sits in `waiting`, or an
+/// old expire job wrongly flipped it to `needs_admin_dispatch`).
+///
+/// This sweep makes the DB the source of truth: every SWEEP_EVERY_MS it
+/// scans for scheduled bookings whose window has arrived but never
+/// broadcast, and re-arms them. Idempotent wave jobIds mean re-arming a
+/// booking whose jobs DO exist is a harmless no-op, so this can't
+/// double-dispatch. Same dedupe-by-key pattern as the reconciler, so
+/// running it from both the API and the worker process is safe.
+const SWEEP_EVERY_MS = 30 * 1000;
+const ensureDispatchSweepScheduled = async () => {
+  if (!dispatchQueue) return;
+  try {
+    const existing = await dispatchQueue.getRepeatableJobs();
+    for (const job of existing) {
+      if (job.name === 'dispatch_sweep') {
+        await dispatchQueue.removeRepeatableByKey(job.key).catch(() => {});
+      }
+    }
+  } catch (err) {
+    logger.warn(`Failed to clean up old dispatch-sweep schedules: ${err.message}`);
+  }
+
+  await dispatchQueue.add(
+    'dispatch_sweep',
+    {},
+    {
+      repeat: { every: SWEEP_EVERY_MS },
+      jobId: 'dispatch_sweep__repeat',
+      removeOnComplete: { count: 1 },
+      removeOnFail: { count: 10 },
+    },
+  );
+};
+
 /// Cancel any pending wave/expiry jobs for a booking — used when a
 /// partner accepts (we don't need future waves to fire) or when admin
 /// cancels manually. Best-effort: if the job already moved to active
@@ -231,6 +271,7 @@ module.exports = {
   enqueuePaymentExpire,
   ensureReconcilerScheduled,
   ensureNotificationCleanupScheduled,
+  ensureDispatchSweepScheduled,
   cancelJobsForBooking,
   close,
 };

@@ -2,6 +2,7 @@ const { Worker } = require('bullmq');
 const couponsService = require('../coupons/coupons.service');
 const razorpayService = require('../payments/razorpay.service');
 const prisma = require('../../config/prisma');
+const { withDbRetry } = require('../../config/prisma');
 const logger = require('../../config/logger');
 const queue = require('./queue');
 const registry = require('./registry');
@@ -77,6 +78,8 @@ const DISPATCH_WAVES = [
 ];
 const FINAL_DISPATCH_WAVE = DISPATCH_WAVES[DISPATCH_WAVES.length - 1];
 const DISPATCH_TOTAL_MS = FINAL_DISPATCH_WAVE.offsetMs + DISPATCH_WINDOW_MS;
+// Lead time before a scheduled slot at which dispatch begins. MUST stay
+// in sync with the same constant in bookings.service.js.
 const SCHEDULE_DISPATCH_LEAD_MS = 30 * 60 * 1000;
 /// When all six waves elapse without acceptance, the booking is
 /// handed off to admin (status stays PENDING, dispatchStatus flips
@@ -355,15 +358,21 @@ const handleReconcile = async () => {
   /// fresh-but-still-broadcasting rows out of scope.
   const cutoff = new Date(Date.now() - DISPATCH_TOTAL_MS - RECONCILE_GRACE_MS);
   const lookback = new Date(Date.now() - RECONCILE_LOOKBACK_MS);
-  const orphans = await prisma.booking.findMany({
-    where: {
-      status: 'PENDING',
-      partnerId: null,
-      createdAt: { gte: lookback, lte: cutoff },
-    },
-    select: { id: true },
-    take: 200,
-  });
+  /// Wrapped in withDbRetry — this fires on a timer against a mostly-idle
+  /// worker connection, the prime victim of RDS/NAT idle-timeout drops.
+  const orphans = await withDbRetry(
+    () =>
+      prisma.booking.findMany({
+        where: {
+          status: 'PENDING',
+          partnerId: null,
+          createdAt: { gte: lookback, lte: cutoff },
+        },
+        select: { id: true },
+        take: 200,
+      }),
+    { label: 'reconcile.findOrphans' },
+  );
   if (orphans.length === 0) return;
 
   /// Re-enqueue with delay 0 — these are already past their expiry
@@ -371,6 +380,114 @@ const handleReconcile = async () => {
   /// jobId means re-queueing one we already have is a no-op.
   await Promise.all(orphans.map((b) => queue.enqueueExpire(b.id, 0)));
   logger.info(`reconciler: re-queued expire for ${orphans.length} orphaned PENDING bookings`);
+};
+
+/// DURABLE scheduled-dispatch safety net. Runs every SWEEP_EVERY_MS (see
+/// queue.ensureDispatchSweepScheduled). Finds scheduled bookings whose
+/// broadcast window has ARRIVED but which never actually broadcast, and
+/// re-arms them. This is what guarantees a scheduled booking goes out at
+/// `scheduledAt - lead` even when the one-shot create-time enqueue was
+/// lost or a worker restart left stale jobs behind.
+///
+/// "Never broadcast" is detected by `dispatchStartedAt IS NULL` — the
+/// wave handler stamps that the moment it runs, so a null value means no
+/// wave has executed regardless of what `dispatchStatus` claims. We
+/// therefore also rescue bookings that an old/premature expire job
+/// wrongly flipped to `needs_admin_dispatch` while their real waves
+/// hadn't run yet (the exact stale-state symptom seen on worker
+/// restarts).
+///
+/// Scope is deliberately narrow so this is cheap and can't hijack
+/// healthy flows:
+///   - scheduled only (isInstant=false, offeredPrice=null) — instant +
+///     BYOP dispatch at create time, not on a scheduled lead.
+///   - still claimable (PENDING, partnerId null)
+///   - never broadcast (dispatchStartedAt null)
+///   - window is OPEN right now: start <= now < start + DISPATCH_TOTAL_MS
+///     so we don't resurrect bookings whose whole window genuinely
+///     elapsed (those correctly belong to admin manual dispatch).
+const SWEEP_LOOKAHEAD_BUFFER_MS = 5 * 1000;
+const handleDispatchSweep = async () => {
+  const now = new Date();
+  /// DB-side prefilter: scheduled, claimable, not yet broadcast, and
+  /// whose dispatch window could plausibly be open now. We compute the
+  /// exact per-booking window in JS below (it depends on isInstant /
+  /// offeredPrice via dispatchStartAt). The upper bound here is
+  /// `scheduledAt <= now + lead + buffer` i.e. start <= now; the lower
+  /// bound keeps the scan bounded to bookings whose window hasn't fully
+  /// elapsed yet.
+  const candidates = await withDbRetry(
+    () =>
+      prisma.booking.findMany({
+        where: {
+          status: 'PENDING',
+          partnerId: null,
+          isInstant: false,
+          offeredPrice: null,
+          dispatchStartedAt: null,
+          dispatchStatus: { in: ['waiting', 'needs_admin_dispatch'] },
+          scheduledAt: {
+            /// start = scheduledAt - SCHEDULE_DISPATCH_LEAD_MS has passed →
+            /// scheduledAt <= now + lead. Add a small buffer so a booking
+            /// that becomes due between ticks isn't missed by a hair.
+            lte: new Date(now.getTime() + SCHEDULE_DISPATCH_LEAD_MS + SWEEP_LOOKAHEAD_BUFFER_MS),
+            /// window not fully elapsed: scheduledAt - lead + TOTAL > now →
+            /// scheduledAt > now - TOTAL + lead.
+            gt: new Date(now.getTime() - DISPATCH_TOTAL_MS + SCHEDULE_DISPATCH_LEAD_MS),
+          },
+        },
+        select: {
+          id: true, isInstant: true, offeredPrice: true,
+          scheduledAt: true, createdAt: true, dispatchStatus: true,
+        },
+        take: 200,
+      }),
+    { label: 'dispatchSweep.findStranded' },
+  );
+  if (candidates.length === 0) return;
+
+  let rearmed = 0;
+  for (const b of candidates) {
+    const start = dispatchStartAt(b).getTime();
+    /// Only act while the window is genuinely open. Outside it the
+    /// reconciler / expire path owns the booking.
+    if (now.getTime() < start || now.getTime() >= start + DISPATCH_TOTAL_MS) continue;
+
+    /// A premature expire flipped it to needs_admin_dispatch before any
+    /// wave ran — reset it to `waiting` so handleWave's PENDING guard
+    /// will transition it to `broadcasting`. Guarded on the same
+    /// (never-broadcast) invariants so we never stomp a real handoff.
+    if (b.dispatchStatus === 'needs_admin_dispatch') {
+      await prisma.booking
+        .updateMany({
+          where: {
+            id: b.id, status: 'PENDING', partnerId: null,
+            dispatchStartedAt: null, dispatchStatus: 'needs_admin_dispatch',
+          },
+          data: { dispatchStatus: 'waiting' },
+        })
+        .catch((err) => logger.warn(`sweep: reset ${b.id} failed: ${err.message}`));
+      /// Tear down any stale admin_timeout/expire jobs left from the
+      /// premature handoff so they don't fire again mid-broadcast.
+      await queue.cancelJobsForBooking(b.id).catch(() => {});
+    }
+
+    /// (Re)enqueue the full wave + expire schedule. Idempotent jobIds
+    /// mean this is a no-op when the jobs already exist, and it heals
+    /// the case where they were lost entirely.
+    await scheduleAllForBooking({
+      id: b.id,
+      isInstant: b.isInstant,
+      offeredPrice: b.offeredPrice,
+      scheduledAt: b.scheduledAt,
+      createdAt: b.createdAt,
+    }).catch((err) => logger.warn(`sweep: re-arm ${b.id} failed: ${err.message}`));
+    rearmed += 1;
+  }
+
+  if (rearmed > 0) {
+    logger.info(`dispatch sweep: re-armed ${rearmed} stranded scheduled booking(s)`);
+  }
 };
 
 /// Repeatable job — prune admin + partner notifications past the
@@ -651,6 +768,8 @@ const start = () => {
           return handlePaymentExpire(job.data);
         case 'reconcile':
           return handleReconcile();
+        case 'dispatch_sweep':
+          return handleDispatchSweep();
         case 'notification_cleanup':
           return handleNotificationCleanup();
         default:
@@ -676,6 +795,18 @@ const start = () => {
   /// schedule already exists in Redis, BullMQ leaves it in place.
   queue.ensureReconcilerScheduled().catch((err) => {
     logger.warn(`Failed to schedule reconciler: ${err.message}`);
+  });
+
+  /// Install the recurring dispatch sweep — the durable safety net that
+  /// re-arms scheduled bookings whose broadcast window arrived but never
+  /// fired (lost create-time enqueue, restart-stale jobs, premature
+  /// admin handoff). Run one pass immediately so anything already
+  /// stranded is rescued on boot instead of waiting for the first tick.
+  queue.ensureDispatchSweepScheduled().catch((err) => {
+    logger.warn(`Failed to schedule dispatch sweep: ${err.message}`);
+  });
+  handleDispatchSweep().catch((err) => {
+    logger.warn(`Initial dispatch sweep failed: ${err.message}`);
   });
 
   /// Install the recurring notification-cleanup schedule, and run one

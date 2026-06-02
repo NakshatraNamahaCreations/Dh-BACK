@@ -94,6 +94,33 @@ exports.postLocation = async ({ partnerId, lat, lng, accuracy }) => {
 /// Best-effort against Redis — if Redis is down the registry helpers
 /// no-op and we still return success (presence-based behaviour is the
 /// fallback, same as before this endpoint existed).
+/// Mirror an on-duty PRESENCE coordinate into the DB so
+/// `partner.currentLat/Lng` stays fresh BETWEEN jobs — not just during
+/// an active booking (which is what `postLocation` covers). Without
+/// this, the DB position freezes wherever a partner finished their last
+/// job, and the admin "nearby partners" view + the accept-time radius
+/// fallback would read that stale point after the partner moved on.
+///
+/// Throttled to ~once/60s per partner via the Redis gate so the 15s
+/// presence cadence doesn't translate into a DB write every 15s.
+/// Best-effort and unconditional on active-job state — this is the
+/// "where is this on-duty partner right now" signal. Swallows errors:
+/// a failed mirror must never break presence registration.
+exports.mirrorPresenceLocation = async ({ partnerId, lat, lng }) => {
+  const registry = require('../dispatch/registry');
+  if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) return;
+  try {
+    if (!(await registry.shouldMirrorLocation(partnerId))) return;
+    await prisma.partner.update({
+      where: { id: Number(partnerId) },
+      data: { currentLat: Number(lat), currentLng: Number(lng), lastLocationAt: new Date() },
+      select: { id: true },
+    });
+  } catch {
+    /* best-effort — never block presence on a mirror write */
+  }
+};
+
 exports.setDuty = async ({ partnerId, onDuty }) => {
   const registry = require('../dispatch/registry');
   /// Look up the partner's category so the OFF path can ZREM them from

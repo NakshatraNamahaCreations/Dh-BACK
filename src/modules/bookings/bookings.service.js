@@ -176,6 +176,8 @@ const DISPATCH_WAVES = [
 ];
 const FINAL_DISPATCH_WAVE = DISPATCH_WAVES[DISPATCH_WAVES.length - 1];
 const DISPATCH_TOTAL_MS = FINAL_DISPATCH_WAVE.endsAtMs;
+// Lead time before a scheduled slot at which dispatch begins. MUST stay
+// in sync with the same constant in dispatch/dispatcher.js.
 const SCHEDULE_DISPATCH_LEAD_MS = 30 * 60 * 1000;
 
 const broadcastStartFor = (booking) => {
@@ -2135,6 +2137,19 @@ exports.partnerIncoming = async ({ partnerId, lat, lng }) => {
     await dispatchRegistry.upsertOnline({
       partnerId: Number(partnerId),
       categoryId: partner.categoryId,
+      lat: coords.lat,
+      lng: coords.lng,
+    });
+  }
+
+  /// Mirror this on-duty coordinate into the DB (throttled ~60s) so
+  /// `partner.currentLat/Lng` stays fresh between jobs for the admin
+  /// nearby-partners view + the accept-time radius fallback. Same
+  /// best-effort mirror the socket presence path does; fire-and-forget.
+  {
+    const tracking = require('../tracking/tracking.service');
+    void tracking.mirrorPresenceLocation({
+      partnerId: Number(partnerId),
       lat: coords.lat,
       lng: coords.lng,
     });

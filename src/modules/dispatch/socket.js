@@ -200,6 +200,12 @@ const start = (httpServer) => {
           lng,
         });
         await registry.touchSocketConn(partnerId).catch(() => {});
+        /// Keep the DB position fresh while on-duty (throttled ~60s)
+        /// so admin "nearby partners" + the accept-time fallback don't
+        /// read a stale post-job location. Fire-and-forget — never
+        /// block the presence hot path on a DB write.
+        const tracking = require('../tracking/tracking.service');
+        void tracking.mirrorPresenceLocation({ partnerId, lat, lng });
       } catch (err) {
         logger.warn(`socket presence failed: ${err.message}`);
       }

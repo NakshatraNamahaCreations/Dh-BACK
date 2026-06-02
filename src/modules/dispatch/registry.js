@@ -168,6 +168,30 @@ const removeOnline = async ({ partnerId, categoryId }) => {
   });
 };
 
+/// Throttle gate for mirroring on-duty presence coordinates into the
+/// DB (`partner.currentLat/Lng`). Presence pings arrive every ~15s, but
+/// we don't want a DB write that often per partner — once a minute is
+/// plenty to keep admin "nearby partners" + the accept-time fallback
+/// fresh. Uses `SET key NX EX 60`: returns true only when the key was
+/// absent (i.e. >60s since the last mirror for this partner), at which
+/// point the caller does the DB write. Fails OPEN (returns true) when
+/// Redis is down so we don't silently stop mirroring — a few extra DB
+/// writes during a Redis outage are harmless.
+const LOCATION_MIRROR_THROTTLE_S = 60;
+const locationMirrorKey = (partnerId) => `partner:locmirror:${partnerId}`;
+const shouldMirrorLocation = async (partnerId) => {
+  return safe(async () => {
+    const res = await redis.set(
+      locationMirrorKey(partnerId),
+      Date.now(),
+      'EX',
+      LOCATION_MIRROR_THROTTLE_S,
+      'NX',
+    );
+    return res === 'OK';
+  }, true);
+};
+
 /// Total count of partners marked online in a category, ignoring
 /// distance. Used purely for diagnostic logging — comparing this to
 /// the radius-filtered count of `findOnlineNearby` reveals whether
@@ -485,6 +509,7 @@ module.exports = {
   setOffDuty,
   clearOffDuty,
   isOffDuty,
+  shouldMirrorLocation,
   countOnlineInCategory,
   filterOnlinePartnerIds,
   incrSocketConn,
