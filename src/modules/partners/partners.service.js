@@ -134,6 +134,16 @@ const enrichPartner = (p, categoryById, jobsCount = 0, earnings = 0) => {
         : 'onboarding',
     suspendReason: p.suspendReason ?? null,
     suspendedAt: p.suspendedAt ?? null,
+    /// Real-time duty mirror (kept in sync from the Redis presence
+    /// layer). Lets the directory show an On Duty / Off Duty badge and
+    /// filter by it. Reflects whether the partner is currently online +
+    /// available for dispatch; may briefly lag a crash until the
+    /// reconciler flips a stale row off.
+    onDuty: p.onDuty ?? false,
+    /// 3-state live status: 'off_duty' | 'available' (on duty, free) |
+    /// 'busy' (on duty + on a job). Superset of `onDuty`.
+    dutyState: p.dutyState ?? 'off_duty',
+    onDutyChangedAt: p.onDutyChangedAt ?? null,
     kyc: kycStatus(p),
     joinedAt: p.createdAt.toISOString().slice(0, 10),
     bankName: p.document?.bankIfsc ? 'Bank account on file' : undefined,
@@ -164,9 +174,20 @@ const bookingStats = async (partnerIds) => {
   }]));
 };
 
-exports.list = async ({ status, kyc, search, scope, page = 1, pageSize = 25 } = {}) => {
+exports.list = async ({ status, kyc, search, onDuty, dutyState, scope, page = 1, pageSize = 25 } = {}) => {
   const { applyScopeToWhere } = require('../../middlewares/adminScope');
   const where = {};
+  /// Duty filters — both AND with status.
+  ///   `dutyState` (preferred): exact 3-state filter
+  ///     'available' (on duty + free) | 'busy' (on a job) | 'off_duty'.
+  ///   `onDuty` (legacy boolean): true → on duty (available OR busy).
+  if (['off_duty', 'available', 'busy'].includes(dutyState)) {
+    where.dutyState = dutyState;
+  } else if (onDuty === true || onDuty === 'true') {
+    where.dutyState = { in: ['available', 'busy'] };
+  } else if (onDuty === false || onDuty === 'false') {
+    where.dutyState = 'off_duty';
+  }
   /// Status filter:
   ///   - 'active'      → isActive=true AND isVerified=true (fully approved + live)
   ///   - 'onboarding'  → isActive=true AND isVerified=false (in-flight)

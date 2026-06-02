@@ -417,6 +417,24 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     CANCELLED: 'cancelled',
   };
 
+  /// PRIVACY GATE — withhold the customer's phone + EXACT location from
+  /// the partner until the booking is PAID. This covers the BYOP /
+  /// instant "pay-after-accept" flow: a partner accepts, the customer
+  /// has a short window to pay, and until that payment lands the partner
+  /// must NOT be able to call the customer or navigate to their exact
+  /// door. We still expose the general area (city) so the partner can
+  /// gauge the job, just not the precise address / coordinates / phone.
+  /// Applies only to in-flight accepted jobs (CONFIRMED / IN_PROGRESS);
+  /// COMPLETED jobs keep full detail for support/history, and incoming
+  /// offers already only carry distance (handled by the caller).
+  const isAcceptedUnpaid =
+    (b.status === 'CONFIRMED' || b.status === 'IN_PROGRESS') &&
+    (b.paymentStatus ?? 'unpaid') !== 'paid';
+  /// Cash jobs are "pay on completion" — there's no upfront payment to
+  /// gate on, so don't mask those (paymentMethod 'cash'). Only the
+  /// online pay-first flow is gated.
+  const maskContact = isAcceptedUnpaid && b.paymentMethod !== 'cash';
+
   return {
     id: String(b.id),
     /// Human-facing Booking ID shared across customer/partner/admin.
@@ -424,10 +442,20 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     service: b.items?.[0]?.serviceName ?? 'Service',
     services,
     customerName: b.customer?.name ?? 'Customer',
-    customerPhone: b.customer?.phone ?? '',
-    address: [addr.line, addr.city].filter(Boolean).join(', '),
-    lat: bookingLat,
-    lng: bookingLng,
+    /// Hidden until paid (see maskContact). The app shows "Available
+    /// after payment" in place of the number.
+    customerPhone: maskContact ? '' : (b.customer?.phone ?? ''),
+    /// While unpaid, expose only the city — not the full street line.
+    address: maskContact
+      ? (addr.city ?? '')
+      : [addr.line, addr.city].filter(Boolean).join(', '),
+    /// Exact coordinates withheld until paid so the partner can't
+    /// navigate to the door before payment.
+    lat: maskContact ? null : bookingLat,
+    lng: maskContact ? null : bookingLng,
+    /// Flag the app uses to render the "unlocks after payment" state on
+    /// the contact + navigation controls.
+    contactLockedUntilPaid: maskContact,
     scheduledAt: b.scheduledAt,
     slotLabel: b.slotLabel ?? '',
     isInstant: b.isInstant ?? false,
@@ -976,18 +1004,38 @@ exports.listMine = async ({ customerId, status, bucket }) => {
   if (bucket === 'upcoming') {
     where.status = { in: ['PENDING', 'CONFIRMED', 'IN_PROGRESS'] };
   } else if (bucket === 'past') {
-    /// Past = completed jobs + cancellations the user can act on.
-    /// Hide system-driven cancellations (no-pay timeout, fresh-attempt
-    /// supersede, no-partner-accepted broadcast expiry) — those rows
-    /// populate `noPartnerReason`. User-driven cancels and admin-driven
-    /// cancels go through `notes` and leave `noPartnerReason` null, so
-    /// they still appear here. The rows stay in the DB for audit /
-    /// support / fraud detection — we just stop surfacing them to the
-    /// customer who didn't make the decision.
+    /// Past = completed jobs + cancellations of REAL bookings the
+    /// customer actually placed.
+    ///
+    /// What we DON'T surface:
+    ///   1. System-driven cancellations (no-pay timeout, fresh-attempt
+    ///      supersede, no-partner-accepted broadcast expiry) — those
+    ///      populate `noPartnerReason`.
+    ///   2. Abandoned instant-search attempts — when a customer starts an
+    ///      instant booking and backs out of the searching screen before
+    ///      any partner accepts or any payment, the app cancels it
+    ///      ("Customer left the search"). These never became a real
+    ///      booking: NO partner was ever assigned AND it was never paid.
+    ///      Previously they passed the filter (customer-cancel path →
+    ///      `noPartnerReason` null) and FLOODED Past with junk. We now
+    ///      require a cancelled booking to have had a partner assigned OR
+    ///      a payment (paid / refund in flight) to count as "real".
+    ///
+    /// The rows stay in the DB for audit / support / fraud detection —
+    /// we just stop surfacing the noise to the customer.
     delete where.status;
     where.OR = [
       { status: 'COMPLETED' },
-      { status: 'CANCELLED', noPartnerReason: null },
+      {
+        status: 'CANCELLED',
+        noPartnerReason: null,
+        /// Real booking: a partner was assigned at some point, OR the
+        /// customer paid (paid / refund_pending / refunded).
+        OR: [
+          { partnerId: { not: null } },
+          { paymentStatus: { in: ['paid', 'refund_pending', 'refunded'] } },
+        ],
+      },
     ];
   }
 
@@ -1176,6 +1224,7 @@ exports.cancelOwn = async ({ customerId, id, reason }) => {
     /// Free the partner — their job was cancelled out from under them,
     /// so clear the BUSY flag and let them receive new offers again.
     await dispatchRegistry.clearActiveJob(b.partnerId).catch(() => {});
+    require('../tracking/tracking.service').setBusyState({ partnerId: b.partnerId, busy: false });
     const notifications = require('../notifications/notifications.service');
     await notifications.create({
       partnerId: b.partnerId,
@@ -1961,6 +2010,7 @@ exports.adminCancel = async (id, reason) => {
   /// can receive new offers again after an admin pulls their job.
   if (b.partnerId) {
     await dispatchRegistry.clearActiveJob(b.partnerId).catch(() => {});
+    require('../tracking/tracking.service').setBusyState({ partnerId: b.partnerId, busy: false });
   }
 
   return adminShape(updated);
@@ -2426,6 +2476,8 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
   /// get new push/socket offers mid-job. Cleared on completion / cancel.
   /// Set regardless of queue mode so the legacy poll path benefits too.
   await dispatchRegistry.setActiveJob(partnerId).catch(() => {});
+  /// Mirror to the queryable DB column: partner is now BUSY (on a job).
+  require('../tracking/tracking.service').setBusyState({ partnerId, busy: true });
 
   /// Cancel the queued wave + expiry jobs and clear Redis state — no
   /// need to fan out further or expire something that's now in flight.
@@ -2570,6 +2622,7 @@ exports.partnerCancel = async ({ partnerId, id, reason }) => {
   /// Partner is no longer on this job — clear the BUSY flag so they can
   /// be offered new jobs again (their next presence ping re-adds them).
   await dispatchRegistry.clearActiveJob(pid).catch(() => {});
+  require('../tracking/tracking.service').setBusyState({ partnerId: pid, busy: false });
 
   /// Re-broadcast outside the txn. Clear any stale queue/registry state
   /// first, then schedule fresh waves off the (now PENDING) booking.
@@ -2726,6 +2779,7 @@ exports.partnerUpdateStatus = async ({ bookingId, partnerId, status, otp }) => {
     /// ping re-adds them to the dispatch pool and they can be offered
     /// new jobs again.
     await dispatchRegistry.clearActiveJob(partnerId).catch(() => {});
+    require('../tracking/tracking.service').setBusyState({ partnerId, busy: false });
   }
 
   const commissionMap = await loadCommissionMap();

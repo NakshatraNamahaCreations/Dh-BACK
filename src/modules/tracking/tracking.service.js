@@ -116,8 +116,72 @@ exports.mirrorPresenceLocation = async ({ partnerId, lat, lng }) => {
       data: { currentLat: Number(lat), currentLng: Number(lng), lastLocationAt: new Date() },
       select: { id: true },
     });
+    /// A presence write means the partner is on duty — mirror that to
+    /// the queryable DB column (change-only, so this is a no-op write on
+    /// the common case where they were already marked on duty).
+    void exports.mirrorOnDuty({ partnerId, onDuty: true });
   } catch {
     /* best-effort — never block presence on a mirror write */
+  }
+};
+
+/// Mirror the partner's duty state into the queryable DB columns
+/// (`onDuty` boolean + `dutyState` 3-state). The AUTHORITATIVE source
+/// stays in Redis; this keeps the DB readable for ops/SQL + the admin
+/// list. Gated by `shouldMirrorDuty` so we only write on an actual on↔off
+/// transition, never on every 15s presence ping.
+///
+/// `dutyState`:
+///   off → 'off_duty'
+///   on  → 'busy' if the partner is currently on a job (Redis
+///         `partner:active` flag), else 'available'. This keeps a
+///         partner who's working from being re-flagged "free" by a
+///         presence ping mid-job.
+/// Best-effort — a failed mirror must never break the duty flow.
+exports.mirrorOnDuty = async ({ partnerId, onDuty }) => {
+  const registry = require('../dispatch/registry');
+  try {
+    if (!(await registry.shouldMirrorDuty(Number(partnerId), Boolean(onDuty)))) return;
+    let dutyState = 'off_duty';
+    if (onDuty) {
+      const busy = await registry.isOnActiveJob(Number(partnerId)).catch(() => false);
+      dutyState = busy ? 'busy' : 'available';
+    }
+    await prisma.partner.update({
+      where: { id: Number(partnerId) },
+      data: { onDuty: Boolean(onDuty), dutyState, onDutyChangedAt: new Date() },
+      select: { id: true },
+    });
+  } catch {
+    /* best-effort — never block presence / duty on a mirror write */
+  }
+};
+
+/// Directly set the free↔busy transition WITHIN on-duty, called from the
+/// booking flow when a partner accepts a job (busy) or finishes/cancels
+/// it (free again). Best-effort.
+///   busy=true  → 'busy' + onDuty=true (a partner on a job IS on duty).
+///   busy=false → back to 'available' IF still on duty; but if they've
+///                since gone off duty (explicit off-duty flag set), put
+///                them at 'off_duty' instead of wrongly re-marking them
+///                free. We check the Redis off-duty flag for that.
+exports.setBusyState = async ({ partnerId, busy }) => {
+  const registry = require('../dispatch/registry');
+  try {
+    let onDuty = true;
+    let dutyState = 'busy';
+    if (!busy) {
+      const offDuty = await registry.isOffDuty(Number(partnerId)).catch(() => false);
+      onDuty = !offDuty;
+      dutyState = offDuty ? 'off_duty' : 'available';
+    }
+    await prisma.partner.update({
+      where: { id: Number(partnerId) },
+      data: { onDuty, dutyState, onDutyChangedAt: new Date() },
+      select: { id: true },
+    });
+  } catch {
+    /* best-effort — never block accept/complete on a mirror write */
   }
 };
 
@@ -141,6 +205,11 @@ exports.setDuty = async ({ partnerId, onDuty }) => {
       categoryId: partner?.categoryId ?? null,
     });
   }
+
+  /// Mirror the explicit toggle to the queryable DB column. This is the
+  /// authoritative duty action, so reflect it right away (change-gated
+  /// inside mirrorOnDuty). Fire-and-forget — never block the toggle.
+  void exports.mirrorOnDuty({ partnerId: Number(partnerId), onDuty: Boolean(onDuty) });
 
   return { partnerId: Number(partnerId), onDuty: Boolean(onDuty) };
 };

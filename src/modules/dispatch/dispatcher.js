@@ -405,6 +405,81 @@ const handleReconcile = async () => {
   logger.info(`reconciler: re-queued expire for ${orphans.length} orphaned PENDING bookings`);
 };
 
+/// Reconcile the DB duty MIRROR against the AUTHORITATIVE Redis presence,
+/// in BOTH directions. The per-ping change-gate can desync the DB from
+/// Redis (e.g. the stale-flip races a reconnecting app, leaving the
+/// mirror cache and the DB disagreeing), so this 60s sweep is the
+/// safety net that makes the DB always converge to reality:
+///
+///   • DB says on duty but Redis presence LAPSED  → flip to off_duty
+///     (ghost: app killed/crashed without a clean off-duty).
+///   • DB says off_duty but Redis presence is LIVE → flip to available
+///     (the missed-write case — app reconnected, presence is flowing,
+///     but the mirror never re-wrote the DB). Busy partners are left
+///     alone: a partner ON A JOB stays 'busy' even though presence is
+///     live, so we only promote off_duty → available, never touch busy.
+///
+/// Both branches realign the duty-mirror cache so the change-gate agrees
+/// with the DB afterwards.
+const reconcileStaleOnDuty = async () => {
+  if (!registry.enabled()) return; // no Redis → presence isn't tracked
+
+  /// Scan the small set of rows in any non-terminal duty interest:
+  /// currently-on-duty rows (to catch ghosts) + verified rows that COULD
+  /// be online (to catch missed on-writes). We pull verified partners and
+  /// check Redis liveness for all of them in one mget.
+  const partners = await withDbRetry(
+    () =>
+      prisma.partner.findMany({
+        where: { isVerified: true },
+        select: { id: true, onDuty: true, dutyState: true },
+        take: 1000,
+      }),
+    { label: 'reconcile.dutyRows' },
+  ).catch(() => []);
+  if (partners.length === 0) return;
+
+  const live = await registry.filterOnlinePartnerIds(partners.map((p) => p.id));
+
+  /// Ghost: marked on duty in DB but no live presence → off_duty.
+  const toOff = partners
+    .filter((p) => p.onDuty && !live.has(Number(p.id)))
+    .map((p) => p.id);
+  /// Missed on-write: live presence but DB says off_duty → available.
+  /// (Don't touch 'busy' — handled by the booking flow.)
+  const toAvailable = partners
+    .filter((p) => !p.onDuty && p.dutyState === 'off_duty' && live.has(Number(p.id)))
+    .map((p) => p.id);
+
+  if (toOff.length > 0) {
+    await withDbRetry(
+      () =>
+        prisma.partner.updateMany({
+          where: { id: { in: toOff } },
+          data: { onDuty: false, dutyState: 'off_duty', onDutyChangedAt: new Date() },
+        }),
+      { label: 'reconcile.flipOff' },
+    ).catch((err) => logger.warn(`duty reconcile off-write failed: ${err.message}`));
+    await Promise.all(toOff.map((id) => registry.clearDutyMirror(id))).catch(() => {});
+  }
+  if (toAvailable.length > 0) {
+    await withDbRetry(
+      () =>
+        prisma.partner.updateMany({
+          where: { id: { in: toAvailable } },
+          data: { onDuty: true, dutyState: 'available', onDutyChangedAt: new Date() },
+        }),
+      { label: 'reconcile.flipAvailable' },
+    ).catch((err) => logger.warn(`duty reconcile on-write failed: ${err.message}`));
+    await Promise.all(toAvailable.map((id) => registry.clearDutyMirror(id))).catch(() => {});
+  }
+  if (toOff.length || toAvailable.length) {
+    logger.info(
+      `duty reconcile: ${toOff.length} → off_duty, ${toAvailable.length} → available`,
+    );
+  }
+};
+
 /// DURABLE scheduled-dispatch safety net. Runs every SWEEP_EVERY_MS (see
 /// queue.ensureDispatchSweepScheduled). Finds scheduled bookings whose
 /// broadcast window has ARRIVED but which never actually broadcast, and
@@ -790,7 +865,11 @@ const start = () => {
         case 'payment_expire':
           return handlePaymentExpire(job.data);
         case 'reconcile':
-          return handleReconcile();
+          /// Run both reconcilers on the 60s tick: orphaned bookings +
+          /// stale onDuty mirror rows. Independent, so settle both even
+          /// if one throws.
+          await Promise.allSettled([handleReconcile(), reconcileStaleOnDuty()]);
+          return;
         case 'dispatch_sweep':
           return handleDispatchSweep();
         case 'notification_cleanup':

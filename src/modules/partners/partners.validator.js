@@ -9,6 +9,10 @@ const listQuerySchema = z.object({
     status: z.string().optional(),
     kyc: z.string().optional(),
     search: z.string().trim().max(100).optional(),
+    /// Duty filters. `onDuty` (legacy boolean string) → on/off duty.
+    /// `dutyState` (3-state) → exact available / busy / off_duty.
+    onDuty: z.enum(['true', 'false']).optional(),
+    dutyState: z.enum(['off_duty', 'available', 'busy']).optional(),
     /// Geography filters — admin's State→City cascade.
     cityId: z.coerce.number().int().positive().optional(),
     stateId: z.coerce.number().int().positive().optional(),

@@ -197,6 +197,38 @@ const isOnActiveJob = async (partnerId) => {
   }, false);
 };
 
+/// Change-detector for the DB `onDuty` MIRROR. Presence pings arrive
+/// every ~15s, but we only want to write the partner row when the duty
+/// state actually FLIPS — otherwise we'd hammer Postgres with a write
+/// per ping (the exact load the Redis-first design avoids). We cache the
+/// last-mirrored value in Redis and return true only when `onDuty`
+/// differs from it (then store the new value). Returns true when Redis
+/// is down so the caller still attempts the write (correctness over
+/// write-amplification during an outage).
+const dutyMirrorKey = (partnerId) => `partner:dutymirror:${partnerId}`;
+const shouldMirrorDuty = async (partnerId, onDuty) => {
+  return safe(async () => {
+    const want = onDuty ? '1' : '0';
+    const prev = await redis.get(dutyMirrorKey(partnerId));
+    if (prev === want) return false;
+    /// Long TTL so the cache survives normal operation; if it expires
+    /// the next ping just re-writes the DB once (harmless idempotent).
+    await redis.set(dutyMirrorKey(partnerId), want, 'EX', 24 * 60 * 60);
+    return true;
+  }, true);
+};
+
+/// Clear the duty-mirror change-cache for a partner — called by the
+/// stale-onDuty reconciler after it flips a ghost row to false, so the
+/// partner's NEXT presence ping is seen as a real transition and
+/// re-writes onDuty=true (otherwise the cache would still say '1' and
+/// the change-gate would skip the write).
+const clearDutyMirror = async (partnerId) => {
+  return safe(async () => {
+    await redis.del(dutyMirrorKey(partnerId));
+  });
+};
+
 /// Given partner ids, return the SUBSET currently on an active job.
 /// Used by the dispatcher to drop busy partners from a wave's candidate
 /// list as defense-in-depth (the upsertOnline guard already keeps them
@@ -577,6 +609,8 @@ module.exports = {
   isOnActiveJob,
   filterActivePartnerIds,
   shouldMirrorLocation,
+  shouldMirrorDuty,
+  clearDutyMirror,
   countOnlineInCategory,
   filterOnlinePartnerIds,
   incrSocketConn,

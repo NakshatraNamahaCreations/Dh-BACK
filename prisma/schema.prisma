@@ -207,6 +207,34 @@ model Partner {
   currentLng       Float?
   lastLocationAt   DateTime?
 
+  /// Queryable MIRROR of the partner's real-time duty state. The
+  /// AUTHORITATIVE source is Redis (presence keys + the `partner:offduty`
+  /// flag) — that's what the dispatcher reads, because duty changes every
+  /// few seconds and must auto-expire when the app stops pinging. This
+  /// column is a denormalised copy kept in sync by the dispatch layer
+  /// (set true on presence/upsertOnline, false on explicit off-duty +
+  /// socket disconnect + the stale-presence sweep) so ops can see/filter
+  /// On Duty partners in plain SQL + the admin partner list WITHOUT
+  /// querying Redis. May briefly lag Redis (e.g. an app that crashes
+  /// without a clean disconnect) until the sweep reconciles it — treat
+  /// it as "best-effort readable", not a dispatch gate.
+  onDuty           Boolean  @default(false)
+  /// When `onDuty` last flipped — lets ops sort "recently went on duty"
+  /// and lets the reconciler age out rows that are stuck `true`.
+  onDutyChangedAt  DateTime?
+
+  /// Richer 3-state live status (superset of `onDuty`):
+  ///   'off_duty'  — not working (onDuty=false)
+  ///   'available' — on duty, FREE, waiting for a job (onDuty=true, no job)
+  ///   'busy'      — on duty and ON A JOB right now (accepted /
+  ///                 in-progress booking). Set when the partner accepts a
+  ///                 job, back to 'available' when it completes/cancels,
+  ///                 'off_duty' when they toggle off. Mirrors the Redis
+  ///                 presence + `partner:active` flag; same best-effort
+  ///                 reconciliation as `onDuty`. Lets ops answer "who is
+  ///                 free to take a job right now" in one SQL filter.
+  dutyState        String   @default("off_duty")
+
   /// Geography FK — populated by the backfill script and by partner
   /// onboarding once the city dropdown ships in the partner-app.
   /// Nullable while legacy rows are still on free-text `city` only.
@@ -226,6 +254,8 @@ model Partner {
   @@index([categoryId])
   @@index([city])
   @@index([cityId])
+  @@index([onDuty])
+  @@index([dutyState])
   /// Geospatial-ish — supports the "nearby partners" admin/dispatch
   /// query without a dedicated geo extension. When traffic justifies
   /// it, swap to PostGIS GIST or move location into Redis Geo and
