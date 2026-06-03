@@ -1856,6 +1856,91 @@ exports.nearbyPartners = async (bookingId) => {
   });
 };
 
+/// Widest dispatch radius (km). Mirrors the 7km final wave in
+/// dispatch/dispatcher.js DISPATCH_WAVES — the customer "how many
+/// partners are nearby" count uses the SAME outer bound the broadcast
+/// will eventually reach, so the number it shows matches who could
+/// actually be offered the job.
+const AVAILABILITY_RADIUS_KM = 7;
+
+/// Live count of online partners who could take THIS booking right now,
+/// within the 7km broadcast radius. Customer-facing — the partner-search
+/// sheet polls this to show "N partners available nearby" and, when the
+/// count is zero, to offer the customer the Schedule / direct-book exits
+/// instead of leaving them watching an empty radar.
+///
+/// Mirrors the dispatcher's candidate logic so the number is honest:
+///   - GEOSEARCH each of the booking's service categories within 7km
+///   - union + dedupe (a partner registered for two categories counts once)
+///   - drop partners currently on an active job (busy)
+///   - drop partners who already DECLINED this booking
+/// Returns { count, hasNearby, radiusKm }. Soft-fails to count 0 when
+/// Redis/geo is unavailable rather than throwing into the customer flow.
+exports.availability = async ({ customerId, id }) => {
+  const fallback = { count: 0, hasNearby: false, radiusKm: AVAILABILITY_RADIUS_KM };
+  try {
+    const booking = await prisma.booking.findUnique({
+      where: { id: Number(id) },
+      select: {
+        customerId: true,
+        lat: true,
+        lng: true,
+        customerAddress: { select: { lat: true, lng: true } },
+        items: { select: { service: { select: { categoryId: true } } } },
+      },
+    });
+    /// Ownership guard — a customer can only probe their OWN booking's
+    /// availability. Soft-fail to the empty result (not a 404) so the
+    /// search sheet's poll degrades gracefully instead of erroring.
+    if (!booking || booking.customerId !== customerId) return fallback;
+
+    const lat = booking.lat ?? booking.customerAddress?.lat ?? null;
+    const lng = booking.lng ?? booking.customerAddress?.lng ?? null;
+    if (lat == null || lng == null) return fallback;
+
+    const categoryIds = [
+      ...new Set(
+        (booking.items ?? [])
+          .map((i) => i.service?.categoryId)
+          .filter((id) => id != null),
+      ),
+    ];
+    if (categoryIds.length === 0) return fallback;
+
+    /// Union nearby online partners across every cart category, deduped.
+    const seen = new Set();
+    for (const cat of categoryIds) {
+      const rows = await dispatchRegistry.findOnlineNearby({
+        categoryId: cat,
+        lat,
+        lng,
+        radiusKm: AVAILABILITY_RADIUS_KM,
+        limit: 50,
+      });
+      for (const r of rows) seen.add(r.partnerId);
+    }
+    if (seen.size === 0) return fallback;
+
+    const ids = [...seen];
+
+    /// Exclude busy partners (on an active job) — they can't take this.
+    const busy = await dispatchRegistry
+      .filterActivePartnerIds(ids)
+      .catch(() => new Set());
+    /// Exclude partners who already declined THIS booking — they won't
+    /// be re-offered it, so they shouldn't inflate the "available" count.
+    const declined = await dispatchRegistry
+      .getDeclinedPartners(Number(id))
+      .catch(() => new Set());
+
+    const count = ids.filter((id) => !busy.has(id) && !declined.has(id)).length;
+    return { count, hasNearby: count > 0, radiusKm: AVAILABILITY_RADIUS_KM };
+  } catch (err) {
+    console.warn(`[availability] booking ${id}: ${err.message}`);
+    return fallback;
+  }
+};
+
 exports.adminGet = async (id) => {
   const b = await prisma.booking.findUnique({
     where: { id },

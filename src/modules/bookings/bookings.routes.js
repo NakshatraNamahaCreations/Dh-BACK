@@ -57,6 +57,7 @@ router.post('/:id/dispatch', adminOnly, requirePermission('bookings.dispatch'), 
 router.post('/', customerOnly, validate(createSchema), controller.create);
 router.get('/me', customerOnly, validate(listMineQuerySchema), controller.listMine);
 router.get('/:id', customerOnly, validate(idParam), controller.getOwn);
+router.get('/:id/availability', customerOnly, validate(idParam), controller.availability);
 router.get('/:id/cancellation-quote', customerOnly, validate(idParam), controller.cancellationQuote);
 router.post('/:id/cancel', customerOnly, validate(cancelSchema), controller.cancelOwn);
 router.post('/:id/rate', customerOnly, validate(rateBookingSchema), controller.rateBooking);

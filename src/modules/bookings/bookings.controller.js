@@ -31,6 +31,14 @@ exports.getOwn = asyncHandler(async (req, res) => {
   success(res, item, 'Booking fetched');
 });
 
+exports.availability = asyncHandler(async (req, res) => {
+  const result = await service.availability({
+    customerId: req.user.sub,
+    id: req.params.id,
+  });
+  success(res, result, 'Partner availability fetched');
+});
+
 exports.cancellationQuote = asyncHandler(async (req, res) => {
   const quote = await service.cancellationQuote({
     customerId: req.user.sub,

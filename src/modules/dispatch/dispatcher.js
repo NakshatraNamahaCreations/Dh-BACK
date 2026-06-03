@@ -346,6 +346,30 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
     return;
   }
 
+  /// LAST-MILE status re-check. The status read at the top of this
+  /// handler can be tens-to-hundreds of ms stale by now — between it and
+  /// here we ran a multi-category GEOSEARCH, liveness MGETs, busy/declined
+  /// filters, and a DB write. If the customer CANCELLED (or a partner
+  /// accepted, or admin assigned) during that gap, the booking is no
+  /// longer offerable — but the top guard already passed, so without this
+  /// we'd still blast `dispatch.offer` + FCM pushes for a dead booking.
+  /// That's the "I closed the search but the partner kept ringing for ~10
+  /// more seconds" bug: the alert came from a wave that started just
+  /// before the cancel and pushed just after it. One indexed read closes
+  /// the window precisely.
+  const liveCheck = await prisma.booking.findUnique({
+    where: { id: booking.id },
+    select: { status: true, partnerId: true },
+  });
+  if (!liveCheck || liveCheck.status !== 'PENDING' || liveCheck.partnerId != null) {
+    logger.info(
+      `dispatch wave ${waveNumber} for booking ${bookingId}: aborted at push ` +
+        `(status=${liveCheck?.status ?? 'gone'}, partnerId=${liveCheck?.partnerId ?? 'null'}) — ` +
+        `booking left the broadcast window mid-wave`,
+    );
+    return;
+  }
+
   await registry.recordVisible({
     bookingId: booking.id,
     partnerIds: candidates.map((c) => c.partnerId),
@@ -479,15 +503,54 @@ const reconcileStaleOnDuty = async () => {
 
   const live = await registry.filterOnlinePartnerIds(partners.map((p) => p.id));
 
+  /// STALE-BUSY reconcile. A partner stuck at dutyState='busy' whose job
+  /// ended through a path that missed the busy-clear (dispatcher supersede,
+  /// deleted booking, admin reassign edge) is INVISIBLE to dispatch and to
+  /// the admin "Available" filter — the orphaned `partner:active` flag also
+  /// makes upsertOnline silently drop their presence pings. The duty-on
+  /// toggle self-heals this (tracking.setDuty), but a partner who never
+  /// re-toggles would stay stranded; this sweep is the safety net for them.
+  /// A busy row is STALE iff the partner has NO active CONFIRMED/IN_PROGRESS
+  /// booking. We only pay for the booking query when there ARE busy rows.
+  const busyRows = partners.filter((p) => p.dutyState === 'busy');
+  let staleBusyIds = [];
+  if (busyRows.length > 0) {
+    const busyIds = busyRows.map((p) => p.id);
+    const withActive = await withDbRetry(
+      () =>
+        prisma.booking.findMany({
+          where: {
+            partnerId: { in: busyIds },
+            status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
+          },
+          select: { partnerId: true },
+        }),
+      { label: 'reconcile.busyActiveBookings' },
+    ).catch(() => []);
+    const genuinelyBusy = new Set(withActive.map((b) => b.partnerId));
+    staleBusyIds = busyIds.filter((id) => !genuinelyBusy.has(id));
+  }
+
   /// Ghost: marked on duty in DB but no live presence → off_duty.
   const toOff = partners
     .filter((p) => p.onDuty && !live.has(Number(p.id)))
     .map((p) => p.id);
   /// Missed on-write: live presence but DB says off_duty → available.
-  /// (Don't touch 'busy' — handled by the booking flow.)
-  const toAvailable = partners
-    .filter((p) => !p.onDuty && p.dutyState === 'off_duty' && live.has(Number(p.id)))
-    .map((p) => p.id);
+  /// Also includes STALE-busy rows that ARE still live → back to available.
+  const toAvailable = [
+    ...partners
+      .filter((p) => !p.onDuty && p.dutyState === 'off_duty' && live.has(Number(p.id)))
+      .map((p) => p.id),
+    ...staleBusyIds.filter((id) => live.has(Number(id))),
+  ];
+  /// Stale-busy rows with NO live presence → off_duty (and out of the pool).
+  const staleBusyToOff = staleBusyIds.filter((id) => !live.has(Number(id)));
+  for (const id of [...staleBusyIds]) {
+    /// Always drop the orphaned Redis active flag so the next presence
+    /// ping (or duty-on) can re-register them without the busy gate.
+    await registry.clearActiveJob(id).catch(() => {});
+  }
+  if (staleBusyToOff.length > 0) toOff.push(...staleBusyToOff);
 
   if (toOff.length > 0) {
     await withDbRetry(
@@ -513,7 +576,8 @@ const reconcileStaleOnDuty = async () => {
   }
   if (toOff.length || toAvailable.length) {
     logger.info(
-      `duty reconcile: ${toOff.length} → off_duty, ${toAvailable.length} → available`,
+      `duty reconcile: ${toOff.length} → off_duty, ${toAvailable.length} → available` +
+        (staleBusyIds.length ? ` (incl. ${staleBusyIds.length} stale-busy healed)` : ''),
     );
   }
 };

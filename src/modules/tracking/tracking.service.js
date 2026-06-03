@@ -1,5 +1,6 @@
 const prisma = require('../../config/prisma');
 const ApiError = require('../../utils/ApiError');
+const logger = require('../../config/logger');
 
 /**
  * Live-location tracking — phase 1: REST data path.
@@ -196,6 +197,55 @@ exports.setDuty = async ({ partnerId, onDuty, lat, lng }) => {
 
   if (onDuty) {
     await registry.clearOffDuty(Number(partnerId));
+
+    /// SELF-HEAL a stale "busy" flag. A partner's active-job flag
+    /// (`partner:active:{id}` + dutyState='busy') is normally cleared when
+    /// the job completes / is cancelled — but if a job ended through a path
+    /// that missed the clear (dispatcher supersede, a deleted booking, an
+    /// admin reassign edge case), the flag is orphaned. That orphan is
+    /// poisonous: `setStickyOnline` below SKIPS busy partners ("busy → leave
+    /// out") and `mirrorOnDuty` at the end reads the flag and writes
+    /// dutyState='busy' — so the partner toggles On Duty in the app but is
+    /// invisible to dispatch AND shows as not-Available in admin, forever.
+    ///
+    /// Going on duty is an explicit "I'm free and ready" signal, so it's the
+    /// right moment to reconcile: if the flag is set but the partner has NO
+    /// active CONFIRMED/IN_PROGRESS booking, the flag is stale — clear it.
+    /// Guarded by the booking check so we never free a partner who really is
+    /// mid-job (a busy partner re-pinging duty-on shouldn't be un-busied).
+    try {
+      const stillBusy = await registry.isOnActiveJob(Number(partnerId)).catch(() => false);
+      if (stillBusy) {
+        const activeCount = await prisma.booking.count({
+          where: {
+            partnerId: Number(partnerId),
+            status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
+          },
+        });
+        if (activeCount === 0) {
+          /// Clear the Redis busy flag so setStickyOnline below will
+          /// actually register them (it skips busy partners).
+          await registry.clearActiveJob(Number(partnerId)).catch(() => {});
+          /// Force the DB dutyState off 'busy' authoritatively. We CAN'T
+          /// rely on the mirrorOnDuty call at the end of setDuty: it's
+          /// change-gated by shouldMirrorDuty, which short-circuits when
+          /// the partner is already onDuty in the mirror cache (the exact
+          /// case here) and would leave dutyState stuck at 'busy'.
+          /// setBusyState writes the row directly (→ 'available').
+          await exports.setBusyState({ partnerId: Number(partnerId), busy: false });
+          /// Bust the duty-mirror change-cache so the trailing
+          /// mirrorOnDuty (and future transitions) aren't suppressed.
+          await registry.clearDutyMirror(Number(partnerId)).catch(() => {});
+          logger.warn(
+            `[duty] cleared STALE busy flag for partner ${partnerId} on duty-on ` +
+              `(no active booking) — was being hidden from dispatch/admin`,
+          );
+        }
+      }
+    } catch {
+      /* best-effort — never block the duty toggle on the reconcile */
+    }
+
     /// STICKY register into the dispatch pool right now, with a long TTL,
     /// so the partner stays matchable while the app is backgrounded and
     /// pings have paused (OEM JS-thread freeze). Use the coords the app
