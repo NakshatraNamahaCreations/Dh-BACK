@@ -23,11 +23,16 @@ const locationBody = z.object({
 });
 
 /// Explicit duty toggle from the partner app — `onDuty:true` to start
-/// receiving offers, `false` to stop. Booleans only; the service maps
-/// these to the Redis off-duty guard flag.
+/// receiving offers, `false` to stop. Optional lat/lng so the server can
+/// register the partner into the dispatch geo set at their current
+/// position the instant they go on duty (so they're matchable even
+/// before/without a live presence ping — important on OEMs that freeze
+/// the JS thread when the app is backgrounded).
 const dutyBody = z.object({
   body: z.object({
     onDuty: z.boolean(),
+    lat: z.number().min(-90).max(90).optional(),
+    lng: z.number().min(-180).max(180).optional(),
   }),
 });
 

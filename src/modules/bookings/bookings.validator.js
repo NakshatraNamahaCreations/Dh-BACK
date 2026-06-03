@@ -200,7 +200,7 @@ const partnerIncomingQuerySchema = z.object({
 const partnerStatusSchema = z.object({
   params: z.object({ id: z.coerce.number().int().positive() }),
   body: z.object({
-    status: z.enum(['in_progress', 'completed']),
+    status: z.enum(['arrived', 'in_progress', 'completed']),
     /// 4-digit handoff OTP read aloud by the customer. Optional only so
     /// legacy bookings created before the OTP rollout can still be
     /// progressed; new bookings have a code on the row and the service

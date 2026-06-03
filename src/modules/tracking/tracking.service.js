@@ -185,20 +185,44 @@ exports.setBusyState = async ({ partnerId, busy }) => {
   }
 };
 
-exports.setDuty = async ({ partnerId, onDuty }) => {
+exports.setDuty = async ({ partnerId, onDuty, lat, lng }) => {
   const registry = require('../dispatch/registry');
-  /// Look up the partner's category so the OFF path can ZREM them from
-  /// the right per-category online set immediately. Not load-bearing
-  /// (the off-duty flag + lastseen-liveness filter already block
-  /// offers) but it keeps the geo set clean rather than waiting for the
-  /// next sweep.
+  /// Need category for the geo set, plus the DB last-known position as a
+  /// fallback when the app didn't include coords in the toggle.
   const partner = await prisma.partner.findUnique({
     where: { id: Number(partnerId) },
-    select: { categoryId: true },
+    select: { categoryId: true, currentLat: true, currentLng: true },
   });
 
   if (onDuty) {
     await registry.clearOffDuty(Number(partnerId));
+    /// STICKY register into the dispatch pool right now, with a long TTL,
+    /// so the partner stays matchable while the app is backgrounded and
+    /// pings have paused (OEM JS-thread freeze). Use the coords the app
+    /// sent, else the DB's last-known position. Live presence pings will
+    /// refresh the position as they move. If we have no coordinate at
+    /// all, we skip — the next live ping registers them normally.
+    const useLat = lat ?? partner?.currentLat ?? null;
+    const useLng = lng ?? partner?.currentLng ?? null;
+    if (partner?.categoryId != null && useLat != null && useLng != null) {
+      await registry.setStickyOnline({
+        partnerId: Number(partnerId),
+        categoryId: partner.categoryId,
+        lat: Number(useLat),
+        lng: Number(useLng),
+      });
+    }
+    /// Remember this as the partner's last-known position too, so the
+    /// next reconcile / nearby query has it even before a live ping.
+    if (useLat != null && useLng != null) {
+      await prisma.partner
+        .update({
+          where: { id: Number(partnerId) },
+          data: { currentLat: Number(useLat), currentLng: Number(useLng), lastLocationAt: new Date() },
+          select: { id: true },
+        })
+        .catch(() => {});
+    }
   } else {
     await registry.setOffDuty({
       partnerId: Number(partnerId),
@@ -221,6 +245,7 @@ exports.getForBooking = async ({ customerId, bookingId }) => {
       id: true,
       customerId: true,
       status: true,
+      arrivedAt: true,
       lat: true,
       lng: true,
       partner: {
@@ -263,6 +288,7 @@ exports.getForBooking = async ({ customerId, bookingId }) => {
           : null,
       partnerLocation: null,
       lastLocationAt: partner?.lastLocationAt ?? null,
+      arrivedAt: booking.arrivedAt ?? null,
     };
   }
 
@@ -284,5 +310,6 @@ exports.getForBooking = async ({ customerId, bookingId }) => {
         : null,
     partnerLocation: { lat: partner.currentLat, lng: partner.currentLng },
     lastLocationAt: partner.lastLocationAt,
+    arrivedAt: booking.arrivedAt ?? null,
   };
 };

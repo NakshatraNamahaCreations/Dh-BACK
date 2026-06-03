@@ -503,6 +503,7 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     /// earnings screen (jobs grouped by `jobCompletedAt`, duration
     /// computed from start↔complete) and to label active-job timers.
     /// Null until the corresponding transition has happened.
+    arrivedAt: b.arrivedAt ?? null,
     jobStartedAt: b.jobStartedAt ?? null,
     jobCompletedAt: b.jobCompletedAt ?? null,
   };
@@ -633,6 +634,7 @@ const shape = (b) => {
   /// partner has verified the code we record the timestamp; UI can use
   /// the timestamp to grey out / hide the code after handoff.
   jobStartOtp: b.jobStartOtp ?? null,
+  arrivedAt: b.arrivedAt ?? null,
   jobStartedAt: b.jobStartedAt ?? null,
   jobCompleteOtp: b.jobCompleteOtp ?? null,
   jobCompletedAt: b.jobCompletedAt ?? null,
@@ -1293,6 +1295,7 @@ const ADMIN_INCLUDE = {
     select: {
       id: true,
       amount: true,
+      refundAmount: true,
       status: true,
       method: true,
       provider: true,
@@ -1369,6 +1372,8 @@ const adminShape = (b) => {
     /// faking it off `updatedAt`. For instant bookings these are
     /// what tell you when the job actually ran, since `scheduledAt`
     /// is auto-set to now+30min at creation and isn't meaningful.
+    assignedAt: b.assignedAt ?? null,
+    arrivedAt: b.arrivedAt ?? null,
     jobStartedAt: b.jobStartedAt ?? null,
     jobCompletedAt: b.jobCompletedAt ?? null,
     completedAt: b.jobCompletedAt ?? (b.status === 'COMPLETED' ? b.updatedAt : null),
@@ -1394,6 +1399,10 @@ const adminShape = (b) => {
     payments: (b.payments ?? []).map((p) => ({
       id: p.id,
       amount: p.amount,
+      /// Actual rupees being refunded (bill minus cancellation fee).
+      /// Null on non-refund rows. The admin UI shows THIS for a refund
+      /// row instead of the original `amount`.
+      refundAmount: p.refundAmount ?? null,
       status: p.status,
       method: p.method,
       provider: p.provider,
@@ -1888,6 +1897,7 @@ exports.reassign = async (bookingId, partnerId, reason = 'Manual assignment') =>
     data: {
       partnerId: partner.id,
       status: 'CONFIRMED',
+      assignedAt: new Date(),
       /// Clear the dispatch-related fields so the booking falls out of
       /// the Manual Dispatch queue and admin views show the partner
       /// instead of "needs_admin_dispatch".
@@ -2457,6 +2467,7 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
       partnerId,
       status: 'CONFIRMED',
       dispatchStatus: 'accepted',
+      assignedAt: new Date(),
       paymentDeadlineAt,
     },
   });
@@ -2624,6 +2635,11 @@ exports.partnerCancel = async ({ partnerId, id, reason }) => {
   await dispatchRegistry.clearActiveJob(pid).catch(() => {});
   require('../tracking/tracking.service').setBusyState({ partnerId: pid, busy: false });
 
+  /// Exclude this partner from future waves for THIS booking — they
+  /// walked away from it, so re-dispatch must not re-offer them the same
+  /// job. handleWave filters the candidate list against this set.
+  await dispatchRegistry.addDeclinedPartner(bookingId, pid).catch(() => {});
+
   /// Re-broadcast outside the txn. Clear any stale queue/registry state
   /// first, then schedule fresh waves off the (now PENDING) booking.
   /// scheduleAllForBooking no-ops when the dispatch queue is disabled —
@@ -2725,6 +2741,7 @@ exports.partnerUpdateStatus = async ({ bookingId, partnerId, status, otp }) => {
     select: {
       id: true,
       partnerId: true,
+      customerId: true,
       status: true,
       jobStartOtp: true,
       jobCompleteOtp: true,
@@ -2732,6 +2749,33 @@ exports.partnerUpdateStatus = async ({ bookingId, partnerId, status, otp }) => {
   });
   if (!b) throw ApiError.notFound('Booking not found');
   if (b.partnerId !== partnerId) throw ApiError.forbidden('Not your booking');
+
+  /// 'arrived' is a SUB-STATE of the en-route (CONFIRMED) phase, not a
+  /// status enum value. We persist `arrivedAt` and DON'T change `status`,
+  /// so the partner's "You have arrived" state survives an app restart
+  /// and the customer/admin can see it. Must be CONFIRMED to arrive, and
+  /// idempotent (re-marking just keeps the first timestamp).
+  if (status === 'arrived') {
+    if (b.status !== 'CONFIRMED') {
+      throw ApiError.badRequest('Can only mark arrival on a confirmed booking.');
+    }
+    const updatedArr = await prisma.booking.update({
+      where: { id },
+      data: { arrivedAt: new Date() },
+      include: PARTNER_INCLUDE,
+    });
+    /// Push the arrival to the customer-app's tracking screen instantly
+    /// (it otherwise only sees it on its next poll). Also notify any
+    /// connected admin so the live timeline updates. Best-effort.
+    try {
+      dispatcher.emitToCustomer(b.customerId, 'booking.partner_arrived', {
+        bookingId: id,
+        arrivedAt: updatedArr.arrivedAt,
+      });
+    } catch { /* socket optional — poll catches up */ }
+    const commissionMap = await loadCommissionMap();
+    return partnerShape(updatedArr, null, commissionMap);
+  }
 
   const dbStatus = PARTNER_DB_STATUS[status];
   if (!dbStatus) throw ApiError.badRequest(`Status '${status}' cannot be synced to backend`);

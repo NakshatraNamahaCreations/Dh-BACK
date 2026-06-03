@@ -12,6 +12,12 @@ const JOB_OFFER_PUSH_TTL_MS = JOB_OFFER_PUSH_TTL_SECONDS * 1000;
 /// system-rendered alert is exactly as loud as the in-app one.
 const JOB_ALERT_CHANNEL_ID = 'job-alerts-v6';
 
+/// Shared Android notification tag for ALL job-offer pushes. A new offer
+/// REPLACES the previous one (no stacking), and a clear push (see
+/// `clearJobOfferPush`) dismisses it when the job is taken/expired. Must
+/// match the tag the partner-app uses to cancel the OS notification.
+const JOB_OFFER_NOTIFICATION_TAG = 'dhoond-job-offer';
+
 /**
  * Send an Expo push notification to a single device.
  *
@@ -140,7 +146,18 @@ const sendFcmDataMessage = async (token, data, notification = null) => {
         channelId: JOB_ALERT_CHANNEL_ID,
         sound: 'job_alert.wav',
         visibility: 'public',
+        /// Single shared tag → a new job-offer notification REPLACES the
+        /// previous one instead of stacking. So the partner only ever
+        /// sees ONE job-offer entry in the bar (mirrors the in-app
+        /// full-screen alert, which uses a fixed notification id). Without
+        /// this, every booking + every retry wave piled up a separate,
+        /// never-clearing notification.
+        tag: JOB_OFFER_NOTIFICATION_TAG,
       };
+      /// Collapse in transit too — if several offer pushes queue while the
+      /// device is in Doze, FCM keeps only the latest (same collapseKey),
+      /// so the partner doesn't get a burst of stale offers on wake.
+      message.android.collapseKey = JOB_OFFER_NOTIFICATION_TAG;
       /// iOS: a visible alert (not the silent background push the
       /// data-only branch uses), so a backgrounded/locked iPhone shows it.
       message.apns = {
@@ -260,4 +277,46 @@ const sendJobAssignedPush = async (prisma, partnerId, { bookingId, serviceName, 
   }
 };
 
-module.exports = { sendPush, sendFcmDataMessage, sendJobOfferPushes, sendJobAssignedPush };
+/**
+ * Clear the job-offer notification from a set of partners' notification
+ * bars — sent when the booking is TAKEN by someone else or its dispatch
+ * window EXPIRES, so a stale "New job" alert doesn't linger. A data-only
+ * FCM message (`type: 'job_clear'`) wakes the app, which cancels the
+ * notification by its shared tag. Best-effort + fire-and-forget; a
+ * failed clear just means the notification ages out on its own TTL.
+ *
+ * @param {object} prisma
+ * @param {number[]} partnerIds  - the audience that was offered the job
+ * @param {number} bookingId
+ */
+const clearJobOfferPush = async (prisma, partnerIds, bookingId) => {
+  if (!Array.isArray(partnerIds) || partnerIds.length === 0) return;
+  try {
+    const partners = await prisma.partner.findMany({
+      where: { id: { in: partnerIds.map(Number) } },
+      select: { id: true, fcmToken: true },
+    });
+    await Promise.allSettled(
+      partners.map((p) => {
+        if (!p.fcmToken) return null;
+        /// Data-only (no notification block) so it silently wakes the app
+        /// to dismiss — it must NOT itself render a notification.
+        return sendFcmDataMessage(p.fcmToken, {
+          type: 'job_clear',
+          bookingId: String(bookingId),
+        });
+      }),
+    );
+  } catch (err) {
+    logger.warn(`[push] clearJobOfferPush failed: ${err.message}`);
+  }
+};
+
+module.exports = {
+  sendPush,
+  sendFcmDataMessage,
+  sendJobOfferPushes,
+  sendJobAssignedPush,
+  clearJobOfferPush,
+  JOB_OFFER_NOTIFICATION_TAG,
+};

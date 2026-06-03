@@ -16,6 +16,8 @@ exports.setDuty = asyncHandler(async (req, res) => {
   const data = await service.setDuty({
     partnerId: req.user.sub,
     onDuty: req.body.onDuty,
+    lat: req.body.lat,
+    lng: req.body.lng,
   });
   success(res, data, data.onDuty ? 'You are now on duty' : 'You are now off duty');
 });

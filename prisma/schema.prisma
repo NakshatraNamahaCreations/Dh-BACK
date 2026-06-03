@@ -543,6 +543,12 @@ model Booking {
   customer        Customer      @relation(fields: [customerId], references: [id])
   partnerId       Int?
   partner         Partner?      @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+  /// When a partner was assigned to this booking — set the moment a
+  /// partner accepts (or an admin manually assigns). Drives the
+  /// "Assigned" step timestamp on the admin tracking timeline. Distinct
+  /// from `updatedAt` (which changes on every later edit), so it stays
+  /// the true assignment moment. Cleared if the partner is removed.
+  assignedAt      DateTime?
   status          BookingStatus @default(PENDING)
 
   /// when the customer wants the partner to arrive
@@ -643,6 +649,13 @@ model Booking {
   /// completing the job. The customer reads the code aloud, the partner
   /// types it in. Plain text is fine — these are short-lived handoff
   /// codes seen by both parties, not security secrets.
+  /// When the partner marked "Arrived" at the customer's location. Set
+  /// between accept (CONFIRMED) and job start (IN_PROGRESS). Persisted
+  /// server-side so the arrival state survives an app restart/reinstall
+  /// and so the customer + admin can see "partner has arrived". The
+  /// booking `status` stays CONFIRMED while arrived — arrival is a
+  /// sub-state of the en-route phase, not its own enum value.
+  arrivedAt       DateTime?
   jobStartOtp     String?
   jobStartedAt    DateTime?
   jobCompleteOtp  String?

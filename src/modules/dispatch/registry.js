@@ -41,6 +41,15 @@ const logger = require('../../config/logger');
  */
 
 const PRESENCE_TTL_S = 90;
+/// "Sticky" presence TTL for an EXPLICITLY on-duty partner. Live presence
+/// pings use the short 90s TTL (so a crashed app drops quickly), but the
+/// explicit On Duty toggle registers the partner with this MUCH longer
+/// TTL so they STAY in the dispatch pool while backgrounded — on OEMs
+/// (Vivo/Oppo/Xiaomi) that freeze the JS thread, pings stop within
+/// seconds and the 90s TTL would otherwise drop a partner who is very
+/// much still on duty. They're removed on explicit Off Duty; this TTL is
+/// just the safety net for "forgot to go off duty" (4h covers a shift).
+const STICKY_ONLINE_TTL_S = 4 * 60 * 60;
 const BOOKING_KEY_TTL_S = 300;
 const VISIBLE_TO_LIMIT = 200;
 
@@ -86,6 +95,11 @@ const ACTIVE_JOB_TTL_S = 4 * 60 * 60;
 const activeJobKey = (partnerId) => `partner:active:${partnerId}`;
 const visibleToKey = (bookingId) => `booking:visibleTo:${bookingId}`;
 const claimKey = (bookingId) => `booking:claim:${bookingId}`;
+/// Partners who DECLINED / cancelled this specific booking — they must
+/// not be re-offered it on subsequent waves (a partner who walked away
+/// from a job shouldn't get re-alerted for the same one). Per-booking
+/// set, aged out with the booking-side TTL.
+const declinedKey = (bookingId) => `booking:declined:${bookingId}`;
 /// Reverse index: every booking a partner has been offered. Written
 /// alongside `visibleTo` so partner polls can do a single SMEMBERS
 /// instead of scanning every booking-visibility key. Auto-trimmed to
@@ -129,12 +143,41 @@ const upsertOnline = async ({ partnerId, categoryId, lat, lng }) => {
     /// and without this they'd be re-added to the pool ~15s after accept.
     /// One EXISTS over both keys keeps this a single round-trip.
     const blocked = await redis.exists(offDutyKey(partnerId), activeJobKey(partnerId));
-    if (blocked > 0) return;
+    if (blocked > 0) {
+      /// TEMP DIAGNOSTIC — remove once "no job alert" is resolved.
+      logger.info(`[presence-debug] upsertOnline BLOCKED partner ${partnerId}: offduty/active flag set (exists=${blocked})`);
+      return;
+    }
     await redis
       .multi()
       .geoadd(onlineKey(categoryId), Number(lng), Number(lat), String(partnerId))
-      .set(lastSeenKey(partnerId), Date.now(), 'EX', PRESENCE_TTL_S)
+      /// Use the STICKY TTL (not 90s): any presence ping means the
+      /// partner is on duty, and we want them to survive the app being
+      /// backgrounded/frozen between pings. They're removed on explicit
+      /// Off Duty; the long TTL is just the "forgot to go off" safety net.
+      .set(lastSeenKey(partnerId), Date.now(), 'EX', STICKY_ONLINE_TTL_S)
       .exec();
+    logger.info(`[presence-debug] upsertOnline DONE partner ${partnerId} → cat:${categoryId} geoadd OK`);
+  });
+};
+
+/// Register an EXPLICITLY on-duty partner into the dispatch pool with a
+/// LONG (sticky) lastseen TTL, so they stay matchable while the app is
+/// backgrounded and pings have paused (OEM JS-thread freeze). Called from
+/// the duty endpoint on toggle-ON. Skips a partner mid-job (active flag)
+/// so we don't make a busy partner re-eligible. The off-duty flag was
+/// just cleared by the toggle, so we don't re-check it here.
+const setStickyOnline = async ({ partnerId, categoryId, lat, lng }) => {
+  if (categoryId == null || lat == null || lng == null) return;
+  if (isSentinelDefaultCoord(lat, lng)) return;
+  return safe(async () => {
+    if ((await redis.exists(activeJobKey(partnerId))) > 0) return; // busy → leave out
+    await redis
+      .multi()
+      .geoadd(onlineKey(categoryId), Number(lng), Number(lat), String(partnerId))
+      .set(lastSeenKey(partnerId), Date.now(), 'EX', STICKY_ONLINE_TTL_S)
+      .exec();
+    logger.info(`[presence-debug] setStickyOnline partner ${partnerId} → cat:${categoryId} (sticky ${STICKY_ONLINE_TTL_S}s)`);
   });
 };
 
@@ -497,6 +540,27 @@ const listPartnersForBooking = async (bookingId) => {
   }, []);
 };
 
+/// Record that a partner DECLINED / cancelled this booking — they won't
+/// be re-offered it on later waves. Aged out with the booking TTL.
+const addDeclinedPartner = async (bookingId, partnerId) => {
+  return safe(async () => {
+    await redis
+      .multi()
+      .sadd(declinedKey(bookingId), String(partnerId))
+      .expire(declinedKey(bookingId), BOOKING_KEY_TTL_S)
+      .exec();
+  });
+};
+
+/// The set of partner ids who declined/cancelled this booking. Used by
+/// the wave handler to filter them out of the candidate list.
+const getDeclinedPartners = async (bookingId) => {
+  return safe(async () => {
+    const ids = await redis.smembers(declinedKey(bookingId));
+    return new Set(ids.map(Number).filter(Number.isFinite));
+  }, new Set());
+};
+
 /// First-ack-wins claim. Returns true when this partner won the lock,
 /// false when somebody else already grabbed it. Caller should still
 /// run their DB transition — Redis is the fast-fail path, the DB row
@@ -600,6 +664,7 @@ module.exports = {
   enabled,
   PRESENCE_TTL_S,
   upsertOnline,
+  setStickyOnline,
   removeOnline,
   setOffDuty,
   clearOffDuty,
@@ -622,6 +687,8 @@ module.exports = {
   recordVisible,
   listOffersForPartner,
   listPartnersForBooking,
+  addDeclinedPartner,
+  getDeclinedPartners,
   tryClaim,
   clearBooking,
   getIdempotentBookingId,

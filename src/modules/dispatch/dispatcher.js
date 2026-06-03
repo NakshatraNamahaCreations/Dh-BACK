@@ -6,7 +6,7 @@ const { withDbRetry } = require('../../config/prisma');
 const logger = require('../../config/logger');
 const queue = require('./queue');
 const registry = require('./registry');
-const { sendJobOfferPushes } = require('../notifications/push.service');
+const { sendJobOfferPushes, clearJobOfferPush } = require('../notifications/push.service');
 
 /**
  * BullMQ-driven dispatch — Phase 2 of the dispatcher rewrite.
@@ -167,10 +167,20 @@ const schedulePaymentExpire = async (bookingId, delayMs) => {
 /// snapshotted the audience BEFORE calling cancelAllForBooking,
 /// which wipes the visibleTo set the audience comes from.
 const broadcastClaimed = (audience, payload) => {
-  if (!socketEmitter || !audience || audience.length === 0) return;
-  for (const pid of audience) {
-    if (pid === payload.partnerId) continue;
-    socketEmitter('dispatch.claimed', pid, payload);
+  if (!audience || audience.length === 0) return;
+  /// Close the in-app offer on every CONNECTED partner (socket).
+  if (socketEmitter) {
+    for (const pid of audience) {
+      if (pid === payload.partnerId) continue;
+      socketEmitter('dispatch.claimed', pid, payload);
+    }
+  }
+  /// Clear the OS notification on BACKGROUNDED partners (FCM) too — they
+  /// have no live socket, so without this the "New job" push lingers in
+  /// their bar after the job is taken. Skip the accepter. Fire-and-forget.
+  const others = audience.filter((pid) => pid !== payload.partnerId);
+  if (others.length > 0 && payload.bookingId != null) {
+    void clearJobOfferPush(prisma, others, payload.bookingId);
   }
 };
 
@@ -182,6 +192,16 @@ const broadcastClaimed = (audience, payload) => {
 const emitToPartner = (partnerId, event, payload) => {
   if (!socketEmitter || partnerId == null) return;
   socketEmitter(event, Number(partnerId), payload);
+};
+
+/// Emit an event to one customer's connected sockets (the `customer:{id}`
+/// room). Used to push live booking-lifecycle updates — e.g. "partner
+/// arrived" — so the customer-app's tracking screen updates instantly
+/// instead of waiting for its next poll. No-op when the gateway isn't
+/// wired or the customer has no live socket (the app's poll catches up).
+const emitToCustomer = (customerId, event, payload) => {
+  if (!socketEmitter || customerId == null) return;
+  socketEmitter(event, `customer:${Number(customerId)}`, payload);
 };
 
 /// One wave: find candidates, mark them visible, push to sockets.
@@ -285,6 +305,24 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       logger.info(
         `dispatch wave ${waveNumber} for booking ${bookingId}: dropped ${before - candidates.length} busy partner(s)`,
       );
+    }
+  }
+
+  /// Drop partners who DECLINED / cancelled THIS booking — they walked
+  /// away from it, so they must never be re-offered the same job on a
+  /// later wave (the "same partner gets re-alerted after cancelling" bug).
+  if (candidates.length > 0) {
+    const declined = await registry.getDeclinedPartners(bookingId).catch(() => new Set());
+    if (declined.size > 0) {
+      const before = candidates.length;
+      for (let i = candidates.length - 1; i >= 0; i -= 1) {
+        if (declined.has(candidates[i].partnerId)) candidates.splice(i, 1);
+      }
+      if (before !== candidates.length) {
+        logger.info(
+          `dispatch wave ${waveNumber} for booking ${bookingId}: dropped ${before - candidates.length} declined partner(s)`,
+        );
+      }
     }
   }
 
@@ -700,11 +738,27 @@ const handleExpire = async ({ bookingId }) => {
   });
   if (result.count === 0) return;
 
+  /// Snapshot who was offered this booking BEFORE clearBooking wipes the
+  /// visibleTo set — we use it to clear their FCM "New job" notification
+  /// (the window closed, so the offer is dead; don't leave it lingering
+  /// in backgrounded partners' notification bars).
+  const offerAudience = await registry.listPartnersForBooking(bookingId).catch(() => []);
+
   /// Clear the broadcast-time Redis state (visibleTo set, claim locks)
   /// — the booking is no longer being broadcast to partners. The
   /// partner-app's "active offer" UI on every connected partner will
   /// disappear, leaving a clean slate for admin's manual dispatch.
   await registry.clearBooking(bookingId);
+
+  /// Dismiss the offer everywhere: socket (connected) + FCM (backgrounded).
+  if (offerAudience.length > 0) {
+    if (socketEmitter) {
+      for (const pid of offerAudience) {
+        socketEmitter('dispatch.claimed', pid, { bookingId, partnerId: null });
+      }
+    }
+    void clearJobOfferPush(prisma, offerAudience, bookingId);
+  }
 
   /// Schedule the safety-net auto-cancel. If admin assigns a partner
   /// (or manually cancels) before this fires, cancelAllForBooking
@@ -944,6 +998,7 @@ module.exports = {
   schedulePaymentExpire,
   broadcastClaimed,
   emitToPartner,
+  emitToCustomer,
   setSocketEmitter,
   isPartnerConnected,
   start,

@@ -163,6 +163,12 @@ const start = (httpServer) => {
       socket.data.categoryId = partner?.categoryId ?? null;
       socket.data.dispatchable =
         !!partner?.isActive && !!partner?.isVerified && partner?.categoryId != null;
+      /// TEMP DIAGNOSTIC — remove once the "no job alert" issue is fixed.
+      logger.info(
+        `[presence-debug] partner ${partnerId} CONNECTED: categoryId=${partner?.categoryId} ` +
+          `isActive=${partner?.isActive} isVerified=${partner?.isVerified} ` +
+          `dispatchable=${socket.data.dispatchable}`,
+      );
     } catch (err) {
       socket.data.dispatchable = false;
       logger.warn(`socket connect lookup failed for partner ${partnerId}: ${err.message}`);
@@ -185,13 +191,24 @@ const start = (httpServer) => {
     /// dispatchable", which is the right state for someone whose app
     /// is still resolving GPS.
     socket.on('presence', async (msg) => {
+      /// TEMP DIAGNOSTIC — fires the instant a presence event ARRIVES,
+      /// before any guard. If we never see this, the APP isn't emitting.
+      logger.info(`[presence-debug] partner ${partnerId} presence EVENT received: ${JSON.stringify(msg)}`);
       const lat = Number(msg?.lat);
       const lng = Number(msg?.lng);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        logger.info(`[presence-debug] partner ${partnerId} presence REJECTED: bad coords lat=${msg?.lat} lng=${msg?.lng}`);
+        return;
+      }
       /// No DB hit on the hot path — read the cached fields set on
       /// connect. Refresh the socket-conn TTL so a long-lived socket's
       /// counter doesn't expire under it.
-      if (!socket.data.dispatchable || socket.data.categoryId == null) return;
+      if (!socket.data.dispatchable || socket.data.categoryId == null) {
+        logger.info(`[presence-debug] partner ${partnerId} presence REJECTED: dispatchable=${socket.data.dispatchable} categoryId=${socket.data.categoryId}`);
+        return;
+      }
+      /// TEMP DIAGNOSTIC — confirms presence reached upsertOnline.
+      logger.info(`[presence-debug] partner ${partnerId} presence OK → upsertOnline (${lat},${lng})`);
       try {
         await registry.upsertOnline({
           partnerId,
@@ -250,11 +267,20 @@ const start = (httpServer) => {
       /// deploy it would have wrongly marked a partner offline while they
       /// still had a socket on another box.)
       const remaining = await registry.decrSocketConn(partnerId).catch(() => 0);
+      /// Only pull the partner from the dispatch pool on disconnect if
+      /// they've EXPLICITLY gone off duty. A socket drop alone is NOT a
+      /// reliable "off duty" signal — OEMs (Vivo/Oppo/Xiaomi) freeze the
+      /// JS thread when the app is backgrounded, dropping the socket while
+      /// the partner is very much still on duty. We keep them in the pool
+      /// (sticky lastseen TTL) so they still receive jobs via FCM push;
+      /// they're removed only via the explicit Off Duty toggle (or the
+      /// 4h sticky-TTL safety net). This is the core of the "stay eligible
+      /// by duty toggle, not live socket" model.
       if (remaining <= 0 && socket.data.categoryId != null) {
-        await registry.removeOnline({
-          partnerId,
-          categoryId: socket.data.categoryId,
-        });
+        const offDuty = await registry.isOffDuty(partnerId).catch(() => false);
+        if (offDuty) {
+          await registry.removeOnline({ partnerId, categoryId: socket.data.categoryId });
+        }
       }
     });
   });
