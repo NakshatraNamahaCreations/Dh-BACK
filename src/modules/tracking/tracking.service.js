@@ -158,6 +158,62 @@ exports.mirrorOnDuty = async ({ partnerId, onDuty }) => {
   }
 };
 
+/// Force a partner OFF duty because their device is gone — the FCM token
+/// came back `registration-token-not-registered`, which Firebase returns
+/// when the app was UNINSTALLED (or notifications were hard-revoked / the
+/// token rotated out). That's the authoritative "this device can't be
+/// reached again" signal, so we:
+///   1. Drop the dead FCM token from the DB so we stop trying to push to it.
+///   2. Remove them from the live dispatch pool (Redis geo + lastseen) and
+///      set the off-duty flag, so they immediately stop being offered jobs
+///      and stop showing as "Available" in admin — instead of lingering for
+///      the full 4h sticky TTL.
+///   3. Mirror dutyState='off_duty' to the DB for the admin list.
+/// Bust the duty-mirror change-cache first, otherwise shouldMirrorDuty
+/// would suppress the DB off-write (it thinks they're still on duty).
+/// Idempotent + best-effort: a partner who already reinstalled and got a
+/// fresh token re-registers normally on their next duty-on.
+exports.forceOffDutyDeadDevice = async ({ partnerId, deadToken = null }) => {
+  const registry = require('../dispatch/registry');
+  const pid = Number(partnerId);
+  if (!Number.isFinite(pid)) return;
+  try {
+    /// Only clear the token row if it STILL matches the dead one — a
+    /// reinstall may have raced a fresh token in already; don't clobber it.
+    const partner = await prisma.partner.findUnique({
+      where: { id: pid },
+      select: { categoryId: true, fcmToken: true },
+    });
+    if (!partner) return;
+
+    /// Clear the token row — but ONLY if it still matches the dead token
+    /// (or no specific token was passed). A reinstall may have raced a
+    /// fresh token in already; don't clobber that.
+    if (!deadToken || partner.fcmToken === deadToken) {
+      await prisma.partner
+        .update({ where: { id: pid }, data: { fcmToken: null }, select: { id: true } })
+        .catch(() => {});
+    }
+
+    /// Pull them out of the live pool + raise the off-duty flag.
+    await registry.setOffDuty({ partnerId: pid, categoryId: partner.categoryId ?? null });
+    /// Bust the mirror cache so the off-write below isn't change-gated away.
+    await registry.clearDutyMirror(pid).catch(() => {});
+    await prisma.partner
+      .update({
+        where: { id: pid },
+        data: { onDuty: false, dutyState: 'off_duty', onDutyChangedAt: new Date() },
+        select: { id: true },
+      })
+      .catch(() => {});
+    logger.warn(
+      `[duty] forced partner ${pid} OFF duty — FCM token unregistered (app uninstalled / token dead)`,
+    );
+  } catch (err) {
+    logger.warn(`[duty] forceOffDutyDeadDevice failed for ${pid}: ${err.message}`);
+  }
+};
+
 /// Directly set the free↔busy transition WITHIN on-duty, called from the
 /// booking flow when a partner accepts a job (busy) or finishes/cancels
 /// it (free again). Best-effort.

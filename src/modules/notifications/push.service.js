@@ -174,8 +174,16 @@ const sendFcmDataMessage = async (token, data, notification = null) => {
     await firebase.messaging().send(message);
     return true;
   } catch (err) {
-    /// Common reasons: invalid / unregistered token (clean these up
-    /// in a follow-up — Firebase returns `registration-token-not-registered`).
+    /// `registration-token-not-registered` is Firebase's authoritative
+    /// "this device is GONE" — the app was uninstalled, notifications were
+    /// hard-revoked, or the token rotated out. Surface it as a distinct
+    /// return so the caller (which knows the partnerId) can force that
+    /// partner off duty + drop the dead token, instead of letting them
+    /// linger as "Available" for the full 4h sticky TTL.
+    if (err.code === 'messaging/registration-token-not-registered') {
+      logger.warn(`[push] FCM token unregistered (device gone) ...${token.slice(-8)}`);
+      return 'token-dead';
+    }
     logger.warn(`[push] FCM send failed for ...${token.slice(-8)}: ${err.message}`);
     return false;
   }
@@ -213,6 +221,17 @@ const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, 
             /// socket-driven in-app popup instead.
             { title: 'New job request!', body: `${serviceName} · ₹${amount} near you` },
           );
+          /// Device is GONE (uninstalled / token dead) — force this partner
+          /// off duty so dispatch stops wasting a broadcast slot on them and
+          /// they drop out of the admin "Available" list. Don't fall back to
+          /// Expo (that token's dead too if the app's uninstalled).
+          if (sent === 'token-dead') {
+            void require('../tracking/tracking.service').forceOffDutyDeadDevice({
+              partnerId: p.id,
+              deadToken: p.fcmToken,
+            });
+            return;
+          }
           /// Direct FCM is the reliable path — only fall back to Expo
           /// when this partner has no FCM token at all or the send
           /// itself failed (network glitch / stale token).
@@ -263,7 +282,16 @@ const sendJobAssignedPush = async (prisma, partnerId, { bookingId, serviceName, 
         { type: 'job_assigned', bookingId, serviceName, amount },
         { title: 'New job assigned', body: `${serviceName} · ₹${amount} — tap to view` },
       );
-      if (sent) return;
+      /// Device gone — force off duty + drop the dead token. Still attempt
+      /// the Expo fallback below in case that channel somehow survives.
+      if (sent === 'token-dead') {
+        void require('../tracking/tracking.service').forceOffDutyDeadDevice({
+          partnerId: Number(partnerId),
+          deadToken: partner.fcmToken,
+        });
+      } else if (sent) {
+        return;
+      }
     }
     if (partner.expoPushToken) {
       await sendPush(partner.expoPushToken, {
