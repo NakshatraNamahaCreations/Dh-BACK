@@ -81,6 +81,28 @@ const DISPATCH_WAVES = [
 ];
 const FINAL_DISPATCH_WAVE = DISPATCH_WAVES[DISPATCH_WAVES.length - 1];
 const DISPATCH_TOTAL_MS = FINAL_DISPATCH_WAVE.offsetMs + DISPATCH_WINDOW_MS;
+
+/// The 6 waves widen in 3 STAGES (initial + retry per radius). This maps a
+/// wave number to its stage index (0,1,2) so we can look up the admin-
+/// configured radius for that stage: waves 1-2 → stage 0, 3-4 → 1, 5-6 → 2.
+const waveRadiusStage = (waveNumber) => Math.floor((waveNumber - 1) / 2);
+
+/// Resolve a wave's radius from the admin-editable dispatch config
+/// (policy.getDispatch → { radii:[r0,r1,r2] }). Falls back to the wave's
+/// hardcoded `radiusKm` if settings are unavailable, so dispatch never
+/// breaks on a settings read error. Loaded fresh per wave (cheap single-
+/// row read) so an admin radius change takes effect on the next booking
+/// without a restart.
+const resolveWaveRadiusKm = async (waveSpec) => {
+  try {
+    const { radii } = await require('../policy/policy.service').getDispatch();
+    const stage = waveRadiusStage(waveSpec.wave);
+    const r = radii?.[stage];
+    return Number.isFinite(r) && r > 0 ? r : waveSpec.radiusKm;
+  } catch {
+    return waveSpec.radiusKm;
+  }
+};
 // Lead time before a scheduled slot at which dispatch begins. MUST stay
 // in sync with the same constant in bookings.service.js.
 const SCHEDULE_DISPATCH_LEAD_MS = 30 * 60 * 1000;
@@ -242,6 +264,11 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
   if (booking.status !== 'PENDING' || booking.partnerId != null) return;
   if (booking.lat == null || booking.lng == null) return;
 
+  /// Admin-configurable radius for this wave's stage (3/5/7km by default,
+  /// editable from the admin Dispatch Rules page). Resolved fresh here so
+  /// a change applies to the next wave without a restart.
+  const radiusKm = await resolveWaveRadiusKm(waveSpec);
+
   /// Distinct categories — usually one, occasionally a multi-category
   /// cart. We GEOSEARCH each pool independently and union the results.
   const categoryIds = [...new Set(booking.items.map((i) => i.service.categoryId))];
@@ -255,7 +282,7 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
   /// that categoryId) vs. nobody on duty at all.
   logger.info(
     `dispatch wave ${waveNumber} for booking ${bookingId}: ` +
-      `anchor=(${booking.lat}, ${booking.lng}) radius=${waveSpec.radiusKm}km ` +
+      `anchor=(${booking.lat}, ${booking.lng}) radius=${radiusKm}km ` +
       `retry=${waveSpec.retry ? 'yes' : 'no'} ` +
       `categories=[${categoryIds.join(',')}]`,
   );
@@ -271,12 +298,12 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       categoryId: cat,
       lat: booking.lat,
       lng: booking.lng,
-      radiusKm: waveSpec.radiusKm,
+      radiusKm,
       limit: 50,
     });
     logger.info(
       `  category ${cat}: pool=${poolSize} online, ` +
-        `${rows.length} within ${waveSpec.radiusKm}km` +
+        `${rows.length} within ${radiusKm}km` +
         (rows.length > 0
           ? ` -> ${rows.map((r) => `#${r.partnerId}@${r.distanceKm.toFixed(2)}km`).join(', ')}`
           : ''),
@@ -326,6 +353,40 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
     }
   }
 
+  /// HARD GATE — drop SUSPENDED / PAUSED / UNVERIFIED partners. The DB is
+  /// the source of truth for account standing; a suspended partner can
+  /// linger in the Redis pool for up to the sticky TTL (or be put back by
+  /// the auto-suspend-on-cancel path that clears their busy flag), so this
+  /// is the bulletproof belt that stops a blocked partner from EVER being
+  /// offered a job regardless of how they got into the candidate set.
+  if (candidates.length > 0) {
+    const eligible = await prisma.partner
+      .findMany({
+        where: {
+          id: { in: candidates.map((c) => c.partnerId) },
+          isActive: true,
+          isVerified: true,
+        },
+        select: { id: true },
+      })
+      .catch(() => null);
+    /// On a DB read failure, fail OPEN (keep candidates) — a transient
+    /// error shouldn't black-hole all dispatch; the DB-side accept guard
+    /// still rejects a suspended partner who somehow taps Accept.
+    if (eligible) {
+      const ok = new Set(eligible.map((p) => p.id));
+      const before = candidates.length;
+      for (let i = candidates.length - 1; i >= 0; i -= 1) {
+        if (!ok.has(candidates[i].partnerId)) candidates.splice(i, 1);
+      }
+      if (before !== candidates.length) {
+        logger.info(
+          `dispatch wave ${waveNumber} for booking ${bookingId}: dropped ${before - candidates.length} suspended/unverified partner(s)`,
+        );
+      }
+    }
+  }
+
   /// Persist wave/dispatch state on the booking row so the legacy
   /// poll endpoint and admin views can show "broadcasting (3 km, wave 1)".
   await prisma.booking
@@ -335,7 +396,7 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
         dispatchStatus: 'broadcasting',
         dispatchStartedAt: dispatchStartAt(booking),
         dispatchExpiresAt: new Date(dispatchStartAt(booking).getTime() + DISPATCH_TOTAL_MS),
-        dispatchRadiusKm: waveSpec.radiusKm,
+        dispatchRadiusKm: radiusKm,
         dispatchWave: waveSpec.wave,
       },
     })
@@ -398,7 +459,7 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       socketEmitter('dispatch.offer', c.partnerId, {
         bookingId: booking.id,
         wave: waveSpec.wave,
-        radiusKm: waveSpec.radiusKm,
+        radiusKm,
         retry: waveSpec.retry,
         activeForSec: DISPATCH_WINDOW_MS / 1000,
         distanceKm: c.distanceKm,
@@ -742,9 +803,31 @@ const handlePaymentExpire = async ({ bookingId }) => {
     return;
   }
 
+  /// If a PARTNER cancelled this booking earlier (it has a
+  /// cancellation_penalty adjustment), KEEP it as CANCELLED instead of
+  /// hard-deleting — otherwise it vanishes from that partner's Past tab.
+  /// Truly-abandoned attempts (never accepted, no partner cancel) are
+  /// still deleted to avoid cluttering the data with dead rows.
+  const wasPartnerCancelled =
+    (await prisma.partnerAdjustment.count({
+      where: { bookingId: booking.id, type: 'cancellation_penalty' },
+    })) > 0;
+
   const result = await prisma.$transaction(async (tx) => {
     if (booking.couponId != null) {
       await couponsService.refundForBooking({ couponId: booking.couponId, tx });
+    }
+    if (wasPartnerCancelled) {
+      return tx.booking.updateMany({
+        where: {
+          id: booking.id,
+          status: booking.status,
+          paymentStatus: { not: 'paid' },
+        },
+        /// noPartnerReason left null so it reads as a real cancellation in
+        /// the partner's history (the system-cancel filter keys on this).
+        data: { status: 'CANCELLED', noPartnerReason: null },
+      });
     }
     return tx.booking.deleteMany({
       where: {
@@ -893,10 +976,18 @@ const handleAdminTimeout = async ({ bookingId }) => {
     return;
   }
 
+  /// A booking a PARTNER cancelled is kept (as CANCELLED) even when unpaid,
+  /// so it survives in that partner's Past tab. Only truly-abandoned unpaid
+  /// bookings (never accepted by anyone) are hard-deleted.
+  const wasPartnerCancelled =
+    (await prisma.partnerAdjustment.count({
+      where: { bookingId: booking.id, type: 'cancellation_penalty' },
+    })) > 0;
+
   let didCancel = false;
   let didDelete = false;
   await prisma.$transaction(async (tx) => {
-    if (booking.paymentStatus === 'paid') {
+    if (booking.paymentStatus === 'paid' || wasPartnerCancelled) {
       const result = await tx.booking.updateMany({
         where: {
           id: booking.id,
@@ -907,8 +998,12 @@ const handleAdminTimeout = async ({ bookingId }) => {
         data: {
           status: 'CANCELLED',
           dispatchStatus: 'no_partner_found',
-          noPartnerReason:
-            'No partner found within broadcast and retry windows; admin grace period elapsed without manual dispatch.',
+          /// Keep noPartnerReason null for partner-cancelled rows so the
+          /// partner-history filter treats them as real cancellations;
+          /// the unpaid-abandoned-but-kept case (paid) keeps the reason.
+          noPartnerReason: wasPartnerCancelled
+            ? null
+            : 'No partner found within broadcast and retry windows; admin grace period elapsed without manual dispatch.',
         },
       });
       didCancel = result.count > 0;

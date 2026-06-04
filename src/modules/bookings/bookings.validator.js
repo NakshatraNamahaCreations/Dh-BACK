@@ -87,6 +87,8 @@ const adminListQuerySchema = z.object({
     /// used by Booking History to default-hide CANCELLED rows so
     /// the admin's operational view stays focused on live work.
     excludeStatus: z.string().trim().max(80).optional(),
+    /// Booking-type filter — Instant / Scheduled / Book-at-price (BYOP).
+    bookingType: z.enum(['instant', 'scheduled', 'byop']).optional(),
     page: z.coerce.number().int().min(1).optional(),
     pageSize: z.coerce.number().int().min(1).max(100).optional(),
   }),

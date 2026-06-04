@@ -19,6 +19,7 @@ const logger = require('../../config/logger');
 
 const CANCELLATION_KEY = 'cancellation_policy';
 const REFUND_KEY = 'refund_policy';
+const DISPATCH_KEY = 'dispatch_config';
 
 const DEFAULT_CANCELLATION = {
   freeWindowMins: 5,
@@ -38,6 +39,17 @@ const DEFAULT_REFUND = {
   processingDaysWallet: 1,
   partialRefundEnabled: true,
   reasonRequired: true,
+};
+
+/// Broadcast-radius config. The dispatcher widens the search in three
+/// stages — `radii[0]` → `radii[1]` → `radii[2]` km — each tried as an
+/// initial + retry attempt before handing off to admin. Only the three
+/// DISTANCES are admin-editable; the wave count, per-attempt timing, and
+/// retry behaviour stay fixed in the dispatcher. Must be 3 ascending
+/// positive numbers; the dispatcher falls back to these defaults if the
+/// stored value is missing or malformed.
+const DEFAULT_DISPATCH = {
+  radii: [3, 5, 7],
 };
 
 /// Read a settings key, falling back to `fallback` on absence or any
@@ -69,6 +81,24 @@ exports.saveCancellation = async (policy) => writeSetting(CANCELLATION_KEY, poli
 
 exports.getRefund = async () => readSetting(REFUND_KEY, DEFAULT_REFUND);
 exports.saveRefund = async (policy) => writeSetting(REFUND_KEY, policy);
+
+/// Returns the dispatch config, sanitised so the dispatcher can trust it:
+/// exactly 3 ascending positive integers. Any malformed stored value
+/// silently falls back to the [3,5,7] default rather than risking a bad
+/// radius (e.g. 0 km = nobody, or descending = the 7km wave searching a
+/// smaller area than the 3km wave).
+exports.getDispatch = async () => {
+  const raw = await readSetting(DISPATCH_KEY, DEFAULT_DISPATCH);
+  const radii = Array.isArray(raw.radii) ? raw.radii.map(Number) : [];
+  const valid =
+    radii.length === 3 &&
+    radii.every((r) => Number.isFinite(r) && r > 0) &&
+    radii[0] <= radii[1] &&
+    radii[1] <= radii[2];
+  return { radii: valid ? radii : [...DEFAULT_DISPATCH.radii] };
+};
+exports.saveDispatch = async (config) => writeSetting(DISPATCH_KEY, config);
+exports.DEFAULT_DISPATCH = DEFAULT_DISPATCH;
 
 /// Pure fee math, exported separately so it's unit-testable without a
 /// DB and reusable by both the cancel flow and the customer-app quote

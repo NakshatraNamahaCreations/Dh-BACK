@@ -21,3 +21,13 @@ exports.saveRefund = asyncHandler(async (req, res) => {
   const data = await service.saveRefund(req.body);
   success(res, data, 'Refund policy saved');
 });
+
+exports.getDispatch = asyncHandler(async (_req, res) => {
+  const data = await service.getDispatch();
+  success(res, data, 'Dispatch config fetched');
+});
+
+exports.saveDispatch = asyncHandler(async (req, res) => {
+  const data = await service.saveDispatch(req.body);
+  success(res, data, 'Dispatch config saved');
+});

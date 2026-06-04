@@ -522,6 +522,27 @@ exports.updateStatus = async (id, status, reason) => {
       data,
       include: { document: true, cityRef: { select: { name: true, state: { select: { name: true, code: true } } } } },
     });
+
+    /// Blocking a partner (paused / suspended → isActive=false) must pull
+    /// them out of the live dispatch pool RIGHT NOW. The DB flag alone
+    /// isn't enough: their Redis presence (geo set + lastseen) lingers for
+    /// the sticky TTL, so without this they keep getting job offers after
+    /// being blocked. The dispatcher's isActive gate is the belt; this is
+    /// the immediate removal. (Reactivating doesn't need a counterpart —
+    /// the partner re-registers on their next duty-on / presence ping.)
+    if (data.isActive === false) {
+      const registry = require('../dispatch/registry');
+      try {
+        await registry.setOffDuty({ partnerId: p.id, categoryId: p.categoryId ?? null });
+        await registry.clearDutyMirror(p.id).catch(() => {});
+        await prisma.partner
+          .update({ where: { id: p.id }, data: { onDuty: false, dutyState: 'off_duty' }, select: { id: true } })
+          .catch(() => {});
+      } catch {
+        /* best-effort — DB flag + dispatcher gate still block dispatch */
+      }
+    }
+
     /// Notify the partner whenever this changes their effective state.
     /// We compare against `before` rather than naively firing on every
     /// admin save — re-saving "suspended" with the same reason shouldn't

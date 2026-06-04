@@ -1376,6 +1376,12 @@ const adminShape = (b) => {
     arrivedAt: b.arrivedAt ?? null,
     jobStartedAt: b.jobStartedAt ?? null,
     jobCompletedAt: b.jobCompletedAt ?? null,
+    /// Job-handoff OTPs surfaced to ADMIN for support — when a customer
+    /// can't find the code, the admin reads it back to them so the
+    /// partner can start/complete the job. `jobStartedAt`/`jobCompletedAt`
+    /// above let the UI grey out a code once that step is already done.
+    jobStartOtp: b.jobStartOtp ?? null,
+    jobCompleteOtp: b.jobCompleteOtp ?? null,
     completedAt: b.jobCompletedAt ?? (b.status === 'COMPLETED' ? b.updatedAt : null),
     cancelledAt: b.status === 'CANCELLED' ? b.updatedAt : null,
     cancelReason: b.status === 'CANCELLED' ? b.notes : undefined,
@@ -1441,6 +1447,7 @@ exports.adminList = async ({
   to,
   dispatchStatus,
   excludeStatus,
+  bookingType,
   scope,
   page = 1,
   pageSize = 25,
@@ -1472,6 +1479,24 @@ exports.adminList = async ({
       where.status = { notIn: list };
     }
   }
+  /// Booking-type filter — matches the Instant / Scheduled / Book-at-price
+  /// badge in the admin table. BYOP is the `offeredPrice != null` signal
+  /// and takes precedence (a BYOP booking is ALSO isInstant), so:
+  ///   byop      → offeredPrice set (customer named their price)
+  ///   instant   → isInstant true AND no offeredPrice (fixed-price now)
+  ///   scheduled → not instant (future slot)
+  if (bookingType) {
+    const t = String(bookingType).toLowerCase();
+    if (t === 'byop') {
+      where.offeredPrice = { not: null };
+    } else if (t === 'instant') {
+      where.isInstant = true;
+      where.offeredPrice = null;
+    } else if (t === 'scheduled') {
+      where.isInstant = false;
+    }
+  }
+
   /// Targeted filters take precedence and AND together — each refines
   /// the result set independently, so typing "51" in bookingId never
   /// matches against phone numbers or other rows the way the legacy
@@ -2715,10 +2740,30 @@ exports.partnerCancel = async ({ partnerId, id, reason }) => {
     return { strikes: strikeCount, suspended: didSuspend };
   });
 
-  /// Partner is no longer on this job — clear the BUSY flag so they can
-  /// be offered new jobs again (their next presence ping re-adds them).
+  /// Partner is no longer on this job. Clear the BUSY flag either way, but
+  /// the follow-on differs by whether this cancel auto-suspended them:
+  ///   - NOT suspended → setBusyState(false) re-enables them for new jobs.
+  ///   - SUSPENDED     → they're blocked, so do NOT re-enable. Yank them
+  ///                     out of the dispatch pool (off-duty + presence
+  ///                     cleared) so they stop getting offers immediately,
+  ///                     instead of lingering for the sticky TTL. Without
+  ///                     this, the very cancel that suspended them would
+  ///                     put them back in the pool.
   await dispatchRegistry.clearActiveJob(pid).catch(() => {});
-  require('../tracking/tracking.service').setBusyState({ partnerId: pid, busy: false });
+  if (suspended) {
+    const partnerRow = await prisma.partner
+      .findUnique({ where: { id: pid }, select: { categoryId: true } })
+      .catch(() => null);
+    await dispatchRegistry
+      .setOffDuty({ partnerId: pid, categoryId: partnerRow?.categoryId ?? null })
+      .catch(() => {});
+    await prisma.partner
+      .update({ where: { id: pid }, data: { onDuty: false, dutyState: 'off_duty' }, select: { id: true } })
+      .catch(() => {});
+    await dispatchRegistry.clearDutyMirror(pid).catch(() => {});
+  } else {
+    require('../tracking/tracking.service').setBusyState({ partnerId: pid, busy: false });
+  }
 
   /// Exclude this partner from future waves for THIS booking — they
   /// walked away from it, so re-dispatch must not re-offer them the same
@@ -2809,7 +2854,64 @@ exports.partnerMine = async ({ partnerId, bucket }) => {
     take: 50,
   });
   const commissionMap = await loadCommissionMap();
-  return bookings.map((b) => partnerShape(b, null, commissionMap));
+  const shaped = bookings.map((b) => partnerShape(b, null, commissionMap));
+
+  /// History also surfaces jobs the partner CANCELLED themselves. When a
+  /// partner cancels an accepted job we RELEASE it back to the pool — the
+  /// booking row's `partnerId` is nulled and status flips to PENDING, so
+  /// the query above (which keys on partnerId) can't find it and the job
+  /// vanished from the partner's Past tab. The durable record that THIS
+  /// partner cancelled THIS booking is the `cancellation_penalty`
+  /// PartnerAdjustment row. We fetch those bookings here and shape them
+  /// with the status FORCED to 'cancelled' (their live status may now be
+  /// PENDING/CONFIRMED/COMPLETED under a different partner — irrelevant to
+  /// this partner's own history).
+  ///
+  /// Run for the 'history' bucket AND the no-bucket call (the partner app
+  /// fetches /partner/mine with NO bucket and splits Upcoming/Past client-
+  /// side by status, so the cancellations must be in that combined list).
+  /// Skip only the 'active' bucket, which is strictly in-flight jobs.
+  if (bucket !== 'active') {
+    const cancelAdjustments = await prisma.partnerAdjustment.findMany({
+      where: { partnerId, type: 'cancellation_penalty', bookingId: { not: null } },
+      select: { bookingId: true, createdAt: true },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+    /// Drop ids already in `shaped` (a booking that was cancelled and
+    /// never re-assigned still has partnerId set + status CANCELLED, so it
+    /// can appear in BOTH lists — show it once).
+    const already = new Set(shaped.map((s) => Number(s.id)));
+    const cancelledIds = [
+      ...new Set(
+        cancelAdjustments
+          .map((a) => a.bookingId)
+          .filter((id) => id != null && !already.has(id)),
+      ),
+    ];
+    if (cancelledIds.length > 0) {
+      const cancelledBookings = await prisma.booking.findMany({
+        where: { id: { in: cancelledIds } },
+        include: PARTNER_INCLUDE,
+      });
+      /// Force the partner-facing status to 'cancelled' regardless of the
+      /// booking's current live status (it may have been re-accepted by
+      /// someone else). From THIS partner's perspective, they cancelled it.
+      const cancelShaped = cancelledBookings.map((b) => ({
+        ...partnerShape(b, null, commissionMap),
+        status: 'cancelled',
+        cancelledByPartner: true,
+      }));
+      shaped.push(...cancelShaped);
+    }
+  }
+
+  /// Newest first across the merged set. partnerShape carries the booking
+  /// timestamps; sort by createdAt desc as a stable, meaningful order.
+  shaped.sort(
+    (a, z) => new Date(z.createdAt ?? 0).getTime() - new Date(a.createdAt ?? 0).getTime(),
+  );
+  return shaped;
 };
 
 // 'enroute' and 'arrived' are purely client-side states (no separate DB enum).

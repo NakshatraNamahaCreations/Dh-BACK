@@ -25,4 +25,18 @@ const refundSchema = z.object({
   }),
 });
 
-module.exports = { cancellationSchema, refundSchema };
+/// Exactly 3 broadcast radii (km), each 1–50, and non-descending so the
+/// widening search never shrinks (r0 ≤ r1 ≤ r2). Refined here so a bad
+/// admin entry is rejected at the API rather than silently falling back.
+const dispatchSchema = z.object({
+  body: z.object({
+    radii: z
+      .array(z.number().positive().max(50))
+      .length(3)
+      .refine((r) => r[0] <= r[1] && r[1] <= r[2], {
+        message: 'Radii must be non-descending (e.g. 3 ≤ 5 ≤ 7).',
+      }),
+  }),
+});
+
+module.exports = { cancellationSchema, refundSchema, dispatchSchema };
