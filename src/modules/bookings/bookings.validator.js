@@ -199,6 +199,15 @@ const partnerIncomingQuerySchema = z.object({
   }),
 });
 
+/// Home arrival-promise ETA — lat/lng required (the badge only requests it
+/// once the customer's location is known).
+const nearbyEtaQuerySchema = z.object({
+  query: z.object({
+    lat: z.coerce.number().min(-90).max(90),
+    lng: z.coerce.number().min(-180).max(180),
+  }),
+});
+
 const partnerStatusSchema = z.object({
   params: z.object({ id: z.coerce.number().int().positive() }),
   body: z.object({
@@ -248,4 +257,5 @@ module.exports = {
   partnerStatusSchema,
   partnerMineQuerySchema,
   rateBookingSchema,
+  nearbyEtaQuerySchema,
 };

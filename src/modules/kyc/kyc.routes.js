@@ -10,6 +10,7 @@ const {
   verifyPanSchema,
   verifyDlSchema,
   verifyBankSchema,
+  skipSchema,
 } = require('./kyc.validator');
 
 const router = express.Router();
@@ -49,5 +50,8 @@ router.post(
 router.post('/pan/verify', partnerOnly, validate(verifyPanSchema), controller.verifyPan);
 router.post('/dl/verify', partnerOnly, validate(verifyDlSchema), controller.verifyDl);
 router.post('/bank/verify', partnerOnly, validate(verifyBankSchema), controller.verifyBank);
+/// Partner self-skip of PAN / DL during onboarding (no QuickeKYC call).
+router.post('/pan/skip', partnerOnly, validate(skipSchema), controller.skipPan);
+router.post('/dl/skip', partnerOnly, validate(skipSchema), controller.skipDl);
 
 module.exports = router;

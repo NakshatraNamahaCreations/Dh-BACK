@@ -58,3 +58,13 @@ exports.verifyBank = asyncHandler(async (req, res) => {
   });
   success(res, result, 'Bank account verified.');
 });
+
+exports.skipPan = asyncHandler(async (req, res) => {
+  const result = await service.skipPan({ partnerId: req.user.sub, reason: req.body?.reason });
+  success(res, result, 'PAN skipped. You can add it later from your profile.');
+});
+
+exports.skipDl = asyncHandler(async (req, res) => {
+  const result = await service.skipDl({ partnerId: req.user.sub, reason: req.body?.reason });
+  success(res, result, 'Driving license skipped. You can add it later from your profile.');
+});

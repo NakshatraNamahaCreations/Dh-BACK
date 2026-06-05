@@ -550,6 +550,10 @@ exports.verifyPan = async ({ partnerId, panNumber, imageUrl }) => {
       panImageUrl: imageUrl,
       kycProvider: PROVIDER,
       panVerifiedAt: new Date(),
+      /// A successful verify SUPERSEDES any earlier skip (e.g. the partner
+      /// skipped PAN during onboarding, then uploaded it from their profile).
+      panSkippedAt: null,
+      panSkipReason: null,
       ...(panHolderName ? { panHolderName } : {}),
       ...(panAddress ? { panAddress } : {}),
       ...(panCategory ? { panCategory } : {}),
@@ -828,4 +832,48 @@ exports.verifyBankAccount = async ({ partnerId, accountNumber, ifsc, imageUrl })
     upiId: data.upi_id ?? null,
     remarks: data.remarks ?? null,
   };
+};
+
+/// Skip PAN verification during onboarding. PAN is a SKIPPABLE document —
+/// the partner can finish onboarding without it and complete it later from
+/// their profile (or an admin can upload it). Sets `panSkippedAt` so the
+/// activation gate (auth.service.hasRequiredPartnerDocuments) treats PAN as
+/// satisfied, while the profile nudge still counts it incomplete until it's
+/// actually verified. No QuickeKYC call — just a state flag.
+///   `by` distinguishes who skipped ('partner' | 'admin') in the reason.
+exports.skipPan = async ({ partnerId, reason, by = 'partner' }) => {
+  const note = reason?.trim() || `Skipped by ${by}`;
+  await prisma.partnerDocument.upsert({
+    where: { partnerId: Number(partnerId) },
+    create: { partnerId: Number(partnerId), panSkippedAt: new Date(), panSkipReason: note },
+    update: { panSkippedAt: new Date(), panSkipReason: note },
+  });
+  const notifications = require('../notifications/notifications.service');
+  await notifications.create({
+    partnerId: Number(partnerId),
+    type: 'kyc',
+    title: 'PAN step skipped',
+    body: 'You can add your PAN later from your profile to complete verification.',
+  });
+  return { skipped: true };
+};
+
+/// Skip DL verification during onboarding — same model as skipPan. (Admin
+/// already has a separate skip via partners.service.skipDlVerification; this
+/// is the PARTNER-initiated self-skip during onboarding.)
+exports.skipDl = async ({ partnerId, reason, by = 'partner' }) => {
+  const note = reason?.trim() || `Skipped by ${by}`;
+  await prisma.partnerDocument.upsert({
+    where: { partnerId: Number(partnerId) },
+    create: { partnerId: Number(partnerId), dlSkippedAt: new Date(), dlSkipReason: note },
+    update: { dlSkippedAt: new Date(), dlSkipReason: note },
+  });
+  const notifications = require('../notifications/notifications.service');
+  await notifications.create({
+    partnerId: Number(partnerId),
+    type: 'kyc',
+    title: 'Driving license step skipped',
+    body: 'You can add your driving license later from your profile.',
+  });
+  return { skipped: true };
 };

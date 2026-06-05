@@ -39,6 +39,14 @@ exports.availability = asyncHandler(async (req, res) => {
   success(res, result, 'Partner availability fetched');
 });
 
+exports.nearbyEta = asyncHandler(async (req, res) => {
+  const result = await service.nearbyEta({
+    lat: req.query.lat,
+    lng: req.query.lng,
+  });
+  success(res, result, 'Nearby ETA fetched');
+});
+
 exports.cancellationQuote = asyncHandler(async (req, res) => {
   const quote = await service.cancellationQuote({
     customerId: req.user.sub,

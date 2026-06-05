@@ -43,9 +43,11 @@ const categoryName = (p, categoryById) =>
 const docState = (value) => (value ? 'uploaded' : 'pending');
 
 const isDlComplete = (doc) => Boolean(doc?.dlVerifiedAt || doc?.dlSkippedAt);
+/// PAN, like DL, is complete when verified OR skipped (skippable doc).
+const isPanComplete = (doc) => Boolean(doc?.panVerifiedAt || doc?.panSkippedAt);
 
 const hasRequiredDocuments = (doc) =>
-  Boolean(doc?.aadharNumber && doc?.panNumber && isDlComplete(doc) && doc?.bankAccount && doc?.bankIfsc);
+  Boolean(doc?.aadharNumber && isPanComplete(doc) && isDlComplete(doc) && doc?.bankAccount && doc?.bankIfsc);
 
 const onboardingStatus = (p) => {
   if (p.rejectedReason || !p.isActive) return 'rejected';
@@ -64,7 +66,7 @@ const stagesForPartner = (p, updatedBy = 'System') => {
   const done = new Set(['application']);
   const doc = p.document;
   if (doc?.aadharNumber) done.add('aadhaar');
-  if (doc?.panNumber) done.add('pan');
+  if (isPanComplete(doc) || doc?.panNumber || doc?.panImageUrl) done.add('pan');
   if (isDlComplete(doc) || doc?.dlNumber || doc?.dlImageUrl) done.add('dl');
   if (doc?.kycStatus === 'verified' || hasRequiredDocuments(doc)) done.add('background');
   if (p.callVerified) done.add('call');
@@ -85,7 +87,9 @@ const stagesForPartner = (p, updatedBy = 'System') => {
 
 const documentsForPartner = (p) => ({
   aadhaar: docState(p.document?.aadharNumber || p.document?.aadharImageUrl),
-  pan: docState(p.document?.panNumber || p.document?.panImageUrl),
+  pan: p.document?.panSkippedAt
+    ? 'skipped'
+    : docState(p.document?.panNumber || p.document?.panImageUrl),
   dl: p.document?.dlSkippedAt ? 'skipped' : docState(p.document?.dlNumber || p.document?.dlImageUrl),
 });
 
@@ -290,6 +294,8 @@ const documentDetailsForPartner = (p) => {
     /// Per-document verification timestamps.
     aadharVerifiedAt: p.document?.aadharVerifiedAt ?? null,
     panVerifiedAt: p.document?.panVerifiedAt ?? null,
+    panSkippedAt: p.document?.panSkippedAt ?? null,
+    panSkipReason: p.document?.panSkipReason ?? null,
     dlVerifiedAt: p.document?.dlVerifiedAt ?? null,
     dlSkippedAt: p.document?.dlSkippedAt ?? null,
     dlSkipReason: p.document?.dlSkipReason ?? null,

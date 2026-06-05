@@ -100,6 +100,14 @@ const verifyBankSchema = z.object({
   }),
 });
 
+/// Skip PAN/DL — optional free-text reason, no image / number. Used by the
+/// partner self-skip during onboarding.
+const skipSchema = z.object({
+  body: z.object({
+    reason: z.string().trim().max(200).optional(),
+  }),
+});
+
 module.exports = {
   generateAadhaarOtpSchema,
   submitAadhaarOtpSchema,
@@ -107,4 +115,5 @@ module.exports = {
   verifyPanSchema,
   verifyDlSchema,
   verifyBankSchema,
+  skipSchema,
 };

@@ -491,6 +491,50 @@ const findOnlineNearby = async ({ categoryId, lat, lng, radiusKm, limit = 50 }) 
   }, []);
 };
 
+/// Distance (km) to the NEAREST online partner of ANY category within
+/// `radiusKm` of (lat, lng), or null if none are online nearby. Powers the
+/// customer home "X mins away" arrival-promise badge — a general "someone
+/// can reach you" signal, not tied to a specific service. Scans every
+/// `partners:online:cat:*` pool with GEORADIUS COUNT 1 (cheap: a handful of
+/// small reads), takes the global minimum, and verifies the winner is still
+/// live (lastseen present) so a stale geo entry can't fake a low ETA.
+const nearestOnlinePartnerKm = async ({ lat, lng, radiusKm = 10 }) => {
+  return safe(async () => {
+    const pools = await redis.keys(onlineKey('*'));
+    if (!pools || pools.length === 0) return null;
+
+    /// Closest candidate per pool, then dedupe to the global nearest.
+    const candidates = [];
+    for (const key of pools) {
+      const rows = await redis.georadius(
+        key,
+        Number(lng),
+        Number(lat),
+        Number(radiusKm),
+        'km',
+        'WITHDIST',
+        'ASC',
+        'COUNT',
+        3, // a few per pool so a stale top entry doesn't block a live one
+      );
+      for (const [id, dist] of rows) {
+        candidates.push({ partnerId: Number(id), distanceKm: Number(dist) });
+      }
+    }
+    if (candidates.length === 0) return null;
+
+    candidates.sort((a, b) => a.distanceKm - b.distanceKm);
+    /// Liveness gate: walk nearest-first, return the first with a fresh
+    /// lastseen key. Cap the check at the closest few to keep it O(1)-ish.
+    const top = candidates.slice(0, 10);
+    const live = await redis.mget(...top.map((c) => lastSeenKey(c.partnerId)));
+    for (let i = 0; i < top.length; i += 1) {
+      if (live[i] !== null) return top[i].distanceKm;
+    }
+    return null;
+  }, null);
+};
+
 /// Add the given partner ids to the booking's visibleTo set and to
 /// each partner's reverse-index set. Two writes per dispatch wave (one
 /// forward, one reverse-fanned) is cheap; the gain is that partner
@@ -684,6 +728,7 @@ module.exports = {
   connectedPartnerIds,
   getOnlinePositions,
   findOnlineNearby,
+  nearestOnlinePartnerKm,
   recordVisible,
   listOffersForPartner,
   listPartnersForBooking,

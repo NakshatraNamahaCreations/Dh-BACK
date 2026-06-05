@@ -198,10 +198,15 @@ const DOCUMENT_FIELDS = [
   'selfieUrl',
 ];
 
+/// Activation gate. Aadhaar (identity) + Bank (payout) are MANDATORY. PAN
+/// and DL are skippable — each is satisfied by EITHER a verification OR a
+/// skip, so a partner can finish onboarding and complete them later from
+/// their profile. (Skipped still counts as incomplete for the profile
+/// nudge — that's a separate notion in partner-app/utils/onboarding.ts.)
 const hasRequiredPartnerDocuments = (document) =>
   Boolean(
     document?.aadharNumber &&
-    document?.panNumber &&
+    (document?.panVerifiedAt || document?.panSkippedAt) &&
     (document?.dlVerifiedAt || document?.dlSkippedAt) &&
     document?.bankAccount &&
     document?.bankIfsc,

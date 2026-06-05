@@ -1966,6 +1966,38 @@ exports.availability = async ({ customerId, id }) => {
   }
 };
 
+/// Arrival-promise ETA for the customer HOME badge. Finds the nearest
+/// online partner of ANY category near (lat, lng) and converts the distance
+/// to minutes. No booking required — it's a "someone can reach you in ~N
+/// min" promise. Returns { available, minutes } — `available:false` when no
+/// partner is online within range (the app then hides the badge rather than
+/// showing a fake number).
+///
+/// Formula: urban travel ≈ 20 km/h ≈ 3 min/km, plus a small prep/accept
+/// buffer, clamped to a sensible [MIN, MAX] band so it always reads as a
+/// crisp promise (never "0 min" or a scary large number).
+const ETA_RADIUS_KM = 10;
+const ETA_MIN_PER_KM = 3;
+const ETA_BASE_MIN = 2;
+const ETA_FLOOR_MIN = 8;
+const ETA_CAP_MIN = 30;
+exports.nearbyEta = async ({ lat, lng }) => {
+  const fallback = { available: false, minutes: null };
+  try {
+    if (lat == null || lng == null) return fallback;
+    const km = await dispatchRegistry
+      .nearestOnlinePartnerKm({ lat: Number(lat), lng: Number(lng), radiusKm: ETA_RADIUS_KM })
+      .catch(() => null);
+    if (km == null) return fallback;
+    const raw = Math.round(ETA_BASE_MIN + km * ETA_MIN_PER_KM);
+    const minutes = Math.min(ETA_CAP_MIN, Math.max(ETA_FLOOR_MIN, raw));
+    return { available: true, minutes };
+  } catch (err) {
+    console.warn(`[nearbyEta] ${err.message}`);
+    return fallback;
+  }
+};
+
 exports.adminGet = async (id) => {
   const b = await prisma.booking.findUnique({
     where: { id },

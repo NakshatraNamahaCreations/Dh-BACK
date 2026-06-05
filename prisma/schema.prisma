@@ -300,6 +300,11 @@ model PartnerDocument {
   kycNote         String?   // rejection reason or notes from provider
   aadharVerifiedAt DateTime?
   panVerifiedAt    DateTime?
+  /// PAN can be SKIPPED during onboarding (like DL) and completed later
+  /// from the partner's profile. Skipped satisfies the activation gate but
+  /// counts as incomplete for the profile-completion nudge.
+  panSkippedAt     DateTime?
+  panSkipReason    String?
   dlVerifiedAt     DateTime?
   dlSkippedAt      DateTime?
   dlSkipReason    String?
