@@ -49,6 +49,32 @@ const isPanComplete = (doc) => Boolean(doc?.panVerifiedAt || doc?.panSkippedAt);
 const hasRequiredDocuments = (doc) =>
   Boolean(doc?.aadharNumber && isPanComplete(doc) && isDlComplete(doc) && doc?.bankAccount && doc?.bankIfsc);
 
+/// Minimal PartnerDocument projection for LIST views. The directory /
+/// onboarding lists only render per-document STATUS + a bank last-4 +
+/// selfie — they never need the full row (no kycNote JSON blob, provider
+/// fields, holder names, address snapshots, raw image URLs beyond presence).
+/// `include: { document: true }` pulled Aadhaar/PAN/DL numbers, bank
+/// details and the provider JSON for every row on every page; this select
+/// is the exact set the list shapers read (enrichPartner + its helpers).
+const LIST_DOCUMENT_SELECT = {
+  // status / completeness signals
+  aadharNumber: true,
+  aadharImageUrl: true,
+  aadharVerifiedAt: true,
+  panNumber: true,
+  panImageUrl: true,
+  panVerifiedAt: true,
+  panSkippedAt: true,
+  dlNumber: true,
+  dlImageUrl: true,
+  dlVerifiedAt: true,
+  dlSkippedAt: true,
+  bankAccount: true, // sliced to last-4 in the shape, not exposed whole
+  bankIfsc: true,
+  kycStatus: true,
+  selfieUrl: true,
+};
+
 const onboardingStatus = (p) => {
   if (p.rejectedReason || !p.isActive) return 'rejected';
   if (p.isVerified) return 'approved';
@@ -207,6 +233,17 @@ exports.list = async ({ status, kyc, search, onDuty, dutyState, scope, page = 1,
   }
   if (kyc === 'verified') where.isVerified = true;
   if (kyc === 'pending') where.isVerified = false;
+  /// 'rejected' = has a rejection reason OR the document's kycStatus is
+  /// 'rejected' (mirrors the kycStatus() shape helper). Filtered in the DB
+  /// so pagination + total are correct — previously this filtered the
+  /// already-paged result, producing short pages and a wrong total.
+  if (kyc === 'rejected') {
+    where.OR = [
+      ...(where.OR ?? []),
+      { rejectedReason: { not: null } },
+      { document: { kycStatus: 'rejected' } },
+    ];
+  }
   if (search) {
     where.OR = [
       { name: { contains: search, mode: 'insensitive' } },
@@ -220,7 +257,10 @@ exports.list = async ({ status, kyc, search, onDuty, dutyState, scope, page = 1,
   const [items, total, categoryById] = await Promise.all([
     prisma.partner.findMany({
       where,
-      include: { document: true, cityRef: { select: { name: true, state: { select: { name: true, code: true } } } } },
+      include: {
+        document: { select: LIST_DOCUMENT_SELECT },
+        cityRef: { select: { name: true, state: { select: { name: true, code: true } } } },
+      },
       orderBy: { createdAt: 'desc' },
       skip: (page - 1) * pageSize,
       take: pageSize,
@@ -229,11 +269,12 @@ exports.list = async ({ status, kyc, search, onDuty, dutyState, scope, page = 1,
     categoryMap(),
   ]);
   const stats = await bookingStats(items.map((p) => p.id));
-  let data = items.map((p) => {
+  const data = items.map((p) => {
     const s = stats.get(p.id) ?? { jobs: 0, earnings: 0 };
     return enrichPartner(p, categoryById, s.jobs, s.earnings);
   });
-  if (kyc === 'rejected') data = data.filter((p) => p.kyc === 'rejected');
+  /// NOTE: the 'rejected' kyc filter now lives in the `where` above, so the
+  /// page + total are computed over the filtered set. No post-fetch filter.
 
   return {
     data,
@@ -597,12 +638,34 @@ exports.listOnboarding = async ({ status, search, scope, page = 1, pageSize = 25
       { city: { contains: search, mode: 'insensitive' } },
     ];
   }
+  /// Translate the onboardingStatus() derivation into WHERE clauses so the
+  /// status tab filters in the DB — page + total are then correct. (List is
+  /// already isVerified:false, so 'approved' can't occur here.) Previously
+  /// this filtered the already-paged rows, yielding short/empty pages and a
+  /// total that ignored the status filter. Mirrors onboardingStatus():
+  ///   rejected  = rejectedReason set OR not active
+  ///   in_review = active + no rejection + callVerified
+  ///   pending   = active + no rejection + not callVerified
+  if (status === 'rejected') {
+    where.OR = [...(where.OR ?? []), { rejectedReason: { not: null } }, { isActive: false }];
+  } else if (status === 'in_review') {
+    where.isActive = true;
+    where.rejectedReason = null;
+    where.callVerified = true;
+  } else if (status === 'pending') {
+    where.isActive = true;
+    where.rejectedReason = null;
+    where.callVerified = false;
+  }
   if (scope) applyScopeToWhere(where, scope);
 
   const [items, total, categoryById] = await Promise.all([
     prisma.partner.findMany({
       where,
-      include: { document: true, cityRef: { select: { name: true, state: { select: { name: true, code: true } } } } },
+      include: {
+        document: { select: LIST_DOCUMENT_SELECT },
+        cityRef: { select: { name: true, state: { select: { name: true, code: true } } } },
+      },
       orderBy: { createdAt: 'desc' },
       skip: (page - 1) * pageSize,
       take: pageSize,
@@ -611,7 +674,7 @@ exports.listOnboarding = async ({ status, search, scope, page = 1, pageSize = 25
     categoryMap(),
   ]);
 
-  let data = items.map((p) => ({
+  const data = items.map((p) => ({
     id: p.id,
     name: p.name ?? p.businessName ?? 'Unnamed partner',
     phone: p.phone,
@@ -639,7 +702,9 @@ exports.listOnboarding = async ({ status, search, scope, page = 1, pageSize = 25
       ? p.trainingCompletedAt.toISOString()
       : null,
   }));
-  if (status && status !== 'all') data = data.filter((a) => a.status === status);
+  /// NOTE: status filtering ('rejected' | 'in_review' | 'pending') now runs
+  /// in the WHERE clause above so the page/total are correct. 'all' (or no
+  /// status) returns every onboarding row. No post-fetch filter here.
 
   return {
     data,

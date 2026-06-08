@@ -908,14 +908,22 @@ async function handlePartnerOnboardingWebhook(event, entity) {
     return { ok: true, idempotent: true };
   }
 
-  await prisma.partner.update({
-    where: { id: partner.id },
-    data: {
-      paymentStatus: 'paid',
-      onboardingFeePaidAt: new Date(),
-      onboardingFeePaymentId: entity.id,
-      rejectedReason: null,
-    },
-  });
+  /// Flip to paid through the SAME guarded path the verified /verify call
+  /// uses, so the webhook can't bypass the onboarding prerequisites (call
+  /// verified, docs complete, admin fee set). Previously this did a raw
+  /// `paymentStatus: 'paid'` update that skipped those checks. If a guard
+  /// isn't satisfied yet (e.g. payment captured before docs were finished)
+  /// we soft-skip rather than 500 — Razorpay would otherwise retry-storm.
+  /// The partner stays unpaid until they're eligible; the explicit /verify
+  /// call (or a webhook redelivery) reconciles once prerequisites are met.
+  const authService = require('../auth/auth.service');
+  try {
+    await authService.partnerPaymentDone(partner.id, { paymentId: entity.id });
+  } catch (err) {
+    if (err && err.statusCode === 403) {
+      return { ok: true, skipped: 'prerequisites_not_met' };
+    }
+    throw err;
+  }
   return { ok: true };
 }

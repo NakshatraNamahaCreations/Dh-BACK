@@ -263,7 +263,14 @@ const updateMe = async ({ sub, type }, data) => {
 // (this fn) → admin marks training done → admin activates. Activation
 // lives in `partners.approve` (admin endpoint); we only flip the
 // payment columns here.
-const partnerPaymentDone = async (partnerId) => {
+/// `paymentId` (optional) records the Razorpay payment id when this is
+/// driven by the verified /verify call or the signed webhook backup path.
+/// This function NEVER verifies a payment itself — callers MUST have proven
+/// the payment first (signature check). It only flips the partner's payment
+/// columns once the onboarding prerequisites (call verified, docs complete,
+/// fee set by admin) are satisfied. The legacy unverified self-confirm route
+/// was removed; the only entry points now are the signature-verified ones.
+const partnerPaymentDone = async (partnerId, { paymentId } = {}) => {
   const partner = await prisma.partner.findUnique({
     where: { id: partnerId },
     include: PARTNER_INCLUDE,
@@ -290,6 +297,7 @@ const partnerPaymentDone = async (partnerId) => {
     data: {
       paymentStatus: 'paid',
       onboardingFeePaidAt: new Date(),
+      ...(paymentId ? { onboardingFeePaymentId: paymentId } : {}),
       /// Don't touch isActive / isVerified here — admin still needs
       /// to mark training complete, then activate. Clear the
       /// rejectedReason so a previously-rejected partner who fixed

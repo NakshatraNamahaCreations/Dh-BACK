@@ -12,6 +12,22 @@ const baseShape = (c) => ({
   updatedAt: c.updatedAt,
 });
 
+/// Exactly the columns baseShape() emits for the directory list. Without
+/// this select the list `findMany` pulled the whole customer row —
+/// including the Expo push tokens (and any other large/unused columns) —
+/// for every customer, and the spend/bookings sort loads ALL matching
+/// customers, so the waste compounds. The list table never renders push
+/// tokens; project to just what it shows.
+const LIST_SELECT = {
+  id: true,
+  phone: true,
+  name: true,
+  email: true,
+  isActive: true,
+  createdAt: true,
+  updatedAt: true,
+};
+
 // ── Directory list ─────────────────────────────────────────────────────────
 //
 // Returns a paginated list of customers enriched with a booking-stats block:
@@ -49,6 +65,7 @@ exports.list = async ({
     const [rows, total] = await Promise.all([
       prisma.customer.findMany({
         where,
+        select: LIST_SELECT,
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * pageSize,
         take: pageSize,
@@ -62,7 +79,7 @@ exports.list = async ({
     };
   }
 
-  const all = await prisma.customer.findMany({ where });
+  const all = await prisma.customer.findMany({ where, select: LIST_SELECT });
   const enriched = await enrichWithStats(all);
   enriched.sort((a, b) => {
     if (sort === 'spend') return b.totalSpent - a.totalSpent;

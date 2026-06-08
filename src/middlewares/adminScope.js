@@ -122,9 +122,36 @@ const applyScopeToRelation = (where, scope, relation) => {
   return where;
 };
 
+/// Assert that a single record is within the admin's city scope, for
+/// DETAIL / MUTATION endpoints (get, update, suspend, approve…). List
+/// endpoints filter in the WHERE clause; single-record endpoints must
+/// check explicitly or a scoped admin could read/modify a partner or
+/// customer outside their assigned cities by guessing the id.
+///
+/// `scope` is the result of `scopeByAdmin(req)`. `recordCityIds` is the
+/// set of cityIds the record belongs to:
+///   - Partner: `[partner.cityId]` (direct column; may be [null]).
+///   - Customer: the cityIds of the customer's bookings.
+/// SUPER admins (scope.cityIds == null) always pass. A scoped admin
+/// passes only if at least one of the record's cityIds is in their set.
+/// A record with no resolvable city (e.g. brand-new partner with no
+/// cityId, or a customer with no bookings) is OUT of scope for a scoped
+/// admin — fail closed, consistent with `scopeByAdmin` returning [] for
+/// an unassigned manager.
+const assertInScope = (scope, recordCityIds) => {
+  if (!scope || scope.cityIds == null) return; // SUPER / unscoped → allow
+  const allow = new Set(scope.cityIds);
+  const cities = (recordCityIds ?? []).filter((id) => id != null);
+  const ok = cities.some((id) => allow.has(id));
+  if (!ok) {
+    throw ApiError.forbidden('This record is outside your assigned cities.');
+  }
+};
+
 module.exports = {
   requireRole,
   scopeByAdmin,
   applyScopeToWhere,
   applyScopeToRelation,
+  assertInScope,
 };

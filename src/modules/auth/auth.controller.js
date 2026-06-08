@@ -45,11 +45,6 @@ exports.registerPushToken = asyncHandler(async (req, res) => {
   success(res, { ok: true });
 });
 
-exports.partnerPaymentDone = asyncHandler(async (req, res) => {
-  const result = await authService.partnerPaymentDone(req.user.sub);
-  success(res, result, 'Payment confirmed. Welcome to Dhoond!');
-});
-
 /// Mint a Razorpay order for the partner's onboarding fee. The amount
 /// comes from Partner.onboardingFeeAmount (set by admin); the partner
 /// app uses the returned order id + key id to open Razorpay Checkout.
