@@ -1,7 +1,7 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
 const { authenticate, requireType, requirePermission } = require('../../middlewares/auth');
-const { cancellationSchema, refundSchema, dispatchSchema } = require('./policy.validator');
+const { cancellationSchema, refundSchema, dispatchSchema, appVersionsSchema } = require('./policy.validator');
 const controller = require('./policy.controller');
 
 const router = express.Router();
@@ -16,5 +16,8 @@ router.put('/refund', adminOnly, requirePermission('refund.edit'), validate(refu
 
 router.get('/dispatch', adminOnly, requirePermission('policy.view'), controller.getDispatch);
 router.put('/dispatch', adminOnly, requirePermission('policy.edit'), validate(dispatchSchema), controller.saveDispatch);
+
+router.get('/app-versions', adminOnly, requirePermission('policy.view'), controller.getAppVersions);
+router.put('/app-versions', adminOnly, requirePermission('policy.edit'), validate(appVersionsSchema), controller.saveAppVersions);
 
 module.exports = router;

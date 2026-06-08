@@ -39,4 +39,23 @@ const dispatchSchema = z.object({
   }),
 });
 
-module.exports = { cancellationSchema, refundSchema, dispatchSchema };
+/// App-version config per app. Versions are dotted semver-ish strings
+/// (e.g. "1.2.0"); the apps compare them numerically part-by-part.
+const semver = z
+  .string()
+  .trim()
+  .regex(/^\d+(\.\d+){0,3}$/, 'Version must be like 1.2.0');
+const appBlock = z.object({
+  latestVersion: semver,
+  minVersion: semver,
+  storeUrl: z.string().trim().url(),
+  message: z.string().trim().max(300).optional().default(''),
+});
+const appVersionsSchema = z.object({
+  body: z.object({
+    customer: appBlock,
+    partner: appBlock,
+  }),
+});
+
+module.exports = { cancellationSchema, refundSchema, dispatchSchema, appVersionsSchema };

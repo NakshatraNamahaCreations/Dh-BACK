@@ -20,6 +20,7 @@ const logger = require('../../config/logger');
 const CANCELLATION_KEY = 'cancellation_policy';
 const REFUND_KEY = 'refund_policy';
 const DISPATCH_KEY = 'dispatch_config';
+const APP_VERSIONS_KEY = 'app_version_config';
 
 const DEFAULT_CANCELLATION = {
   freeWindowMins: 5,
@@ -50,6 +51,29 @@ const DEFAULT_REFUND = {
 /// stored value is missing or malformed.
 const DEFAULT_DISPATCH = {
   radii: [3, 5, 7],
+};
+
+/// In-app update config, per app. The apps fetch this on launch and compare
+/// their own version against it:
+///   version < minVersion    → BLOCKING "Update required" (can't dismiss)
+///   version < latestVersion → dismissible "Update available" prompt
+/// `storeUrl` opens the Play Store listing. Admin bumps these after each
+/// Play Store release. Defaults keep the apps working (no prompt) when the
+/// row is absent — minVersion '0.0.0' never blocks, latest matches typical
+/// first release so nobody is nagged until admin sets real values.
+const DEFAULT_APP_VERSIONS = {
+  customer: {
+    latestVersion: '1.0.0',
+    minVersion: '0.0.0',
+    storeUrl: 'https://play.google.com/store/apps/details?id=com.dhoond.customer',
+    message: '',
+  },
+  partner: {
+    latestVersion: '1.0.0',
+    minVersion: '0.0.0',
+    storeUrl: 'https://play.google.com/store/apps/details?id=com.dhoond.partner',
+    message: '',
+  },
 };
 
 /// Read a settings key, falling back to `fallback` on absence or any
@@ -99,6 +123,20 @@ exports.getDispatch = async () => {
 };
 exports.saveDispatch = async (config) => writeSetting(DISPATCH_KEY, config);
 exports.DEFAULT_DISPATCH = DEFAULT_DISPATCH;
+
+/// Full app-version config (both apps) — for the admin editor.
+exports.getAppVersions = async () => readSetting(APP_VERSIONS_KEY, DEFAULT_APP_VERSIONS);
+exports.saveAppVersions = async (config) => writeSetting(APP_VERSIONS_KEY, config);
+exports.DEFAULT_APP_VERSIONS = DEFAULT_APP_VERSIONS;
+
+/// Single-app config served to the launching app. `app` is 'customer' |
+/// 'partner'; anything else falls back to the customer block. Returns just
+/// that app's { latestVersion, minVersion, storeUrl, message }.
+exports.getAppConfig = async (app) => {
+  const all = await exports.getAppVersions();
+  const key = app === 'partner' ? 'partner' : 'customer';
+  return { ...DEFAULT_APP_VERSIONS[key], ...(all[key] ?? {}) };
+};
 
 /// Pure fee math, exported separately so it's unit-testable without a
 /// DB and reusable by both the cancel flow and the customer-app quote

@@ -66,4 +66,9 @@ router.use('/partners/:partnerId/kyc', kycAdminRoutes);
 router.use('/partners/me/notifications', partnerNotificationRoutes);
 router.use('/push-broadcasts', pushBroadcastRoutes);
 
+/// PUBLIC app-update config — the customer/partner apps fetch this on
+/// launch (before login) to decide whether to show an "Update available"
+/// or "Update required" prompt. No auth: it's a launch gate. `?app=`.
+router.get('/app-config', require('../modules/policy/policy.controller').getAppConfig);
+
 module.exports = router;

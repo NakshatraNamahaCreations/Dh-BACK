@@ -42,6 +42,16 @@ const schema = z.object({
   SMS_ROUTE: z.coerce.number().int().default(2),
   SMS_COUNTRY: z.coerce.number().int().default(0),
 
+  // ----- Play Store / App Store review login bypass -----
+  // A SINGLE whitelisted phone number that accepts a FIXED OTP without an
+  // SMS being sent — so the app-store reviewer can log in (the app is
+  // OTP-gated and Google can't receive a real SMS). Scoped to exactly this
+  // number; every other login is unaffected. Leave both unset to disable.
+  // Set REVIEW_LOGIN_PHONE to the full number as the app sends it
+  // (e.g. "+919999900000") and REVIEW_LOGIN_OTP to the fixed code.
+  REVIEW_LOGIN_PHONE: z.string().optional(),
+  REVIEW_LOGIN_OTP: z.string().optional(),
+
   // S3 / object storage — optional. If unset, the uploads module returns
   // an explanatory error instead of crashing on boot.
   S3_REGION: z.string().optional(),

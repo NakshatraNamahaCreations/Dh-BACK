@@ -31,3 +31,21 @@ exports.saveDispatch = asyncHandler(async (req, res) => {
   const data = await service.saveDispatch(req.body);
   success(res, data, 'Dispatch config saved');
 });
+
+/// PUBLIC — the launching app fetches its update config (no auth; called
+/// before login). `?app=customer|partner`.
+exports.getAppConfig = asyncHandler(async (req, res) => {
+  const data = await service.getAppConfig(req.query.app);
+  success(res, data, 'App config fetched');
+});
+
+/// Admin editor — full both-apps config.
+exports.getAppVersions = asyncHandler(async (_req, res) => {
+  const data = await service.getAppVersions();
+  success(res, data, 'App versions fetched');
+});
+
+exports.saveAppVersions = asyncHandler(async (req, res) => {
+  const data = await service.saveAppVersions(req.body);
+  success(res, data, 'App versions saved');
+});

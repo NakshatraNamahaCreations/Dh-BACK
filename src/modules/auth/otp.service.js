@@ -14,6 +14,16 @@ const OTP_MAX_ATTEMPTS = 5;
 /// zero from in transit.
 const generateCode = () => String(Math.floor(1000 + Math.random() * 9000));
 
+/// App-store REVIEW account. When the request is for the single whitelisted
+/// number, we skip the SMS send and accept a fixed OTP — so the Play/App
+/// Store reviewer can log into the OTP-gated app without receiving a real
+/// SMS. Active only when BOTH env vars are set, and matches ONLY that exact
+/// phone, so real users are never affected.
+const isReviewPhone = (phone) =>
+  Boolean(env.REVIEW_LOGIN_PHONE) &&
+  Boolean(env.REVIEW_LOGIN_OTP) &&
+  String(phone) === String(env.REVIEW_LOGIN_PHONE);
+
 /// Delivers the OTP via yourbulksms.com when SMS_AUTHKEY is set; falls
 /// back to console-logging in dev/unconfigured setups so onboarding
 /// engineers and QA can self-serve. In production the SMS provider is
@@ -31,6 +41,13 @@ const sendSms = async (phone, code) => {
 };
 
 const requestOtp = async ({ phone, userType }) => {
+  /// Review account — no SMS, no DB record. Just acknowledge so the
+  /// reviewer's app proceeds to the OTP-entry screen, where the fixed code
+  /// is accepted in verifyOtp.
+  if (isReviewPhone(phone)) {
+    return { expiresInSeconds: OTP_TTL_MIN * 60 };
+  }
+
   const recent = await prisma.otp.findFirst({
     where: { phone, userType, consumed: false },
     orderBy: { createdAt: 'desc' },
@@ -84,6 +101,12 @@ const requestOtp = async ({ phone, userType }) => {
 };
 
 const verifyOtp = async ({ phone, userType, code }) => {
+  /// Review account — accept the fixed OTP, no DB OTP record involved.
+  if (isReviewPhone(phone)) {
+    if (String(code).trim() === String(env.REVIEW_LOGIN_OTP)) return;
+    throw ApiError.badRequest('Invalid OTP');
+  }
+
   const otp = await prisma.otp.findFirst({
     where: { phone, userType, consumed: false },
     orderBy: { createdAt: 'desc' },
