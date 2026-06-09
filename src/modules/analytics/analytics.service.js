@@ -243,6 +243,153 @@ exports.revenueReport = async ({ range = '30d' } = {}, scope) => {
   };
 };
 
+// ── Booking report ───────────────────────────────────────────────────────────
+//
+// A filterable, exportable booking ledger with a full earnings breakup.
+// Filters: explicit from/to dates (falls back to `range`), stateId, cityId,
+// customerId, partnerId, status. Every filter composes into one Prisma WHERE
+// and stays inside the admin's city scope.
+//
+// Earnings model (whole rupees, per the Booking pricing snapshot):
+//   total        — partner-facing job amount (commission + earning base)
+//   partnerEarn  — PartnerEarning.earnedAmount for completed jobs (the
+//                  partner's actual credited share). 0 when not completed.
+//   commission   — total − partnerEarn (Dhoond's cut of the job amount)
+//   platformFee  — 2% platform fee charged on top (Dhoond income)
+//   gstAmount    — 18% GST (government pass-through, NOT Dhoond income)
+//   dhoondEarn   — commission + platformFee
+//   grandTotal   — what the customer paid = total + gst + platformFee
+//
+// `refunds` is the grandTotal of CANCELLED bookings (money returned), shown
+// separately from the earnings of live/completed bookings.
+
+const parseDate = (v) => {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+exports.bookingReport = async (query = {}, scope) => {
+  const { stateId, cityId, customerId, partnerId, status } = query;
+
+  // Date window — explicit from/to wins; otherwise fall back to `range`.
+  const from = parseDate(query.from);
+  const to = parseDate(query.to);
+  let createdAt;
+  if (from || to) {
+    createdAt = {};
+    if (from) { from.setHours(0, 0, 0, 0); createdAt.gte = from; }
+    if (to) { to.setHours(23, 59, 59, 999); createdAt.lte = to; }
+  } else {
+    const r = dateFromRange(query.range ?? '30d');
+    createdAt = { gte: r.from };
+  }
+
+  // City scope: an explicit cityId filter must still respect the admin's
+  // scope. If a stateId is given, resolve its cities and AND them in.
+  const where = withCityScope({ createdAt }, scope);
+  if (customerId) where.customerId = Number(customerId);
+  if (partnerId) where.partnerId = Number(partnerId);
+  if (status) where.status = status;
+
+  if (cityId) {
+    where.cityId = Number(cityId);
+  } else if (stateId) {
+    const cities = await prisma.city.findMany({
+      where: { stateId: Number(stateId) },
+      select: { id: true },
+    });
+    const ids = cities.map((c) => c.id);
+    // Empty state → no rows (rather than silently ignoring the filter).
+    where.cityId = { in: ids.length ? ids : [-1] };
+  }
+
+  const bookings = await prisma.booking.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    include: {
+      customer: { select: { id: true, name: true, phone: true } },
+      partner: { select: { id: true, name: true, businessName: true, phone: true } },
+      /// `cityRef` is the City relation (cityId FK). The scalar `city`
+      /// column is the legacy free-text snapshot, used as fallback.
+      cityRef: { select: { id: true, name: true, state: { select: { id: true, name: true } } } },
+      earning: { select: { earnedAmount: true, commissionPct: true } },
+      items: { include: { service: { select: { name: true, category: { select: { name: true } } } } } },
+    },
+  });
+
+  const rows = bookings.map((b) => {
+    const isCancelled = b.status === 'CANCELLED';
+    const partnerEarn = b.earning?.earnedAmount ?? 0;
+    // Commission only makes sense once a partner share exists (completed).
+    // For non-completed/non-cancelled rows we still show the job amount but
+    // leave the split at 0 so totals aren't inflated by unrealised revenue.
+    const commission = b.earning ? Math.max(0, b.total - partnerEarn) : 0;
+    const platformFee = b.platformFee ?? 0;
+    const gst = b.gstAmount ?? 0;
+    const dhoondEarn = commission + platformFee;
+    const services = b.items.map((it) => it.service?.name).filter(Boolean).join(', ');
+    const category = b.items[0]?.service?.category?.name ?? '—';
+
+    return {
+      id: b.id,
+      bookingRef: b.bookingRef ?? `#${b.id}`,
+      date: b.createdAt,
+      scheduledAt: b.scheduledAt,
+      status: b.status,
+      paymentStatus: b.paymentStatus,
+      paymentMethod: b.paymentMethod,
+      customerId: b.customer?.id ?? b.customerId,
+      customerName: b.customer?.name ?? '—',
+      customerPhone: b.customer?.phone ?? '',
+      partnerId: b.partner?.id ?? null,
+      partnerName: b.partner?.name ?? b.partner?.businessName ?? '—',
+      partnerPhone: b.partner?.phone ?? '',
+      stateId: b.cityRef?.state?.id ?? null,
+      state: b.cityRef?.state?.name ?? '—',
+      cityId: b.cityRef?.id ?? null,
+      city: b.cityRef?.name ?? b.city ?? '—',
+      category,
+      services,
+      // Money (whole rupees)
+      jobAmount: b.total,
+      partnerEarning: isCancelled ? 0 : partnerEarn,
+      commission: isCancelled ? 0 : commission,
+      platformFee: isCancelled ? 0 : platformFee,
+      gst: isCancelled ? 0 : gst,
+      dhoondEarning: isCancelled ? 0 : dhoondEarn,
+      grandTotal: b.grandTotal,
+      refund: isCancelled ? b.grandTotal : 0,
+    };
+  });
+
+  // Totals (live/completed feed the earnings split; cancelled feed refunds).
+  const totals = rows.reduce(
+    (t, r) => {
+      t.bookings += 1;
+      if (r.status === 'COMPLETED') t.completed += 1;
+      else if (r.status === 'CANCELLED') t.cancelled += 1;
+      t.jobAmount += r.jobAmount;
+      t.partnerEarning += r.partnerEarning;
+      t.commission += r.commission;
+      t.platformFee += r.platformFee;
+      t.gst += r.gst;
+      t.dhoondEarning += r.dhoondEarning;
+      t.grandTotal += r.grandTotal;
+      t.refund += r.refund;
+      return t;
+    },
+    {
+      bookings: 0, completed: 0, cancelled: 0,
+      jobAmount: 0, partnerEarning: 0, commission: 0,
+      platformFee: 0, gst: 0, dhoondEarning: 0, grandTotal: 0, refund: 0,
+    },
+  );
+  totals.takeRate = totals.jobAmount > 0 ? totals.dhoondEarning / totals.jobAmount : 0;
+
+  return { rows, totals };
+};
+
 // ── Partner performance ────────────────────────────────────────────────────
 
 exports.partnerPerformance = async ({ range = '30d' } = {}, scope) => {

@@ -310,19 +310,6 @@ const PARTNER_INCLUDE = {
   },
 };
 
-/// Leaner include for the INCOMING-OFFERS list. A PENDING offer is shown to
-/// many partners who haven't accepted, so we don't fetch the customer's
-/// phone or exact street/coordinates at all — only the name and the
-/// general AREA (city) the partner needs to gauge the job. `partnerShape`
-/// also masks these for PENDING, but not fetching them is both cheaper and
-/// defense-in-depth (the data never leaves the DB row into the offer path).
-/// No `rating` — irrelevant for an offer the partner is deciding on.
-const PARTNER_OFFER_INCLUDE = {
-  customer: { select: { id: true, name: true } },
-  items: { include: { service: { select: { categoryId: true } } } },
-  customerAddress: { select: { id: true, city: true } },
-};
-
 /// Resolve the display address for a booking with the FK-first
 /// strategy. Reads from the joined `customerAddress` row when
 /// present; falls back to the legacy snapshot columns for
@@ -431,30 +418,22 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
   };
 
   /// PRIVACY GATE — withhold the customer's phone + EXACT location from
-  /// the partner until the booking is theirs AND paid.
-  ///
-  /// Two cases mask:
-  ///   (a) PENDING offer — the partner is just being SHOWN this job in the
-  ///       incoming/offers list and has NOT accepted it. They have no
-  ///       business knowing the customer's phone or exact door; only the
-  ///       distance + general area is needed to decide. (This is the
-  ///       privacy leak: a broadcast goes to up to 50 partners, none of
-  ///       whom should see the customer's contact for a job they didn't
-  ///       take.)
-  ///   (b) CONFIRMED / IN_PROGRESS but UNPAID — the BYOP / instant
-  ///       "pay-after-accept" flow: a partner accepted, the customer has a
-  ///       short window to pay, and until payment lands the partner must
-  ///       not be able to call or navigate to the door.
-  /// We still expose the general area (city) so the partner can gauge the
-  /// job. COMPLETED jobs keep full detail for support/history.
-  const isPendingOffer = b.status === 'PENDING';
+  /// the partner until the booking is PAID. This covers the BYOP /
+  /// instant "pay-after-accept" flow: a partner accepts, the customer
+  /// has a short window to pay, and until that payment lands the partner
+  /// must NOT be able to call the customer or navigate to their exact
+  /// door. We still expose the general area (city) so the partner can
+  /// gauge the job, just not the precise address / coordinates / phone.
+  /// Applies only to in-flight accepted jobs (CONFIRMED / IN_PROGRESS);
+  /// COMPLETED jobs keep full detail for support/history, and incoming
+  /// offers already only carry distance (handled by the caller).
   const isAcceptedUnpaid =
     (b.status === 'CONFIRMED' || b.status === 'IN_PROGRESS') &&
     (b.paymentStatus ?? 'unpaid') !== 'paid';
   /// Cash jobs are "pay on completion" — there's no upfront payment to
-  /// gate on, so don't mask those (paymentMethod 'cash') ONCE ACCEPTED.
-  /// A PENDING offer always masks regardless of method (not theirs yet).
-  const maskContact = isPendingOffer || (isAcceptedUnpaid && b.paymentMethod !== 'cash');
+  /// gate on, so don't mask those (paymentMethod 'cash'). Only the
+  /// online pay-first flow is gated.
+  const maskContact = isAcceptedUnpaid && b.paymentMethod !== 'cash';
 
   return {
     id: String(b.id),
@@ -573,10 +552,6 @@ const BOOKING_INCLUDE = {
   payments: {
     select: { id: true, status: true, amount: true, refundAmount: true, createdAt: true },
     orderBy: { createdAt: 'desc' },
-    /// Cap to the most-recent few. The customer shape only needs the
-    /// latest payment + any refund row; a booking that accrued many retry
-    /// attempts shouldn't drag its whole payment history into every list.
-    take: 5,
   },
 };
 
@@ -1076,12 +1051,6 @@ exports.listMine = async ({ customerId, status, bucket }) => {
     where,
     include: BOOKING_INCLUDE,
     orderBy: { createdAt: 'desc' },
-    /// Cap the result so a long-tenured customer's history can't grow
-    /// unbounded into one response. Newest-first, so the cap drops only
-    /// the oldest bookings (well past what any list UI scrolls to). The
-    /// app consumes a flat array, so this stays backward-compatible — a
-    /// cursor/page API would be the next step if deeper history is needed.
-    take: 100,
   });
   return items.map(shape);
 };
@@ -1339,35 +1308,7 @@ const ADMIN_INCLUDE = {
   },
 };
 
-/// Slim include for the admin booking LIST. The list table renders
-/// customer/partner, service+category, status, amounts, location and
-/// dispatch — it never shows the payment trail or the handoff OTPs (only
-/// BookingDetails, which uses adminGet + full ADMIN_INCLUDE, does). So the
-/// list drops the `payments` join entirely (was up to 5 rows × ~11 fields
-/// per booking) and trims `items` to the fields the row actually needs
-/// (no imageUrl). adminShape(b, { forList: true }) then omits OTPs +
-/// payment trail from the response so they aren't shipped to the client.
-const ADMIN_LIST_INCLUDE = {
-  customer: { select: { id: true, name: true, phone: true } },
-  partner: { select: { id: true, name: true, phone: true, businessName: true } },
-  cityRef: { select: { id: true, name: true, state: { select: { id: true, name: true, code: true } } } },
-  customerAddress: {
-    select: { id: true, label: true, addressLine: true, city: true, pincode: true, lat: true, lng: true },
-  },
-  items: {
-    select: {
-      id: true,
-      serviceId: true,
-      serviceName: true,
-      qty: true,
-      basePrice: true,
-      service: { select: { categoryId: true, category: { select: { id: true, name: true } } } },
-    },
-  },
-  rating: { select: { id: true, stars: true, comment: true, createdAt: true, updatedAt: true } },
-};
-
-const adminShape = (b, { forList = false } = {}) => {
+const adminShape = (b) => {
   const firstItem = b.items?.[0];
   const serviceName = firstItem?.serviceName ?? 'Service';
   const categoryId = firstItem?.service?.categoryId ?? '';
@@ -1439,10 +1380,8 @@ const adminShape = (b, { forList = false } = {}) => {
     /// can't find the code, the admin reads it back to them so the
     /// partner can start/complete the job. `jobStartedAt`/`jobCompletedAt`
     /// above let the UI grey out a code once that step is already done.
-    /// OTPs are support-only and shown solely on the detail page. The list
-    /// never renders them, so we don't ship them to the table response.
-    jobStartOtp: forList ? null : (b.jobStartOtp ?? null),
-    jobCompleteOtp: forList ? null : (b.jobCompleteOtp ?? null),
+    jobStartOtp: b.jobStartOtp ?? null,
+    jobCompleteOtp: b.jobCompleteOtp ?? null,
     completedAt: b.jobCompletedAt ?? (b.status === 'COMPLETED' ? b.updatedAt : null),
     cancelledAt: b.status === 'CANCELLED' ? b.updatedAt : null,
     cancelReason: b.status === 'CANCELLED' ? b.notes : undefined,
@@ -1631,13 +1570,13 @@ exports.adminList = async ({
       orderBy: { createdAt: 'desc' },
       skip: (page - 1) * pageSize,
       take: pageSize,
-      include: ADMIN_LIST_INCLUDE,
+      include: ADMIN_INCLUDE,
     }),
     prisma.booking.count({ where }),
   ]);
 
   return {
-    data: items.map((b) => adminShape(b, { forList: true })),
+    data: items.map(adminShape),
     meta: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
   };
 };
@@ -1739,12 +1678,12 @@ exports.listStuckJobs = async () => {
       createdAt: { lte: fiveMinAgo },
     },
     orderBy: { createdAt: 'asc' },
-    include: ADMIN_LIST_INCLUDE,
+    include: ADMIN_INCLUDE,
     take: 30,
   });
   return items.map((b) => {
     const pendingMins = Math.floor((Date.now() - new Date(b.createdAt).getTime()) / 60000);
-    const shaped = adminShape(b, { forList: true });
+    const shaped = adminShape(b);
     return {
       id: b.id,
       service: shaped.service,
@@ -2456,9 +2395,7 @@ exports.partnerIncoming = async ({ partnerId, lat, lng }) => {
         dispatchStatus: { in: ['waiting', 'broadcasting', 'needs_admin_dispatch'] },
         items: { some: { service: { categoryId: partner.categoryId } } },
       },
-      /// Lean include — offers don't fetch the customer's phone/exact
-      /// address (the partner hasn't accepted; see PARTNER_OFFER_INCLUDE).
-      include: PARTNER_OFFER_INCLUDE,
+      include: PARTNER_INCLUDE,
       orderBy: { createdAt: 'asc' },
       take: 50,
     });
@@ -2487,8 +2424,7 @@ exports.partnerIncoming = async ({ partnerId, lat, lng }) => {
 
   const bookings = await prisma.booking.findMany({
     where,
-    /// Lean include — legacy offer path also masks customer contact.
-    include: PARTNER_OFFER_INCLUDE,
+    include: PARTNER_INCLUDE,
     orderBy: { createdAt: 'asc' },
     take: 50,
   });

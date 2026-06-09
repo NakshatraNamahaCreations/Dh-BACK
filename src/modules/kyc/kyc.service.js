@@ -602,24 +602,38 @@ exports.verifyDrivingLicense = async ({ partnerId, dlNumber, dob, imageUrl: card
   }
 
   /// OCR + QuickeKYC in parallel — same pattern as PAN.
-  /// OCR is a SOFT gate for DL: tesseract.js has accuracy issues reading
-  /// DL numbers from glossy laminated cards (glare, font, proximity to
-  /// photo), so a real DL can fail OCR even when QuickeKYC + name-match
-  /// would happily verify it. We still run OCR for logging / future
-  /// audit, but rely on the RTO verification + Aadhaar-name-match below
-  /// to catch the real abuse cases (someone uploading another person's
-  /// DL). If OCR fails on a wrong upload, QuickeKYC will return
-  /// "not found" anyway.
+  /// OCR is a HARD gate for DL: the uploaded photo must actually contain
+  /// the DL number, otherwise a partner can pass verification with any
+  /// random image (a screenshot, another doc, a photo of a screen) as
+  /// long as they TYPE a real DL number — QuickeKYC only checks the
+  /// typed number against RTO records, never the photo. The number
+  /// matcher has four escalating fallback strategies (exact → fuzzy →
+  /// digits → last-8-digits) precisely so glossy/laminated cards with
+  /// glare still match, which keeps false-rejections of genuine cards
+  /// low while still rejecting wrong uploads.
+  ///
+  /// `.catch(() => ({ found: true, infraError: true }))` keeps an
+  /// infrastructure failure (image URL unreachable, OCR worker crash)
+  /// from hard-blocking a real partner — those throw, and we'd rather
+  /// fall back to the RTO + Aadhaar-name-match gate than reject on an
+  /// S3 hiccup. A clean `found: false` means OCR ran and the number is
+  /// genuinely absent — that we DO reject.
   const ocr = require('./ocr.service');
   const [ocrResult, apiResult] = await Promise.all([
-    ocr.numberExistsInImage(cardImageUrl, dl).catch(() => ({ found: true })),
+    ocr.numberExistsInImage(cardImageUrl, dl).catch((err) => {
+      logger.warn(`[kyc.dl] OCR errored for DL ${dl} — passing on infra failure: ${err.message}`);
+      return { found: true, infraError: true };
+    }),
     post('/api/v1/driving-license/driving-license', { id_number: dl, dob: dobForApi }),
   ]);
 
   if (!ocrResult.found) {
     logger.warn(
-      `[kyc.dl] OCR could not detect DL number ${dl} on uploaded image — ` +
-      `proceeding because QuickeKYC + name-match will gate identity.`,
+      `[kyc.dl] OCR could not detect DL number ${dl} on uploaded image — rejecting upload.`,
+    );
+    throw ApiError.badRequest(
+      "We couldn't read your driving license number in the photo. Please upload a clear, " +
+      'well-lit photo of your actual driving license (not a screenshot or another document).',
     );
   }
 

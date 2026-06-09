@@ -1,7 +1,7 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
 const { authenticate, requireType } = require('../../middlewares/auth');
-const { rangeQuerySchema, customerRangeQuerySchema } = require('./analytics.validator');
+const { rangeQuerySchema, customerRangeQuerySchema, bookingReportQuerySchema } = require('./analytics.validator');
 const controller = require('./analytics.controller');
 
 const router = express.Router();
@@ -14,5 +14,6 @@ router.get('/bookings', adminOnly, validate(rangeQuerySchema), controller.bookin
 router.get('/revenue', adminOnly, validate(rangeQuerySchema), controller.revenue);
 router.get('/partners', adminOnly, validate(rangeQuerySchema), controller.partners);
 router.get('/customers', adminOnly, validate(customerRangeQuerySchema), controller.customers);
+router.get('/booking-report', adminOnly, validate(bookingReportQuerySchema), controller.bookingReport);
 
 module.exports = router;

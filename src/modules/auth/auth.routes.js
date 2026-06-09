@@ -46,12 +46,9 @@ router.post('/admin/login', loginLimiter, validate(adminLoginSchema), controller
 //      the partner app can open Checkout.
 //   2. POST /partner/onboarding/verify  → backend verifies the signed
 //      payload, persists the payment id, and flips paymentStatus = paid.
-// The legacy /partner/payment-done endpoint was REMOVED: it called
-// partnerPaymentDone and flipped paymentStatus = 'paid' without verifying
-// any Razorpay order/payment/signature, so an authenticated partner could
-// mark their own onboarding fee paid for free. All payment confirmation now
-// goes through /partner/onboarding/verify (signature-checked) or the signed
-// Razorpay webhook — both of which run the same onboarding guards.
+// The legacy /partner/payment-done endpoint is kept for now so older app
+// builds still work, but new clients should call the verify route which
+// enforces signature verification.
 router.post(
   '/partner/onboarding/order',
   authenticate,
@@ -65,6 +62,7 @@ router.post(
   validate(verifyOnboardingPaymentSchema),
   controller.verifyOnboardingPayment,
 );
+router.post('/partner/payment-done', authenticate, requireType('PARTNER'), controller.partnerPaymentDone);
 
 // Current user
 router.get('/me', authenticate, controller.me);

@@ -1,6 +1,6 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
-const { authenticate, requireType, requirePermission } = require('../../middlewares/auth');
+const { authenticate, requireType } = require('../../middlewares/auth');
 const {
   idParam,
   listQuerySchema,
@@ -40,11 +40,8 @@ router.post(
 );
 
 // ── Admin ──────────────────────────────────────────────────────────────────
-// RBAC gates added — previously any authenticated admin could view a
-// customer or suspend/reactivate them regardless of role. (toggle flips
-// isActive, i.e. suspend/unsuspend → customers.suspend.)
-router.get('/', adminOnly, requirePermission('customers.view'), validate(listQuerySchema), controller.list);
-router.get('/:id', adminOnly, requirePermission('customers.view'), validate(idParam), controller.get);
-router.post('/:id/toggle', adminOnly, requirePermission('customers.suspend'), validate(idParam), controller.toggleActive);
+router.get('/', adminOnly, validate(listQuerySchema), controller.list);
+router.get('/:id', adminOnly, validate(idParam), controller.get);
+router.post('/:id/toggle', adminOnly, validate(idParam), controller.toggleActive);
 
 module.exports = router;

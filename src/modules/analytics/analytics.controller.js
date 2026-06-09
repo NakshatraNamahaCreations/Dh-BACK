@@ -43,3 +43,9 @@ exports.customers = asyncHandler(async (req, res) => {
   const data = await service.customerInsights(req.query, scope);
   success(res, data, 'Customer insights fetched');
 });
+
+exports.bookingReport = asyncHandler(async (req, res) => {
+  const scope = await scopeByAdmin(req);
+  const data = await service.bookingReport(req.query, scope);
+  success(res, data, 'Booking report fetched');
+});
