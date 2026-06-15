@@ -1,6 +1,7 @@
 const express = require('express');
 const authRoutes = require('../modules/auth/auth.routes');
 const categoryRoutes = require('../modules/categories/categories.routes');
+const subCategoryRoutes = require('../modules/sub-categories/sub-categories.routes');
 const serviceRoutes = require('../modules/services/services.routes');
 const uploadRoutes = require('../modules/uploads/uploads.routes');
 const bannerRoutes = require('../modules/banners/banners.routes');
@@ -34,6 +35,7 @@ router.get('/health', (req, res) => {
 
 router.use('/auth', authRoutes);
 router.use('/categories', categoryRoutes);
+router.use('/sub-categories', subCategoryRoutes);
 router.use('/services', serviceRoutes);
 router.use('/uploads', uploadRoutes);
 router.use('/banners', bannerRoutes);

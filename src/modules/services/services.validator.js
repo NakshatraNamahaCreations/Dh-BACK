@@ -22,6 +22,10 @@ const baseFields = {
   includes: z.array(z.string().trim().min(1).max(160)).max(30).default([]),
   excludes: z.array(z.string().trim().min(1).max(160)).max(30).default([]),
   categoryId: z.number().int().positive('Invalid categoryId'),
+  /// Optional sub-category within the category. null/omitted = attached
+  /// directly to the category. Validated server-side to belong to the
+  /// chosen category.
+  subCategoryId: z.number().int().positive('Invalid subCategoryId').nullable().optional(),
   /// Optional list of question/answer pairs. When present in a save payload,
   /// replaces the service's existing FAQs entirely.
   faqs: z.array(faqRow).max(20).optional(),
@@ -50,6 +54,7 @@ const updateSchema = z.object({
       includes: baseFields.includes.optional(),
       excludes: baseFields.excludes.optional(),
       categoryId: baseFields.categoryId.optional(),
+      subCategoryId: baseFields.subCategoryId,
       faqs: baseFields.faqs,
     })
     .refine((v) => Object.keys(v).length > 0, { message: 'No fields to update' }),

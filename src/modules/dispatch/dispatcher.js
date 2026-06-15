@@ -861,12 +861,58 @@ const handlePaymentExpire = async ({ bookingId }) => {
 const handleExpire = async ({ bookingId }) => {
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
-    select: { id: true, status: true, partnerId: true, customerId: true },
+    select: {
+      id: true, status: true, partnerId: true, customerId: true,
+      offeredPrice: true, paymentStatus: true,
+    },
   });
   if (!booking) return;
   if (booking.status !== 'PENDING' || booking.partnerId != null) {
     /// Already accepted / cancelled — clean up Redis and bail.
     await registry.clearBooking(bookingId);
+    return;
+  }
+
+  /// BYOP abandon shortcut. "Book at your price" broadcasts BEFORE
+  /// payment, so an unpaid BYOP booking that reached the end of the
+  /// broadcast window with no partner is an ABANDONED price request —
+  /// the customer never committed money and (typically) has left. There
+  /// is no point routing it to admin manual dispatch for a 2-hour grace:
+  /// even if an admin assigned a partner, there's no paying customer on
+  /// the other end. Cancel it now and stop broadcasting. (Fixed-price
+  /// bookings are pre-paid, so they still go to the admin queue below.)
+  const isUnpaidByop =
+    booking.offeredPrice != null && booking.paymentStatus !== 'paid';
+  if (isUnpaidByop) {
+    const cancelled = await prisma.booking.updateMany({
+      where: { id: booking.id, status: 'PENDING', partnerId: null },
+      data: {
+        status: 'CANCELLED',
+        dispatchStatus: 'no_partner_found',
+        dispatchExpiresAt: null,
+        noPartnerReason:
+          'Book-at-your-price request expired — no partner accepted within the broadcast window and payment was never made.',
+      },
+    });
+    if (cancelled.count === 0) return;
+
+    /// Tear down the broadcast everywhere, same as the admin-route path.
+    const audience = await registry.listPartnersForBooking(bookingId).catch(() => []);
+    await registry.clearBooking(bookingId);
+    if (audience.length > 0) {
+      if (socketEmitter) {
+        for (const pid of audience) {
+          socketEmitter('dispatch.claimed', pid, { bookingId, partnerId: null });
+        }
+      }
+      void clearJobOfferPush(prisma, audience, bookingId);
+    }
+    /// Let the customer app know the request ended (so any lingering
+    /// "searching" UI closes out to a clean state).
+    if (socketEmitter) {
+      socketEmitter('booking.expired', `customer:${booking.customerId}`, { bookingId: booking.id });
+    }
+    logger.info(`dispatch expire: BYOP booking ${bookingId} cancelled (unpaid, no partner accepted)`);
     return;
   }
 

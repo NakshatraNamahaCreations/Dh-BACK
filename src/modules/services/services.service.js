@@ -4,6 +4,7 @@ const ApiError = require('../../utils/ApiError');
 
 const SERVICE_INCLUDE = {
   category: { select: { id: true, name: true, icon: true, color: true } },
+  subCategory: { select: { id: true, name: true, icon: true } },
   faqs: { orderBy: { sortOrder: 'asc' } },
 };
 
@@ -42,6 +43,10 @@ const shape = (s) => ({
   excludes: s.excludes,
   categoryId: s.categoryId,
   category: s.category ?? null,
+  /// Optional sub-category. Null = service is attached directly to the
+  /// category (renders under "Other Services" in the customer app).
+  subCategoryId: s.subCategoryId ?? null,
+  subCategory: s.subCategory ?? null,
   faqs: s.faqs?.map((f) => ({
     id: f.id,
     question: f.question,
@@ -58,6 +63,21 @@ const assertCategoryExists = async (categoryId) => {
     select: { id: true },
   });
   if (!exists) throw ApiError.badRequest(`Category ${categoryId} does not exist`);
+};
+
+/// Validation rule: a chosen sub-category must exist AND belong to the
+/// service's category. `categoryId` is the effective category the service
+/// will have after this write.
+const assertSubCategoryValid = async (subCategoryId, categoryId) => {
+  if (subCategoryId == null) return;
+  const sub = await prisma.subCategory.findUnique({
+    where: { id: subCategoryId },
+    select: { id: true, categoryId: true },
+  });
+  if (!sub) throw ApiError.badRequest(`Sub-category ${subCategoryId} does not exist`);
+  if (sub.categoryId !== categoryId) {
+    throw ApiError.badRequest('Selected sub-category does not belong to the chosen category');
+  }
 };
 
 /// Wipes the service's FAQs and recreates them from the supplied array. Runs
@@ -123,6 +143,7 @@ exports.get = async (id) => {
 
 exports.create = async (data) => {
   await assertCategoryExists(data.categoryId);
+  await assertSubCategoryValid(data.subCategoryId, data.categoryId);
   const { faqs = [], ...serviceData } = data;
   const created = await prisma.$transaction(async (tx) => {
     const s = await tx.service.create({ data: serviceData });
@@ -135,6 +156,22 @@ exports.create = async (data) => {
 
 exports.update = async (id, data) => {
   if (data.categoryId) await assertCategoryExists(data.categoryId);
+
+  /// Validate the sub-category against the EFFECTIVE category (the new
+  /// one if the category is changing, else the current one). Runs when
+  /// either field is part of the update so a category change can't strand
+  /// a service under a sub-category from a different category.
+  if (data.subCategoryId !== undefined || data.categoryId !== undefined) {
+    const current = await prisma.service.findUnique({
+      where: { id },
+      select: { categoryId: true, subCategoryId: true },
+    });
+    if (!current) throw ApiError.notFound('Service not found');
+    const effectiveCategoryId = data.categoryId ?? current.categoryId;
+    const effectiveSubCategoryId =
+      data.subCategoryId !== undefined ? data.subCategoryId : current.subCategoryId;
+    await assertSubCategoryValid(effectiveSubCategoryId, effectiveCategoryId);
+  }
 
   // Pricing cross-field validation when one of the two changes.
   if (data.originalPrice != null || data.basePrice != null) {

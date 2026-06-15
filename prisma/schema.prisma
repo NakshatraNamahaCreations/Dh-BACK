@@ -471,11 +471,38 @@ model Category {
   updatedAt       DateTime  @updatedAt
 
   services        Service[]
+  subCategories   SubCategory[]
   range           CategoryRange?
   commissionRule  CommissionRule?
 
   @@index([active, sortOrder])
   @@map("categories")
+}
+
+/// Optional second level under a Category. Services may be assigned to a
+/// sub-category OR directly to the category (sub_category_id is nullable).
+/// Fully backward compatible — existing services keep sub_category_id NULL
+/// and continue to display under the category's "Other Services" group.
+model SubCategory {
+  id             Int       @id @default(autoincrement())
+  name           String
+  /// lucide icon name, mirrors Category.icon
+  icon           String    @default("wrench")
+  bannerImageUrl String?
+  active         Boolean   @default(true)
+  /// display order within the parent category
+  sortOrder      Int       @default(0)
+
+  categoryId     Int
+  category       Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  services       Service[]
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([categoryId, active, sortOrder])
+  @@map("sub_categories")
 }
 
 model Service {
@@ -497,6 +524,14 @@ model Service {
   categoryId    Int
   category      Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
 
+  /// Optional sub-category within the category. NULL = the service is
+  /// attached directly to the category (renders under "Other Services").
+  /// onDelete: SetNull so deleting a sub-category reverts its services to
+  /// category-direct rather than failing; the admin layer additionally
+  /// blocks deletion while a sub-category still has services (see service).
+  subCategoryId Int?
+  subCategory   SubCategory? @relation(fields: [subCategoryId], references: [id], onDelete: SetNull)
+
   bookingItems  BookingItem[]
   faqs          ServiceFaq[]
 
@@ -504,6 +539,7 @@ model Service {
   updatedAt     DateTime @updatedAt
 
   @@index([categoryId, active])
+  @@index([subCategoryId])
   @@map("services")
 }
 
