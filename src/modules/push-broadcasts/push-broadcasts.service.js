@@ -1,8 +1,10 @@
 const prisma = require('../../config/prisma');
 const logger = require('../../config/logger');
+const firebase = require('../../config/firebase');
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const BATCH_SIZE = 100; // Expo accepts up to 100 per request
+const FCM_BATCH_SIZE = 500; // firebase-admin multicast cap per request
 
 const sendBatch = async (messages) => {
   if (!messages.length) return;
@@ -21,36 +23,74 @@ const sendBatch = async (messages) => {
   }
 };
 
+/// Direct-FCM multicast for recipients whose device registered a RAW FCM
+/// token (Android). This bypasses Expo's relay — which is throttled/dropped
+/// on aggressive OEMs (Vivo/Oppo/Xiaomi) when the app is swiped away — and
+/// renders an OS notification that shows even when the app is killed. Reuses
+/// the backend's already-configured firebase-admin (same as partner pushes);
+/// no-ops gracefully when Firebase isn't configured.
+const sendFcmBroadcast = async (tokens, { title, body, imageUrl }) => {
+  const messaging = firebase.messaging();
+  if (!messaging || tokens.length === 0) return;
+  for (let i = 0; i < tokens.length; i += FCM_BATCH_SIZE) {
+    const chunk = tokens.slice(i, i + FCM_BATCH_SIZE);
+    try {
+      await messaging.sendEachForMulticast({
+        tokens: chunk,
+        notification: { title, body, ...(imageUrl ? { imageUrl } : {}) },
+        android: {
+          priority: 'high',
+          notification: {
+            channelId: 'general',
+            ...(imageUrl ? { imageUrl } : {}),
+          },
+        },
+        apns: {
+          payload: { aps: { sound: 'default' } },
+          ...(imageUrl ? { fcmOptions: { imageUrl } } : {}),
+        },
+      });
+    } catch (err) {
+      logger.warn(`[push-broadcast] FCM multicast failed: ${err.message}`);
+    }
+  }
+};
+
+/// Collect push tokens for the audience. For EACH device we prefer its raw
+/// FCM token (direct FCM) over its Expo token, so a device that has both
+/// gets exactly ONE notification — via the more reliable channel.
 const collectTokens = async (audience) => {
-  const tokens = [];
+  const expoTokens = [];
+  const fcmTokens = [];
+  const pick = (rows) => {
+    rows.forEach((r) => {
+      if (r.fcmToken) fcmTokens.push(r.fcmToken);
+      else if (r.expoPushToken?.startsWith('ExponentPushToken[')) expoTokens.push(r.expoPushToken);
+    });
+  };
+
+  const where = {
+    isActive: true,
+    OR: [{ expoPushToken: { not: null } }, { fcmToken: { not: null } }],
+  };
+  const select = { expoPushToken: true, fcmToken: true };
 
   if (audience === 'partners' || audience === 'all') {
-    const partners = await prisma.partner.findMany({
-      where: { isActive: true, expoPushToken: { not: null } },
-      select: { expoPushToken: true },
-    });
-    partners.forEach((p) => {
-      if (p.expoPushToken?.startsWith('ExponentPushToken[')) tokens.push(p.expoPushToken);
-    });
+    pick(await prisma.partner.findMany({ where, select }));
   }
-
   if (audience === 'customers' || audience === 'all') {
-    const customers = await prisma.customer.findMany({
-      where: { isActive: true, expoPushToken: { not: null } },
-      select: { expoPushToken: true },
-    });
-    customers.forEach((c) => {
-      if (c.expoPushToken?.startsWith('ExponentPushToken[')) tokens.push(c.expoPushToken);
-    });
+    pick(await prisma.customer.findMany({ where, select }));
   }
 
-  return tokens;
+  return { expoTokens, fcmTokens };
 };
 
 exports.send = async (adminId, { title, body, imageUrl, audience }) => {
-  const tokens = await collectTokens(audience);
+  const { expoTokens, fcmTokens } = await collectTokens(audience);
 
-  const messages = tokens.map((token) => ({
+  // Legacy Expo relay — for devices that only have an Expo token (iOS, or
+  // older Android builds before the raw-FCM token registration).
+  const messages = expoTokens.map((token) => ({
     to: token,
     title,
     body,
@@ -59,11 +99,12 @@ exports.send = async (adminId, { title, body, imageUrl, audience }) => {
     priority: 'high',
     channelId: 'general',
   }));
-
-  // Send in parallel batches of 100
   for (let i = 0; i < messages.length; i += BATCH_SIZE) {
     await sendBatch(messages.slice(i, i + BATCH_SIZE));
   }
+
+  // Direct FCM — for devices with a raw FCM token (reliable on OEMs).
+  await sendFcmBroadcast(fcmTokens, { title, body, imageUrl });
 
   const record = await prisma.pushBroadcast.create({
     data: {
@@ -72,11 +113,19 @@ exports.send = async (adminId, { title, body, imageUrl, audience }) => {
       imageUrl: imageUrl ?? null,
       audience,
       sentBy: adminId,
-      sentCount: tokens.length,
+      sentCount: expoTokens.length + fcmTokens.length,
     },
   });
 
   return record;
+};
+
+/// Remove a broadcast from the history log. This only deletes the record
+/// of a past send — it does not (and cannot) recall a notification that was
+/// already delivered to devices.
+exports.remove = async (id) => {
+  await prisma.pushBroadcast.delete({ where: { id } });
+  return { id };
 };
 
 exports.list = async ({ page = 1, pageSize = 20 } = {}) => {

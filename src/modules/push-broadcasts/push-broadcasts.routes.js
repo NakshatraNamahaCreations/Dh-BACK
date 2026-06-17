@@ -9,5 +9,6 @@ router.use(authenticate, requireType('ADMIN'), requireRole('SUPER'));
 
 router.post('/', controller.send);
 router.get('/', controller.list);
+router.delete('/:id', controller.remove);
 
 module.exports = router;

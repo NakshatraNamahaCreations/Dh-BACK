@@ -37,9 +37,6 @@ const shape = (cat) => ({
   sortOrder: cat.sortOrder,
   serviceCount: cat._count?.services ?? 0,
   bannerImageUrl: cat.bannerImageUrl,
-  offerHeadline: cat.offerHeadline,
-  offerSubtext: cat.offerSubtext,
-  offerPrice: cat.offerPrice,
   createdAt: cat.createdAt,
   updatedAt: cat.updatedAt,
 });

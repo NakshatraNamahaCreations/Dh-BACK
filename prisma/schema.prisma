@@ -463,10 +463,6 @@ model Category {
   /// display order — admins reorder via drag/buttons
   sortOrder       Int       @default(0)
   bannerImageUrl  String?
-  offerHeadline   String?
-  offerSubtext    String?
-  /// optional starting price shown on the customer-app banner
-  offerPrice      Int?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 

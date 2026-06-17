@@ -1,4 +1,5 @@
 const prisma = require('../../config/prisma');
+const logger = require('../../config/logger');
 const ApiError = require('../../utils/ApiError');
 const { signToken } = require('../../utils/jwt');
 const { comparePassword } = require('../../utils/password');
@@ -311,7 +312,10 @@ const partnerPaymentDone = async (partnerId) => {
 };
 
 const registerPushToken = async ({ sub, type }, token) => {
-  if (!token) return;
+  if (!token) {
+    logger.warn(`[push-token] ${type} #${sub} called register with EMPTY token — ignored`);
+    return;
+  }
   const isExpo = token.startsWith('ExponentPushToken[');
   const data = isExpo ? { expoPushToken: token } : { fcmToken: token };
   if (type === 'CUSTOMER') {
@@ -319,6 +323,13 @@ const registerPushToken = async ({ sub, type }, token) => {
   } else if (type === 'PARTNER') {
     await prisma.partner.update({ where: { id: sub }, data });
   }
+  /// Diagnostic — confirms the app reached the backend and which column was
+  /// written. If you never see this line for a CUSTOMER, the customer app
+  /// isn't obtaining a token (needs the google-services.json rebuild) or
+  /// isn't logged in. `...${last8}` keeps the secret out of the logs.
+  logger.info(
+    `[push-token] stored ${isExpo ? 'expoPushToken' : 'fcmToken'} for ${type} #${sub} (...${token.slice(-8)})`,
+  );
 };
 
 module.exports = {

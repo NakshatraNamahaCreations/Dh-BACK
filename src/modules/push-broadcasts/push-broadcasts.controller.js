@@ -12,3 +12,9 @@ exports.list = async (req, res) => {
   const result = await service.list({ page, pageSize });
   res.json({ success: true, ...result });
 };
+
+exports.remove = async (req, res) => {
+  const id = Number(req.params.id);
+  await service.remove(id);
+  res.json({ success: true, data: { id } });
+};

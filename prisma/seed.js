@@ -26,9 +26,6 @@ const CATEGORIES = [
     sortOrder: 1,
     /// Reused verified Unsplash photo from the original seed.
     bannerImageUrl: 'https://images.unsplash.com/photo-1631545806609-21b1d2b1c8a4?w=800',
-    offerHeadline: 'AC service done right',
-    offerSubtext: 'Trained pros · 30-day service warranty',
-    offerPrice: 499,
   },
   {
     slug: 'electrician',
@@ -38,9 +35,6 @@ const CATEGORIES = [
     sortOrder: 2,
     /// No verified photo — fallback tile (icon + colour) renders.
     bannerImageUrl: null,
-    offerHeadline: 'Trusted home electricians',
-    offerSubtext: 'Licensed pros · Same-day visits',
-    offerPrice: 199,
   },
   {
     slug: 'ro-technician',
@@ -49,9 +43,6 @@ const CATEGORIES = [
     color: '#0891B2',
     sortOrder: 3,
     bannerImageUrl: null,
-    offerHeadline: 'Pure water, every day',
-    offerSubtext: 'Service · Filter change · Install',
-    offerPrice: 299,
   },
   {
     slug: 'plumber',
@@ -61,9 +52,6 @@ const CATEGORIES = [
     sortOrder: 4,
     /// Reused verified geyser/water-heater install photo — fits plumbing.
     bannerImageUrl: 'https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=800',
-    offerHeadline: 'Leaks fixed fast',
-    offerSubtext: 'Quick visits · Genuine fittings',
-    offerPrice: 249,
   },
   {
     slug: 'carpenter',
@@ -72,9 +60,6 @@ const CATEGORIES = [
     color: '#92400E',
     sortOrder: 5,
     bannerImageUrl: null,
-    offerHeadline: 'Custom work, neat finish',
-    offerSubtext: 'Furniture · Doors · Polishing',
-    offerPrice: 349,
   },
   {
     slug: 'tv-technician',
@@ -83,9 +68,6 @@ const CATEGORIES = [
     color: '#7C3AED',
     sortOrder: 6,
     bannerImageUrl: null,
-    offerHeadline: 'TV setup, sorted',
-    offerSubtext: 'Wall mount · Smart TV setup',
-    offerPrice: 449,
   },
   {
     slug: 'cleaning',
@@ -94,9 +76,6 @@ const CATEGORIES = [
     color: '#0EA5E9',
     sortOrder: 7,
     bannerImageUrl: 'https://images.unsplash.com/photo-1581578731548-c64695cc6952?w=800',
-    offerHeadline: 'Sparkling clean homes',
-    offerSubtext: 'Deep clean · Eco-safe products',
-    offerPrice: 599,
   },
   {
     slug: 'pest-control',
@@ -105,9 +84,6 @@ const CATEGORIES = [
     color: '#DC2626',
     sortOrder: 8,
     bannerImageUrl: null,
-    offerHeadline: 'Pest-free, guaranteed',
-    offerSubtext: 'Cockroach · Termite · Bedbug',
-    offerPrice: 799,
   },
   {
     slug: 'painting',
@@ -116,9 +92,6 @@ const CATEGORIES = [
     color: '#A855F7',
     sortOrder: 9,
     bannerImageUrl: null,
-    offerHeadline: 'Fresh walls, new vibe',
-    offerSubtext: 'Interior · Exterior · Texture',
-    offerPrice: 1499,
   },
   {
     slug: 'salon-at-home',
@@ -127,9 +100,6 @@ const CATEGORIES = [
     color: '#EC4899',
     sortOrder: 10,
     bannerImageUrl: 'https://images.unsplash.com/photo-1560066984-138dadb4c035?w=800',
-    offerHeadline: 'Salon services, your home',
-    offerSubtext: 'Trained pros · Hygienic kits',
-    offerPrice: 399,
   },
   {
     slug: 'appliance-repair',
@@ -138,9 +108,6 @@ const CATEGORIES = [
     color: '#0F766E',
     sortOrder: 11,
     bannerImageUrl: null,
-    offerHeadline: 'Repairs done right',
-    offerSubtext: 'Washing machine · Fridge · Microwave',
-    offerPrice: 349,
   },
 ];
 
@@ -613,9 +580,6 @@ async function seedCatalog() {
       sortOrder: c.sortOrder,
       active: c.active ?? true,
       bannerImageUrl: c.bannerImageUrl ?? null,
-      offerHeadline: c.offerHeadline ?? null,
-      offerSubtext: c.offerSubtext ?? null,
-      offerPrice: c.offerPrice ?? null,
     };
     const cat = existing
       ? await prisma.category.update({ where: { id: existing.id }, data })

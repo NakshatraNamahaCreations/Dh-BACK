@@ -22,9 +22,6 @@ const baseFields = {
   active: z.boolean().default(true),
   sortOrder: z.number().int().min(0).max(9999).optional(),
   bannerImageUrl: z.string().trim().url().nullable().optional(),
-  offerHeadline: z.string().trim().max(120).nullable().optional(),
-  offerSubtext: z.string().trim().max(200).nullable().optional(),
-  offerPrice: z.number().int().min(0).max(10_000_000).nullable().optional(),
 };
 
 const createSchema = z.object({
@@ -41,9 +38,6 @@ const updateSchema = z.object({
       active: z.boolean().optional(),
       sortOrder: baseFields.sortOrder,
       bannerImageUrl: baseFields.bannerImageUrl,
-      offerHeadline: baseFields.offerHeadline,
-      offerSubtext: baseFields.offerSubtext,
-      offerPrice: baseFields.offerPrice,
     })
     .refine((v) => Object.keys(v).length > 0, { message: 'No fields to update' }),
 });
