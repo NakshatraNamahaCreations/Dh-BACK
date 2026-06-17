@@ -3026,6 +3026,21 @@ exports.partnerUpdateStatus = async ({ bookingId, partnerId, status, otp }) => {
     include: PARTNER_INCLUDE,
   });
 
+  /// Push the status change to the customer's tracking screen instantly.
+  /// Without this the start-OTP card lingers until the customer's next 6s
+  /// poll after the partner starts the job — the exact "still showing the
+  /// start OTP" lag. Best-effort; the HTTP poll is the fallback if the
+  /// socket is down. (Arrival emits its own `booking.partner_arrived`
+  /// above; this covers in_progress + completed.)
+  try {
+    dispatcher.emitToCustomer(b.customerId, 'booking.updated', {
+      bookingId: id,
+      status: dbStatus,
+      jobStartedAt: updated.jobStartedAt ?? null,
+      jobCompletedAt: updated.jobCompletedAt ?? null,
+    });
+  } catch { /* socket optional — poll catches up */ }
+
   /// Credit the partner the moment the job flips to COMPLETED. The
   /// earnings service is idempotent — a duplicate completion event
   /// (network retry, admin re-mark) returns the same row instead of
