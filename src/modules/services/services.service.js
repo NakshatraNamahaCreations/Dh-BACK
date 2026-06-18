@@ -35,6 +35,7 @@ const shape = (s) => ({
   name: s.name,
   description: s.description,
   imageUrl: s.imageUrl,
+  thumbnailUrl: s.thumbnailUrl ?? null,
   durationMins: s.durationMins,
   basePrice: s.basePrice,
   originalPrice: s.originalPrice,

@@ -505,7 +505,11 @@ model Service {
   id            Int      @id @default(autoincrement())
   name          String
   description   String   @default("")
+  /// Wide 16:10 hero image shown at the top of the service-detail screen.
   imageUrl      String?
+  /// Square thumbnail shown on the category-list service card. Falls back
+  /// to `imageUrl` in the apps when null.
+  thumbnailUrl  String?
   durationMins  Int
   /// price in INR (whole rupees — keep as int to avoid float drift)
   basePrice     Int
