@@ -22,11 +22,13 @@ const baseFields = {
   active: z.boolean().default(true),
   includes: z.array(z.string().trim().min(1).max(160)).max(30).default([]),
   excludes: z.array(z.string().trim().min(1).max(160)).max(30).default([]),
-  categoryId: z.number().int().positive('Invalid categoryId'),
+  // `coerce` so a string id from a form `<select>` (e.g. "5") is accepted
+  // and normalised to a number — same pattern as the params/query ids below.
+  categoryId: z.coerce.number().int().positive('Invalid categoryId'),
   /// Optional sub-category within the category. null/omitted = attached
   /// directly to the category. Validated server-side to belong to the
   /// chosen category.
-  subCategoryId: z.number().int().positive('Invalid subCategoryId').nullable().optional(),
+  subCategoryId: z.coerce.number().int().positive('Invalid subCategoryId').nullable().optional(),
   /// Optional list of question/answer pairs. When present in a save payload,
   /// replaces the service's existing FAQs entirely.
   faqs: z.array(faqRow).max(20).optional(),
