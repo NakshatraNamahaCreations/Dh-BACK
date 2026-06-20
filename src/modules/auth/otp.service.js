@@ -14,6 +14,25 @@ const OTP_MAX_ATTEMPTS = 5;
 /// zero from in transit.
 const generateCode = () => String(Math.floor(1000 + Math.random() * 9000));
 
+/// ── Store-review test accounts ─────────────────────────────────────────
+/// Our login is OTP-only and we never send a real SMS to the reviewer's
+/// dummy number, so Play/App Store reviewers would be locked out. Any phone
+/// in TEST_OTP_PHONES skips the SMS gateway and always accepts the fixed
+/// TEST_OTP_CODE — and that code is shown on the OTP screen (even in
+/// production) so the reviewer can read it. Only the last 10 digits are
+/// compared, so "+919999900000" and "9999900000" both match. Disabled when
+/// TEST_OTP_CODE is empty.
+const normalizePhone = (p) => String(p || '').replace(/\D/g, '').slice(-10);
+const TEST_OTP_CODE = String(env.TEST_OTP_CODE || '').trim();
+const TEST_OTP_PHONES = new Set(
+  String(env.TEST_OTP_PHONES || '')
+    .split(',')
+    .map((s) => normalizePhone(s))
+    .filter(Boolean),
+);
+const isTestPhone = (phone) =>
+  TEST_OTP_CODE.length > 0 && TEST_OTP_PHONES.has(normalizePhone(phone));
+
 /// Delivers the OTP via yourbulksms.com when SMS_AUTHKEY is set; falls
 /// back to console-logging in dev/unconfigured setups so onboarding
 /// engineers and QA can self-serve. In production the SMS provider is
@@ -49,7 +68,8 @@ const requestOtp = async ({ phone, userType }) => {
     });
   }
 
-  const code = generateCode();
+  const testNumber = isTestPhone(phone);
+  const code = testNumber ? TEST_OTP_CODE : generateCode();
   const codeHash = await bcrypt.hash(code, 10);
   const expiresAt = new Date(Date.now() + OTP_TTL_MIN * 60 * 1000);
 
@@ -61,7 +81,9 @@ const requestOtp = async ({ phone, userType }) => {
   /// a failed send is a hard error — better to surface "couldn't send
   /// OTP" than to silently issue an unsent code that the user will then
   /// type forever. In dev we log the code locally so the flow continues.
-  const sent = await sendSms(phone, code);
+  /// Review test numbers never hit the SMS gateway — the reviewer reads the
+  /// fixed code off the OTP screen (devCode below) / our Play Console notes.
+  const sent = testNumber ? true : await sendSms(phone, code);
   if (!sent && env.NODE_ENV === 'production') {
     /// Mark the issued OTP consumed so a retry mints a fresh one rather
     /// than colliding with the resend cooldown on the unsent record.
@@ -76,8 +98,11 @@ const requestOtp = async ({ phone, userType }) => {
   // developers can self-serve OTP entry without an SMS provider wired up.
   // The check on env.NODE_ENV is the hard gate — never include devCode in
   // production responses.
+  /// Leak the plain code back to the client in non-prod (dev self-serve) AND
+  /// for store-review test numbers in any env, so the reviewer sees it on the
+  /// OTP screen. Real production users never get devCode.
   const payload = { expiresInSeconds: OTP_TTL_MIN * 60 };
-  if (env.NODE_ENV !== 'production') {
+  if (env.NODE_ENV !== 'production' || testNumber) {
     payload.devCode = code;
   }
   return payload;
