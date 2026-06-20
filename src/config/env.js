@@ -11,6 +11,17 @@ const schema = z.object({
   OTP_EXPIRY_MINUTES: z.coerce.number().int().min(1).max(30).default(5),
   OTP_RESEND_SECONDS: z.coerce.number().int().min(10).max(600).default(60),
 
+  // ── Store-review test accounts ─────────────────────────────────────
+  // Comma-separated phone numbers (any format — only the last 10 digits
+  // are compared) that BYPASS the SMS gateway and always accept
+  // TEST_OTP_CODE as their OTP. This lets Google Play / App Store
+  // reviewers sign in to our OTP-only login without a real SMS, and the
+  // code is surfaced on the OTP screen even in production. Leave
+  // TEST_OTP_CODE empty to disable entirely. NEVER list a real user's
+  // number here.
+  TEST_OTP_PHONES: z.string().default(''),
+  TEST_OTP_CODE: z.string().default(''),
+
   // Razorpay. Keys are optional at boot so non-payment dev/CI tasks can
   // still run; payment endpoints fail clearly if the needed key is absent.
   RAZORPAY_KEY_ID: z.string().optional(),
