@@ -751,8 +751,12 @@ model BookingItem {
   id          Int      @id @default(autoincrement())
   bookingId   Int
   booking     Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-  serviceId   Int
-  service     Service  @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  /// Nullable + SetNull: a service that has bookings can still be permanently
+  /// deleted — this link is cleared, but the booking item itself (and its
+  /// serviceName/basePrice snapshot below) is preserved so history stays
+  /// accurate. Readers already null-check `item.service?.…`.
+  serviceId   Int?
+  service     Service? @relation(fields: [serviceId], references: [id], onDelete: SetNull)
 
   /// snapshot at time of booking — service can be edited later, history stays accurate
   serviceName String

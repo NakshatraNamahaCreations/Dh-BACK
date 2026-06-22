@@ -70,6 +70,7 @@ const listQuerySchema = z.object({
     pageSize: z.coerce.number().int().min(1).max(200).default(25),
     search: z.string().trim().max(120).optional(),
     categoryId: z.coerce.number().int().positive().optional(),
+    subCategoryId: z.coerce.number().int().positive().optional(),
     active: z
       .union([z.literal('true'), z.literal('false')])
       .optional()

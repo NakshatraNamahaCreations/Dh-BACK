@@ -15,8 +15,8 @@ const CACHE_PREFIX = 'svc:';
 /// for long.
 const CACHE_TTL = 300;
 
-const listKey = ({ page, pageSize, search, categoryId, active } = {}) =>
-  `${CACHE_PREFIX}list:p${page}:ps${pageSize}:c${categoryId ?? ''}:a${active === true ? '1' : active === false ? '0' : 'N'}:q${search ?? ''}`;
+const listKey = ({ page, pageSize, search, categoryId, subCategoryId, active } = {}) =>
+  `${CACHE_PREFIX}list:p${page}:ps${pageSize}:c${categoryId ?? ''}:s${subCategoryId ?? ''}:a${active === true ? '1' : active === false ? '0' : 'N'}:q${search ?? ''}`;
 const itemKey = (id) => `${CACHE_PREFIX}id:${id}`;
 const relatedKey = (id, limit) => `${CACHE_PREFIX}rel:${id}:l${limit}`;
 
@@ -27,6 +27,10 @@ const invalidate = async () => {
   await Promise.all([
     cache.delByPrefix(CACHE_PREFIX),
     cache.delByPrefix('cat:'),
+    /// A service's `subCategoryId` drives each sub-category's `serviceCount`,
+    /// so creating / reassigning / deleting a service must also refresh the
+    /// sub-category list (otherwise it shows a stale "0" count).
+    cache.delByPrefix('subcat:'),
   ]);
 };
 
@@ -96,13 +100,14 @@ const replaceFaqs = async (tx, serviceId, faqs) => {
   });
 };
 
-exports.list = async ({ page, pageSize, search, categoryId, active } = {}) => {
+exports.list = async ({ page, pageSize, search, categoryId, subCategoryId, active } = {}) => {
   return cache.getOrSet(
-    listKey({ page, pageSize, search, categoryId, active }),
+    listKey({ page, pageSize, search, categoryId, subCategoryId, active }),
     CACHE_TTL,
     async () => {
       const where = {};
       if (categoryId) where.categoryId = categoryId;
+      if (subCategoryId) where.subCategoryId = subCategoryId;
       if (typeof active === 'boolean') where.active = active;
       if (search) {
         where.OR = [

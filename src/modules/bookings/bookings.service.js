@@ -553,6 +553,22 @@ const BOOKING_INCLUDE = {
     select: { id: true, status: true, amount: true, refundAmount: true, createdAt: true },
     orderBy: { createdAt: 'desc' },
   },
+  /// Assigned professional — surfaced on the customer's booking-detail
+  /// "your professional" card. The aggregate rating is denormalised on the
+  /// partner row; the completed-jobs count + trade name are resolved in
+  /// `getOwn` (kept off the list path to avoid an N+1).
+  partner: {
+    select: {
+      id: true,
+      name: true,
+      avgRating: true,
+      ratingCount: true,
+      categoryId: true,
+      /// Profile photo lives on the partner's verification document (the
+      /// selfie), not the partner row itself.
+      document: { select: { selfieUrl: true } },
+    },
+  },
 };
 
 /// The refund a customer will actually receive on a CANCELLED booking.
@@ -645,6 +661,20 @@ const shape = (b) => {
         comment: b.rating.comment,
         createdAt: b.rating.createdAt,
         updatedAt: b.rating.updatedAt,
+      }
+    : null,
+  /// Assigned professional card. Present once a partner has accepted the
+  /// booking; `role` (trade name) and `jobsCompleted` are enriched in
+  /// `getOwn` (undefined on the list path, where the card isn't shown).
+  partner: b.partner
+    ? {
+        id: b.partner.id,
+        name: b.partner.name ?? 'Professional',
+        photoUrl: b.partner.document?.selfieUrl ?? null,
+        role: b.partner.categoryName ?? null,
+        rating: b.partner.avgRating ?? 0,
+        ratingCount: b.partner.ratingCount ?? 0,
+        jobsCompleted: b.partner.jobsCompleted ?? 0,
       }
     : null,
   notes: b.notes,
@@ -1058,6 +1088,23 @@ exports.listMine = async ({ customerId, status, bucket }) => {
 exports.getOwn = async ({ customerId, id }) => {
   const b = await prisma.booking.findUnique({ where: { id }, include: BOOKING_INCLUDE });
   if (!b || b.customerId !== customerId) throw ApiError.notFound('Booking not found');
+  /// Enrich the assigned partner for the "your professional" card: their
+  /// lifetime completed-jobs count and trade name. Done here (single
+  /// booking) rather than in `shape`/`BOOKING_INCLUDE` so the bookings-list
+  /// path stays a single query.
+  if (b.partner) {
+    const [jobsCompleted, category] = await Promise.all([
+      prisma.booking.count({ where: { partnerId: b.partner.id, status: 'COMPLETED' } }),
+      b.partner.categoryId
+        ? prisma.category.findUnique({
+            where: { id: b.partner.categoryId },
+            select: { name: true },
+          })
+        : Promise.resolve(null),
+    ]);
+    b.partner.jobsCompleted = jobsCompleted;
+    b.partner.categoryName = category?.name ?? null;
+  }
   return shape(b);
 };
 
