@@ -41,24 +41,33 @@ const resolveCategoryId = (booking) => {
 ///
 /// All values are Int (whole rupees), using Math.floor to avoid
 /// ever crediting more than the rule authorises.
+/// Commission base = grandTotal (the customer-facing all-in price).
+/// Split:
+///   partner gross  = grandTotal × partnerPct%         (e.g. 80% of ₹499 = ₹399.2)
+///   partner 5% GST = partner gross × 5%               (e.g. 5%  of ₹399 = ₹19.96)
+///   partner net    = partner gross − partner GST       (e.g. ₹399 − ₹20 = ₹379  ← credited)
+///   dhoond gross   = grandTotal × (100−partnerPct)%   (e.g. 20% of ₹499 = ₹99.8)
+///   dhoond 18% GST = dhoond gross × 18%               (e.g. 18% of ₹99 = ₹17.96)
+///   dhoond net     = dhoond gross − dhoond GST        (e.g. ₹99 − ₹18 = ₹81)
 const computeBreakdown = (bookingAmount, partnerPct) => {
-  const amt      = Number(bookingAmount);
-  const pPct     = Number(partnerPct);
-  const dPct     = 100 - pPct;               // Dhoond's percentage (e.g. 20)
+  const amt  = Number(bookingAmount);  // must be grandTotal (customer-facing)
+  const pPct = Number(partnerPct);
+  const dPct = 100 - pPct;
 
-  const earnedAmount     = Math.floor(amt * pPct  / 100);
-  const dhoondCommission = Math.floor(amt * dPct  / 100);
+  const earnedAmount     = Math.floor(amt * pPct / 100);
+  const dhoondCommission = Math.floor(amt * dPct / 100);
 
-  const partnerGst       = Math.floor(earnedAmount     * 5  / 100);  // 5% GST
-  const dhoondGst        = Math.floor(dhoondCommission * 18 / 100);  // 18% GST
+  // Math.round so 19.95 → 20 (matches the 5% of 399.2 = 19.96 design)
+  const partnerGst = Math.round(earnedAmount * 5  / 100);
+  const dhoondGst  = Math.round(dhoondCommission * 18 / 100);
 
   return {
-    earnedAmount,
+    earnedAmount,                          // partner gross (before 5% GST)
     dhoondCommission,
     dhoondGst,
     dhoondNet:  dhoondCommission - dhoondGst,
     partnerGst,
-    netAmount:  earnedAmount - partnerGst,
+    netAmount:  earnedAmount - partnerGst, // credited to partner
   };
 };
 
@@ -76,7 +85,11 @@ exports.creditForBooking = async (bookingId) => {
 
   const categoryId = resolveCategoryId(booking);
   const partnerPct = await commissionsService.getEffectivePctForCategory(categoryId);
-  const bd = computeBreakdown(booking.total, partnerPct);
+  // Use grandTotal (what customer paid) as the commission base, not
+  // the pre-tax `total`. grandTotal is the all-in price; partner earns
+  // their % of that, then 5% GST is deducted from their share.
+  const base = booking.grandTotal ?? booking.total;
+  const bd = computeBreakdown(base, partnerPct);
 
   /// Upsert by bookingId so idempotency is enforced at the DB level.
   /// On the second call we return the existing row instead of bumping

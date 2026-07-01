@@ -404,10 +404,13 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     (commissionMap && primaryCategoryId != null
       ? commissionMap.get(primaryCategoryId)
       : undefined) ?? 80;
-  /// Floor matches the standard payout-rounding direction used by
-  /// earnings.creditForBooking — partner gets at most their fair
-  /// share, never more than the rule says.
-  const partnerEarning = Math.floor((fare.total * partnerCommissionPct) / 100);
+  /// Commission base = grandTotal (customer's all-in price).
+  /// Partner gross = grandTotal × partnerPct%.
+  /// Partner 5% GST is deducted from gross → net is what gets credited.
+  /// Matches the earnings.service computeBreakdown design exactly.
+  const _partnerGross = Math.floor((fare.grandTotal * partnerCommissionPct) / 100);
+  const _partnerGst   = Math.round(_partnerGross * 5 / 100);
+  const partnerEarning = _partnerGross - _partnerGst; // net credited to partner
 
   const statusMap = {
     PENDING: 'incoming',
