@@ -450,6 +450,16 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
   /// `grandTotal`, then `total` for old rows that pre-date the
   /// grand-total column being populated.
   const amount = booking.offeredPrice ?? booking.grandTotal ?? booking.total ?? 0;
+  /// Best address we can surface without a follow-up DB read — used by
+  /// the partner app to render the card instantly (no "Loading address…"
+  /// while refreshIncoming is pending). Prefer the stored addressLine
+  /// (from an inline or saved address), then the customerAddress join,
+  /// then the addressLabel (saved-address nickname). Falls back to ''.
+  const address =
+    booking.addressLine ||
+    booking.customerAddress?.addressLine ||
+    booking.addressLabel ||
+    '';
 
   /// Push to connected partners. The gateway's emitter is responsible
   /// for figuring out which candidates have a live socket; the rest
@@ -465,6 +475,7 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
         distanceKm: c.distanceKm,
         serviceName,
         amount,
+        address,
       });
     }
   }
