@@ -12,6 +12,11 @@ exports.apply = asyncHandler(async (req, res) => {
   success(res, data, 'Coupon applied');
 });
 
+exports.listAvailable = asyncHandler(async (req, res) => {
+  const data = await service.listAvailable();
+  success(res, data, 'Coupons fetched');
+});
+
 // ── Admin ──────────────────────────────────────────────────────────────
 
 exports.adminList = asyncHandler(async (req, res) => {

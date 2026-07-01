@@ -104,6 +104,27 @@ exports.applyForCart = async ({ code, items }) => {
   };
 };
 
+/// Customer-facing list of currently-claimable coupons — active, inside
+/// their validity window, and not exhausted. Returns the same safe shape
+/// as `apply` (no usedCount), plus `validUntil` so the app can show expiry.
+/// The real discount is still re-validated on apply / at booking creation.
+exports.listAvailable = async () => {
+  const now = new Date();
+  const coupons = await prisma.coupon.findMany({
+    where: {
+      active: true,
+      AND: [
+        { OR: [{ validFrom: null }, { validFrom: { lte: now } }] },
+        { OR: [{ validUntil: null }, { validUntil: { gte: now } }] },
+      ],
+    },
+    orderBy: [{ minOrderValue: 'asc' }, { discountValue: 'desc' }],
+  });
+  return coupons
+    .filter((c) => c.usageLimit == null || c.usedCount < c.usageLimit)
+    .map((c) => ({ ...customerShape(c), validUntil: c.validUntil }));
+};
+
 /// Internal — called by bookings.service.create after the cart's
 /// subtotal is locked. Returns the computed discount and ensures
 /// `usedCount` ticks atomically. Throws if the coupon is unusable

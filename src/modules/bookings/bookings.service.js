@@ -862,20 +862,26 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
     /// as the new booking insert so the customer can never end up
     /// with two live PENDING attempts even on race.
     if (stalePrev.length > 0) {
-      /// Refund any coupon redemptions on the deleted rows so the
+      /// Refund any coupon redemptions on the superseded rows so the
       /// customer's promo isn't burned by a back-and-retry loop.
       for (const prev of stalePrev) {
         if (prev.couponId != null) {
           await couponsService.refundForBooking({ couponId: prev.couponId, tx });
         }
       }
-      await tx.booking.deleteMany({
+      /// CANCEL (not delete) so the row stays in history and any
+      /// in-flight polling on the old bookingId gets a CANCELLED status
+      /// response rather than a 404 — the customer app can then
+      /// transition to the "rejected" state immediately instead of
+      /// showing "No partners available" for the full 3-minute window.
+      await tx.booking.updateMany({
         where: {
           id: { in: stalePrev.map((b) => b.id) },
           status: 'PENDING',
           partnerId: null,
           paymentStatus: { not: 'paid' },
         },
+        data: { status: 'CANCELLED', dispatchStatus: 'cancelled' },
       });
     }
 
@@ -1955,6 +1961,7 @@ exports.availability = async ({ customerId, id }) => {
       where: { id: Number(id) },
       select: {
         customerId: true,
+        status: true,
         lat: true,
         lng: true,
         customerAddress: { select: { lat: true, lng: true } },
@@ -1962,9 +1969,11 @@ exports.availability = async ({ customerId, id }) => {
       },
     });
     /// Ownership guard — a customer can only probe their OWN booking's
-    /// availability. Soft-fail to the empty result (not a 404) so the
-    /// search sheet's poll degrades gracefully instead of erroring.
+    /// availability. Also guard against CANCELLED / CONFIRMED bookings
+    /// (e.g. a superseded booking that the app is still polling) so the
+    /// geo search doesn't run for a booking that's no longer in flight.
     if (!booking || booking.customerId !== customerId) return fallback;
+    if (booking.status !== 'PENDING') return fallback;
 
     const lat = booking.lat ?? booking.customerAddress?.lat ?? null;
     const lng = booking.lng ?? booking.customerAddress?.lng ?? null;

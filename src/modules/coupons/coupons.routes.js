@@ -20,6 +20,11 @@ const adminOnly = [authenticate, requireType('ADMIN')];
 /// done at booking creation).
 router.post('/apply', customerOnly, validate(applySchema), controller.apply);
 
+/// Customer — list all currently-claimable coupons (active + in-window +
+/// not used up). Registered BEFORE the admin `/:id` route so the literal
+/// path isn't captured as an id.
+router.get('/available', customerOnly, controller.listAvailable);
+
 /// Admin CRUD.
 router.get('/', adminOnly, validate(listQuerySchema), controller.adminList);
 router.post('/', adminOnly, validate(createSchema), controller.adminCreate);

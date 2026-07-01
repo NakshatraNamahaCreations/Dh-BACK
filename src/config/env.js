@@ -69,6 +69,19 @@ const schema = z.object({
   /** Custom endpoint for non-AWS S3 providers (MinIO, Cloudflare R2, etc.) */
   S3_ENDPOINT: z.string().url().optional(),
 
+  // ── Email (SMTP) — used for invoice delivery after payment. When unset,
+  // invoice emails are skipped with a warning log (safe for dev/CI).
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().default(587),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASS: z.string().optional(),
+  SMTP_FROM: z.string().default('noreply@dhoond.in'),
+
+  // ── Company / GST details printed on customer invoices ────────────────
+  COMPANY_NAME: z.string().default('Dhoond Services'),
+  COMPANY_ADDRESS: z.string().default('Bengaluru, Karnataka 560001, India'),
+  COMPANY_GSTIN: z.string().optional(),
+
   // ── QuickeKYC — third-party Aadhaar / PAN / DL verification used
   // during partner onboarding. The token is sent in the request
   // body as `key`. When unset, the /kyc routes return a clear "not

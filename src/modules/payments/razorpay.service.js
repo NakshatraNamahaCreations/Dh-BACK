@@ -452,6 +452,14 @@ exports.verifyPayment = async ({
     );
   });
 
+  /// Enqueue invoice-generation + email delivery. 3 s delay (set in
+  /// enqueuePaymentSuccess) lets this transaction commit before the
+  /// worker reads the booking row. Idempotent jobId deduplicates with
+  /// any concurrent webhook that also fires enqueuePaymentSuccess.
+  dispatchQueue.enqueuePaymentSuccess(booking.id).catch((err) => {
+    logger.warn(`payment_success enqueue failed for booking ${booking.id}: ${err.message}`);
+  });
+
   return result;
 };
 
@@ -793,6 +801,12 @@ exports.handleWebhook = async ({ rawBody, signature }) => {
     /// Idempotent with the verify-path trigger via the queue's
     /// `wave:{bookingId}:{n}` job ids.
     await triggerDispatchIfNeeded(bookingId);
+
+    /// Idempotent with the verify-path enqueue — same jobId means only
+    /// one invoice is generated and emailed even when both paths fire.
+    dispatchQueue.enqueuePaymentSuccess(bookingId).catch((err) => {
+      logger.warn(`payment_success enqueue (webhook) failed for booking ${bookingId}: ${err.message}`);
+    });
   } else if (event === 'payment.failed' && payment.status !== 'paid') {
     await prisma.$transaction(async (tx) => {
       await tx.payment.update({

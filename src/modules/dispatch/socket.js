@@ -45,6 +45,11 @@ let io = null;
 /// presence only when ALL sockets disconnect.
 const partnerSockets = new Map();
 
+/// customerId → pending setTimeout handle. Started when a customer's last
+/// socket disconnects; cleared on reconnect. Module-level so stop() can
+/// drain it during graceful shutdown.
+const customerDisconnectTimers = new Map();
+
 const addPartnerSocket = (partnerId, socketId) => {
   let set = partnerSockets.get(partnerId);
   if (!set) {
@@ -291,6 +296,12 @@ const start = (httpServer) => {
   /// that room so the cart and tracking screens get instant updates.
   const customerNs = io.of('/customers');
 
+  /// Grace period before auto-cancelling an in-flight instant booking
+  /// when a customer's socket drops. Short enough to stop phantom partner
+  /// alerts quickly; long enough to survive brief network blips and app
+  /// backgrounding (which typically reconnect in < 10 s).
+  const CUSTOMER_DISCONNECT_GRACE_MS = 30 * 1000;
+
   customerNs.use((socket, next) => {
     try {
       const token =
@@ -308,7 +319,66 @@ const start = (httpServer) => {
   });
 
   customerNs.on('connection', (socket) => {
-    socket.join(`customer:${socket.data.customerId}`);
+    const customerId = socket.data.customerId;
+    socket.join(`customer:${customerId}`);
+
+    /// If the customer reconnected before the grace period expired,
+    /// abort the pending auto-cancel — their search is still live.
+    if (customerDisconnectTimers.has(customerId)) {
+      clearTimeout(customerDisconnectTimers.get(customerId));
+      customerDisconnectTimers.delete(customerId);
+      logger.info(`customer ${customerId} reconnected — search auto-cancel aborted`);
+    }
+
+    socket.on('disconnect', () => {
+      /// Only start the grace timer when NO other sockets for this
+      /// customer remain on this server instance. A customer with the
+      /// app open on two devices should not trigger a cancel when one
+      /// disconnects.
+      const room = customerNs.adapter.rooms.get(`customer:${customerId}`);
+      if (room && room.size > 0) return;
+
+      const timer = setTimeout(async () => {
+        customerDisconnectTimers.delete(customerId);
+        try {
+          /// Find the most recent PENDING instant booking that hasn't
+          /// been accepted yet. Scheduled bookings are intentionally
+          /// excluded — they're dispatched at a fixed future time, not
+          /// in the active "finding partner" window.
+          const booking = await prisma.booking.findFirst({
+            where: {
+              customerId,
+              status: 'PENDING',
+              partnerId: null,
+              isInstant: true,
+            },
+            select: { id: true },
+            orderBy: { createdAt: 'desc' },
+          });
+          if (!booking) return;
+
+          logger.info(
+            `customer ${customerId} disconnect grace expired — auto-cancelling search booking ${booking.id}`,
+          );
+
+          /// cancelOwn handles the full teardown chain:
+          ///   DB status → CANCELLED
+          ///   dispatcher.cancelAllForBooking → kills queue jobs + clears Redis
+          ///   dispatcher.broadcastClaimed    → pushes dispatch.claimed to every
+          ///     partner who had the offer on screen, closing their job alert
+          ///     immediately without waiting for the 30 s poll window.
+          await require('../bookings/bookings.service').cancelOwn({
+            customerId,
+            id: booking.id,
+            reason: 'Customer app closed',
+          });
+        } catch (err) {
+          logger.warn(`customer ${customerId} disconnect auto-cancel failed: ${err.message}`);
+        }
+      }, CUSTOMER_DISCONNECT_GRACE_MS);
+
+      customerDisconnectTimers.set(customerId, timer);
+    });
   });
 
   /// Wire the dispatcher's emit hook so wave/expire jobs can push
@@ -334,6 +404,10 @@ const stop = async () => {
     io = null;
   }
   partnerSockets.clear();
+  /// Clear any pending customer disconnect timers so graceful shutdown
+  /// doesn't fire auto-cancels against a half-torn-down DB connection.
+  for (const t of customerDisconnectTimers.values()) clearTimeout(t);
+  customerDisconnectTimers.clear();
 };
 
 module.exports = {

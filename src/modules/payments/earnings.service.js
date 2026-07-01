@@ -29,12 +29,37 @@ const resolveCategoryId = (booking) => {
   return first?.service?.categoryId ?? null;
 };
 
-const computeEarning = (bookingTotal, partnerPct) => {
-  /// Whole-rupee math, no floats. `Math.round` would be safer for
-  /// non-multiples of 100 but `Math.floor` matches the standard
-  /// payout-rounding direction (partner gets at most their fair share
-  /// — never more than the rule says).
-  return Math.floor((Number(bookingTotal) * Number(partnerPct)) / 100);
+/// Full breakdown per the business design:
+///
+///   bookingAmount × partnerPct%     → partner GROSS (earnedAmount)
+///   partner gross × 5%              → partner GST (CGST 2.5% + SGST 2.5%)
+///   partner gross − partner GST     → netAmount (actually credited to partner)
+///
+///   bookingAmount × (100−partnerPct)% → Dhoond commission
+///   Dhoond commission × 18%           → Dhoond GST (CGST 9% + SGST 9%)
+///   Dhoond commission − Dhoond GST    → dhoondNet
+///
+/// All values are Int (whole rupees), using Math.floor to avoid
+/// ever crediting more than the rule authorises.
+const computeBreakdown = (bookingAmount, partnerPct) => {
+  const amt      = Number(bookingAmount);
+  const pPct     = Number(partnerPct);
+  const dPct     = 100 - pPct;               // Dhoond's percentage (e.g. 20)
+
+  const earnedAmount     = Math.floor(amt * pPct  / 100);
+  const dhoondCommission = Math.floor(amt * dPct  / 100);
+
+  const partnerGst       = Math.floor(earnedAmount     * 5  / 100);  // 5% GST
+  const dhoondGst        = Math.floor(dhoondCommission * 18 / 100);  // 18% GST
+
+  return {
+    earnedAmount,
+    dhoondCommission,
+    dhoondGst,
+    dhoondNet:  dhoondCommission - dhoondGst,
+    partnerGst,
+    netAmount:  earnedAmount - partnerGst,
+  };
 };
 
 exports.creditForBooking = async (bookingId) => {
@@ -51,7 +76,7 @@ exports.creditForBooking = async (bookingId) => {
 
   const categoryId = resolveCategoryId(booking);
   const partnerPct = await commissionsService.getEffectivePctForCategory(categoryId);
-  const earnedAmount = computeEarning(booking.total, partnerPct);
+  const bd = computeBreakdown(booking.total, partnerPct);
 
   /// Upsert by bookingId so idempotency is enforced at the DB level.
   /// On the second call we return the existing row instead of bumping
@@ -63,11 +88,16 @@ exports.creditForBooking = async (bookingId) => {
   const earning = await prisma.partnerEarning.upsert({
     where: { bookingId: booking.id },
     create: {
-      partnerId: booking.partnerId,
-      bookingId: booking.id,
-      bookingAmount: booking.total,
-      commissionPct: partnerPct,
-      earnedAmount,
+      partnerId:        booking.partnerId,
+      bookingId:        booking.id,
+      bookingAmount:    booking.total,
+      commissionPct:    partnerPct,
+      earnedAmount:     bd.earnedAmount,     // partner gross (before 5% GST)
+      dhoondCommission: bd.dhoondCommission,
+      dhoondGst:        bd.dhoondGst,
+      dhoondNet:        bd.dhoondNet,
+      partnerGst:       bd.partnerGst,
+      netAmount:        bd.netAmount,        // credited to partner after 5% GST
       status: 'pending',
     },
     update: {}, // no-op on duplicate calls
@@ -83,7 +113,7 @@ exports.creditForBooking = async (bookingId) => {
       partnerId: booking.partnerId,
       type: 'job_completed',
       title: 'Job completed',
-      body: `₹${earnedAmount} added to your earnings · Booking #${booking.id}`,
+      body: `₹${bd.netAmount} credited to your earnings · Booking #${booking.id}`,
       bookingId: booking.id,
     });
   }
@@ -121,7 +151,16 @@ const earningShape = (e) => ({
   bookingId: e.bookingId,
   bookingAmount: e.bookingAmount,
   commissionPct: e.commissionPct,
-  earnedAmount: e.earnedAmount,
+  earnedAmount: e.earnedAmount,     // partner gross (before 5% GST)
+  // ── Breakdown ────────────────────────────────────────────────────
+  breakdown: {
+    dhoondCommission: e.dhoondCommission ?? 0,
+    dhoondGst:        e.dhoondGst        ?? 0,
+    dhoondNet:        e.dhoondNet        ?? 0,
+    partnerGst:       e.partnerGst       ?? 0,
+    netAmount:        e.netAmount        ?? 0,  // credited to partner
+  },
+  // ─────────────────────────────────────────────────────────────────
   status: e.status,
   payoutId: e.payoutId,
   createdAt: e.createdAt,
@@ -196,7 +235,7 @@ exports.summaryForPartner = async (partnerId) => {
   const [pending, thisWeek, thisMonth, lifetime] = await Promise.all([
     prisma.partnerEarning.aggregate({
       where: { partnerId: Number(partnerId), status: 'pending' },
-      _sum: { earnedAmount: true },
+      _sum: { earnedAmount: true, netAmount: true },
       _count: { _all: true },
     }),
     prisma.partnerEarning.aggregate({
@@ -204,7 +243,7 @@ exports.summaryForPartner = async (partnerId) => {
         partnerId: Number(partnerId),
         createdAt: { gte: weekStart },
       },
-      _sum: { earnedAmount: true },
+      _sum: { earnedAmount: true, netAmount: true },
       _count: { _all: true },
     }),
     prisma.partnerEarning.aggregate({
@@ -212,21 +251,37 @@ exports.summaryForPartner = async (partnerId) => {
         partnerId: Number(partnerId),
         createdAt: { gte: monthStart },
       },
-      _sum: { earnedAmount: true },
+      _sum: { earnedAmount: true, netAmount: true },
       _count: { _all: true },
     }),
     prisma.partnerEarning.aggregate({
       where: { partnerId: Number(partnerId) },
-      _sum: { earnedAmount: true },
+      _sum: { earnedAmount: true, netAmount: true },
       _count: { _all: true },
     }),
   ]);
 
   return {
-    pending: { amount: pending._sum.earnedAmount ?? 0, count: pending._count._all },
-    thisWeek: { amount: thisWeek._sum.earnedAmount ?? 0, count: thisWeek._count._all },
-    thisMonth: { amount: thisMonth._sum.earnedAmount ?? 0, count: thisMonth._count._all },
-    lifetime: { amount: lifetime._sum.earnedAmount ?? 0, count: lifetime._count._all },
+    pending: {
+      amount: pending._sum.netAmount ?? pending._sum.earnedAmount ?? 0,
+      grossAmount: pending._sum.earnedAmount ?? 0,
+      count: pending._count._all,
+    },
+    thisWeek: {
+      amount: thisWeek._sum.netAmount ?? thisWeek._sum.earnedAmount ?? 0,
+      grossAmount: thisWeek._sum.earnedAmount ?? 0,
+      count: thisWeek._count._all,
+    },
+    thisMonth: {
+      amount: thisMonth._sum.netAmount ?? thisMonth._sum.earnedAmount ?? 0,
+      grossAmount: thisMonth._sum.earnedAmount ?? 0,
+      count: thisMonth._count._all,
+    },
+    lifetime: {
+      amount: lifetime._sum.netAmount ?? lifetime._sum.earnedAmount ?? 0,
+      grossAmount: lifetime._sum.earnedAmount ?? 0,
+      count: lifetime._count._all,
+    },
   };
 };
 
@@ -279,13 +334,13 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
     prisma.partnerEarning.groupBy({
       by: ['partnerId'],
       where: { partnerId: { in: partnerIds }, status: 'pending' },
-      _sum: { earnedAmount: true },
+      _sum: { earnedAmount: true, netAmount: true },
       _count: { _all: true },
     }),
     prisma.partnerEarning.groupBy({
       by: ['partnerId'],
       where: { partnerId: { in: partnerIds } },
-      _sum: { earnedAmount: true },
+      _sum: { earnedAmount: true, netAmount: true },
       _count: { _all: true },
     }),
     prisma.payout.groupBy({
@@ -314,6 +369,10 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
     const lp = lastPaidByPid.get(p.id);
     const adj = pendingAdjByPid.get(p.id);
     const pendingDeductions = adj?._sum.amount ?? 0;
+    // Use netAmount (post-GST) when available, fall back to earnedAmount
+    // for legacy rows that were created before the breakdown columns were added.
+    const pendingNet  = pe?._sum.netAmount  ?? pe?._sum.earnedAmount  ?? 0;
+    const lifetimeNet = lt?._sum.netAmount  ?? lt?._sum.earnedAmount  ?? 0;
     return {
       partnerId: p.id,
       partner: p.name ?? p.businessName ?? `Partner ${p.id}`,
@@ -322,12 +381,12 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
       city: p.cityRef?.name ?? p.city ?? null,
       state: p.cityRef?.state?.name ?? null,
       stateCode: p.cityRef?.state?.code ?? null,
-      pendingAmount: (pe?._sum.earnedAmount ?? 0) - pendingDeductions,
+      pendingAmount: pendingNet - pendingDeductions,
       pendingJobs: pe?._count._all ?? 0,
       /// Surfaced so the payout table can show "−₹X penalties" alongside
       /// the net pending figure.
       pendingDeductions,
-      lifetimeAmount: lt?._sum.earnedAmount ?? 0,
+      lifetimeAmount: lifetimeNet,
       lifetimeJobs: lt?._count._all ?? 0,
       lastPaidAt: lp?._max.paidAt ?? null,
     };

@@ -896,8 +896,20 @@ model PartnerEarning {
   /// category at credit time. Without the snapshot, an admin
   /// changing the % later would silently rewrite history.
   commissionPct Int
-  /// `bookingAmount * commissionPct / 100` rounded to whole rupees.
+  /// `bookingAmount * commissionPct / 100` — partner's GROSS before GST.
   earnedAmount  Int
+
+  // ── Partner Breakdown (per business design) ─────────────────────────────
+  // bookingAmount × (100 − commissionPct) / 100 — Dhoond's 20% cut
+  dhoondCommission  Int  @default(0)
+  // 18% GST on Dhoond's commission (CGST 9% + SGST 9%)
+  dhoondGst         Int  @default(0)
+  // Dhoond's net after paying GST
+  dhoondNet         Int  @default(0)
+  // 5% GST on partner's earned amount (CGST 2.5% + SGST 2.5%)
+  partnerGst        Int  @default(0)
+  // earnedAmount − partnerGst — actual amount credited to partner
+  netAmount         Int  @default(0)
 
   status        String   @default("pending")
 

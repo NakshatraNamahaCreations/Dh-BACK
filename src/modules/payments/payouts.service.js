@@ -73,7 +73,13 @@ exports.generateForPartner = async ({ partnerId, notes = null }) => {
       orderBy: { createdAt: 'asc' },
     });
 
-    const earningsTotal = earnings.reduce((s, e) => s + e.earnedAmount, 0);
+    // Use netAmount (partner's actual credited amount after 5% GST) when the
+    // row has been computed with the new breakdown; fall back to earnedAmount
+    // for legacy rows created before the breakdown columns were added.
+    const earningsTotal = earnings.reduce(
+      (s, e) => s + (e.netAmount > 0 ? e.netAmount : e.earnedAmount),
+      0,
+    );
     const adjustmentsTotal = adjustments.reduce((s, a) => s + a.amount, 0);
     const amount = earningsTotal - adjustmentsTotal;
     const periodStart = earnings[0].createdAt;
@@ -278,6 +284,13 @@ exports.get = async (id) => {
       bookingAmount: e.bookingAmount,
       commissionPct: e.commissionPct,
       earnedAmount: e.earnedAmount,
+      breakdown: {
+        dhoondCommission: e.dhoondCommission ?? 0,
+        dhoondGst:        e.dhoondGst        ?? 0,
+        dhoondNet:        e.dhoondNet        ?? 0,
+        partnerGst:       e.partnerGst       ?? 0,
+        netAmount:        e.netAmount        ?? 0,
+      },
       status: e.status,
       booking: e.booking,
     })),

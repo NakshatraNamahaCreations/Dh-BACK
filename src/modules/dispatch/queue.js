@@ -109,6 +109,25 @@ const enqueuePaymentExpire = async (bookingId, delayMs) => {
   );
 };
 
+/// Payment-success job — enqueued once payment is confirmed (verify +
+/// webhook). Runs the post-payment flow: confirm booking if needed and
+/// deliver the invoice PDF to the customer's email address.
+///
+/// Idempotent jobId means a verify → webhook race safely deduplicates to
+/// one execution. 3 s delay lets the DB transaction from verifyPayment /
+/// handleWebhook fully commit before the worker reads the updated row.
+const enqueuePaymentSuccess = async (bookingId) => {
+  if (!dispatchQueue) return null;
+  return dispatchQueue.add(
+    'payment_success',
+    { bookingId },
+    {
+      delay: 3000,
+      jobId: `payment_success__${bookingId}`,
+    },
+  );
+};
+
 /// Recurring reconciler — installs a repeatable BullMQ job that fires
 /// every RECONCILE_EVERY_MS and looks for orphaned PENDING bookings.
 /// Idempotent: BullMQ dedupes repeatable jobs by their key, so calling
@@ -269,6 +288,7 @@ module.exports = {
   enqueueExpire,
   enqueueAdminTimeout,
   enqueuePaymentExpire,
+  enqueuePaymentSuccess,
   ensureReconcilerScheduled,
   ensureNotificationCleanupScheduled,
   ensureDispatchSweepScheduled,

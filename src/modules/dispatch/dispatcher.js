@@ -759,6 +759,106 @@ const handleNotificationCleanup = async () => {
   return pruneExpired();
 };
 
+/// Payment-success handler — runs once per booking after payment is
+/// confirmed (either via verifyPayment or the Razorpay webhook).
+///
+/// Responsibilities:
+///   1. If a partner has already been assigned but the booking is still
+///      PENDING (edge-case: partner accepted a BYOP, customer paid, but
+///      the status transition was skipped), flip it to CONFIRMED.
+///   2. Generate a GST invoice PDF and email it to the customer.
+///
+/// Idempotent — gated on paymentStatus='paid' so re-enqueue after a
+/// duplicate webhook is always a no-op.
+const handlePaymentSuccess = async ({ bookingId }) => {
+  const booking = await prisma.booking.findUnique({
+    where: { id: bookingId },
+    select: {
+      id: true,
+      status: true,
+      paymentStatus: true,
+      partnerId: true,
+      bookingRef: true,
+      subtotal: true,
+      discount: true,
+      total: true,
+      gstAmount: true,
+      platformFee: true,
+      grandTotal: true,
+      paidAt: true,
+      createdAt: true,
+      scheduledAt: true,
+      addressLine: true,
+      addressLabel: true,
+      customer: { select: { id: true, name: true, email: true } },
+      customerAddress: { select: { addressLine: true } },
+      items: {
+        select: {
+          qty: true,
+          price: true,
+          service: { select: { name: true } },
+        },
+      },
+    },
+  });
+
+  if (!booking) return;
+  if (booking.paymentStatus !== 'paid') return;
+
+  /// Edge-case heal: partner accepted (BYOP) before payment landed, so
+  /// the booking has a partnerId but status is still PENDING.
+  if (booking.status === 'PENDING' && booking.partnerId != null) {
+    const updated = await prisma.booking.updateMany({
+      where: {
+        id: bookingId,
+        status: 'PENDING',
+        partnerId: { not: null },
+        paymentStatus: 'paid',
+      },
+      data: { status: 'CONFIRMED' },
+    });
+    if (updated.count > 0) {
+      logger.info(`payment_success: booking ${bookingId} moved PENDING → CONFIRMED (post-payment)`);
+    }
+  }
+
+  const email = booking.customer?.email;
+  if (!email) {
+    logger.info(`payment_success: booking ${bookingId} paid — no customer email, skipping invoice`);
+    return;
+  }
+
+  try {
+    const { generateInvoicePdf, buildInvoiceEmailHtml, invoiceNumber } = require('../../lib/invoice');
+    const { sendMail } = require('../../lib/email');
+
+    const [pdfBuffer, html] = await Promise.all([
+      generateInvoicePdf(booking),
+      Promise.resolve(buildInvoiceEmailHtml(booking)),
+    ]);
+
+    const invNo = invoiceNumber(booking);
+    await sendMail({
+      to: email,
+      subject: `Your Dhoond Invoice — ${invNo}`,
+      html,
+      attachments: [
+        {
+          filename: `dhoond-invoice-${invNo}.pdf`,
+          content: pdfBuffer,
+          contentType: 'application/pdf',
+        },
+      ],
+    });
+
+    logger.info(`payment_success: invoice ${invNo} emailed → ${email} (booking ${bookingId})`);
+  } catch (err) {
+    logger.warn(`payment_success: invoice email failed for booking ${bookingId}: ${err.message}`);
+    /// Don't rethrow — a failed email must NOT fail the job and trigger
+    /// BullMQ retries (that would re-send the same email on every retry).
+  }
+};
+
 /// BYOP pay-after-accept expiry. Fires 3 min after the partner
 /// accepts a booking with `offeredPrice` set. If the customer still
 /// hasn't paid, the booking auto-cancels back to CANCELLED (with a
@@ -1123,6 +1223,8 @@ const start = () => {
           return handleAdminTimeout(job.data);
         case 'payment_expire':
           return handlePaymentExpire(job.data);
+        case 'payment_success':
+          return handlePaymentSuccess(job.data);
         case 'reconcile':
           /// Run both reconcilers on the 60s tick: orphaned bookings +
           /// stale onDuty mirror rows. Independent, so settle both even
