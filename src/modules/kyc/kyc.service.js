@@ -164,37 +164,44 @@ exports.generateAadhaarOtp = async ({ partnerId, aadhaarNumber, imageUrl, backIm
     throw ApiError.badRequest('Back-of-Aadhaar photo is required.');
   }
 
-  /// OCR check — soft-warn, NOT a hard block. Gallery uploads
-  /// (compressed re-saves, screenshots, OEM "gallery cleaner" passes)
-  /// often degrade the image enough that tesseract can't detect the
-  /// 12-digit number even though the upload is genuinely the partner's
-  /// real card. We were blocking too many legit users.
+  /// OCR gate — HARD block (re-tightened 2026-07-06 by admin decision;
+  /// previously a soft-warn, which let a partner attach any random
+  /// photo and still reach the OTP step — the wrong image was only
+  /// caught later in manual admin review).
   ///
-  /// The actual KYC check happens via QuickeKYC's OTP flow: the OTP
-  /// goes to the Aadhaar-linked mobile, so a partner can't fake their
-  /// way through by typing their own number + uploading someone
-  /// else's card — they wouldn't have the OTP. OCR was only here as
-  /// extra friction to catch fat-finger typos that happen to match a
-  /// different valid Aadhaar. Soft-warn keeps the audit trail without
-  /// false-blocking real uploads.
+  ///   - FRONT: the typed 12-digit number must be readable in the photo
+  ///     (with the OCR class-map + fuzzy/digit-run tolerances).
+  ///   - BACK: must read as an Aadhaar back — the same number OR the
+  ///     mandatory UIDAI template markers (some layouts don't repeat
+  ///     the number on the back, so markers count too).
+  ///
+  /// Infrastructure failures (image fetch error, OCR worker crash)
+  /// still fail OPEN: a real partner shouldn't be blocked because S3 or
+  /// tesseract hiccuped — the OTP-to-linked-mobile flow remains the
+  /// primary identity check regardless. Only a successful OCR pass that
+  /// genuinely can't find the number/markers blocks the request.
   const ocr = require('./ocr.service');
-  try {
-    const [frontOcr, backOcr] = await Promise.all([
-      ocr.numberExistsInImage(imageUrl, digits).catch(() => ({ found: true })),
-      ocr.aadhaarBackMarkersInImage(backImageUrl).catch(() => ({ found: true })),
-    ]);
-    if (!frontOcr.found) {
-      logger.warn(
-        `[kyc] OCR couldn't find digits in front image for partner ${partnerId} — proceeding anyway. OTP gate still applies.`,
-      );
-    }
-    if (!backOcr.found) {
-      logger.warn(
-        `[kyc] OCR couldn't find UIDAI markers on back image for partner ${partnerId} — proceeding anyway.`,
-      );
-    }
-  } catch (err) {
-    logger.warn(`[kyc] OCR pipeline threw for partner ${partnerId}: ${err.message}`);
+  const [frontOcr, backOcr] = await Promise.all([
+    ocr.numberExistsInImage(imageUrl, digits).catch((err) => {
+      logger.warn(`[kyc] front OCR errored for partner ${partnerId} — failing open: ${err.message}`);
+      return { found: true };
+    }),
+    ocr.aadhaarBackMarkersInImage(backImageUrl, digits).catch((err) => {
+      logger.warn(`[kyc] back OCR errored for partner ${partnerId} — failing open: ${err.message}`);
+      return { found: true };
+    }),
+  ]);
+  if (!frontOcr.found) {
+    logger.warn(`[kyc] OCR gate BLOCKED front image for partner ${partnerId} (number not found).`);
+    throw ApiError.badRequest(
+      'We could not find the Aadhaar number you entered on the front photo. Upload a clear, well-lit photo of the FRONT of your Aadhaar card and make sure it matches the number you typed.',
+    );
+  }
+  if (!backOcr.found) {
+    logger.warn(`[kyc] OCR gate BLOCKED back image for partner ${partnerId} (no number / UIDAI markers).`);
+    throw ApiError.badRequest(
+      'The back photo does not look like an Aadhaar card. Upload a clear, well-lit photo of the BACK of your Aadhaar card.',
+    );
   }
 
   const { body } = await post('/api/v1/aadhaar-v2/generate-otp', { id_number: digits });

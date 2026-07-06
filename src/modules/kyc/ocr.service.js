@@ -207,10 +207,16 @@ const BACK_MARKERS = [
  * arbitrary uploads (screenshots, selfies, blank pages) without
  * requiring the partner's specific Aadhaar number to be on the back.
  *
+ * When `number` is passed, the 12-digit Aadhaar number appearing in
+ * the image also counts as a match (same single OCR pass) — most card
+ * layouts DO repeat it on the back, so it rescues photos where the
+ * small UIDAI footer text is blurred but the large number is legible.
+ *
  * @param {string} imageUrl - publicly accessible URL of the back-of-card image
+ * @param {string} [number] - the partner's typed Aadhaar number
  * @returns {Promise<{ found: boolean, extracted?: string }>}
  */
-exports.aadhaarBackMarkersInImage = async (imageUrl) => {
+exports.aadhaarBackMarkersInImage = async (imageUrl, number) => {
   const t0 = Date.now();
   const [worker, buf] = await Promise.all([getWorker(), fetchAndDownscale(imageUrl)]);
   const { data } = await worker.recognize(buf);
@@ -222,9 +228,19 @@ exports.aadhaarBackMarkersInImage = async (imageUrl) => {
   /// random photo from 1947 doesn't slip through.
   const helplineHit =
     lower.includes('1947') && (lower.includes('aadhaar') || lower.includes('aadhar'));
-  const found = Boolean(matched) || helplineHit;
+  /// Number-on-back match — same digit-run / tail8 tolerance the front
+  /// check uses (digits OCR far more reliably than the tiny footer text).
+  let numberHit = false;
+  if (number) {
+    const canonDigits = canonicalise(raw).replace(/\D/g, '');
+    const numDigits = canonicalise(number).replace(/\D/g, '');
+    numberHit =
+      numDigits.length >= 8 &&
+      (canonDigits.includes(numDigits) || canonDigits.includes(numDigits.slice(-8)));
+  }
+  const found = Boolean(matched) || helplineHit || numberHit;
   logger.info(
-    `[ocr] aadhaar-back markers found=${found} marker=${matched || (helplineHit ? '1947+aadhaar' : 'none')} (extracted ${raw.length} chars, ${Date.now() - t0}ms)`,
+    `[ocr] aadhaar-back found=${found} marker=${matched || (helplineHit ? '1947+aadhaar' : numberHit ? 'number' : 'none')} (extracted ${raw.length} chars, ${Date.now() - t0}ms)`,
   );
   return { found, extracted: found ? undefined : raw.slice(0, 300) };
 };
