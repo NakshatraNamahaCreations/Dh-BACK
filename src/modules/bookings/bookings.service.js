@@ -2554,6 +2554,7 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
       id: true,
       status: true,
       partnerId: true,
+      customerId: true,
       lat: true,
       lng: true,
       dispatchStatus: true,
@@ -2679,6 +2680,18 @@ exports.partnerAccept = async ({ bookingId, partnerId }) => {
     await dispatchRegistry.clearBooking(id);
     throw ApiError.conflict('Booking already accepted by another partner');
   }
+
+  /// Push the accept to the customer instantly — the home-screen status
+  /// banner and the accepted sheet flip to "Professional is on the way"
+  /// without waiting for their next poll. Same best-effort contract as
+  /// the arrival / in_progress emits below.
+  try {
+    dispatcher.emitToCustomer(b.customerId, 'booking.updated', {
+      bookingId: id,
+      status: 'CONFIRMED',
+      partnerId: Number(partnerId),
+    });
+  } catch { /* socket optional — poll catches up */ }
 
   /// Mark the partner BUSY so subsequent dispatch waves for OTHER
   /// bookings stop offering jobs to them while they finish this one.

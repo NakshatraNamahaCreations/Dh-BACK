@@ -32,6 +32,12 @@ const presignSchema = z.object({
       )
       .max(80)
       .optional(),
+    /** Opt-in immutable caching: signs `Cache-Control: public,
+     *  max-age=31536000, immutable` into the presigned PUT. The client
+     *  MUST then send that exact header on the PUT (the response echoes
+     *  it as `cacheControl`). Safe because every upload gets a unique
+     *  key — old clients that don't opt in are unaffected. */
+    longCache: z.boolean().optional(),
   }),
 });
 
