@@ -47,6 +47,36 @@ const getWorker = async () => {
   return _workerInitPromise;
 };
 
+/// Second worker dedicated to the digits-only RESCUE pass (see
+/// digitsRescuePass below). Its own worker — not setParameters swaps on
+/// the shared one — because concurrent front+back checks queue jobs on
+/// the same worker, and a whitelist set for one job could leak into the
+/// other. Lazy: only partners whose primary pass misses ever pay the
+/// init cost.
+let _digitWorker = null;
+let _digitWorkerInitPromise = null;
+const getDigitWorker = async () => {
+  if (_digitWorker) return _digitWorker;
+  if (!_digitWorkerInitPromise) {
+    _digitWorkerInitPromise = (async () => {
+      const w = await createWorker('eng', 1, { logger: () => {} });
+      /// PSM 11 = sparse text — hunts for isolated text blobs, which
+      /// finds the big printed Aadhaar number line that PSM 6's
+      /// uniform-block assumption walks straight past on busy
+      /// mixed-script (Kannada/Hindi + English) cards and photos of
+      /// phone screens. The digit whitelist stops regional-script
+      /// glyphs being force-fitted onto letters.
+      await w.setParameters({
+        tessedit_pageseg_mode: '11',
+        tessedit_char_whitelist: '0123456789 ',
+      });
+      _digitWorker = w;
+      return w;
+    })();
+  }
+  return _digitWorkerInitPromise;
+};
+
 /// Pre-warm at module load time so the FIRST partner OTP request
 /// after a server restart doesn't pay the worker init latency. Fire-
 /// and-forget — failure here just falls back to lazy init on first
@@ -127,6 +157,24 @@ const fuzzyContains = (haystack, needle, threshold = 0.85) => {
   return false;
 };
 
+/// Digits-only rescue pass on an already-preprocessed buffer. Run only
+/// after the primary pass misses — a real-world example: an Aadhaar
+/// front where PSM 6 read the English header + DOB but skipped the big
+/// number line entirely (mixed-script layout). The sparse-text digit
+/// worker found it. ~1s extra latency, paid only on primary-pass misses.
+/// Fuzzy tolerance 0.9 over 12 digits allows a single misread digit.
+const digitsRescuePass = async (buf, numDigits) => {
+  if (!numDigits || numDigits.length < 8) return false;
+  const w = await getDigitWorker();
+  const { data } = await w.recognize(buf);
+  const digits = (data.text ?? '').replace(/\D/g, '');
+  return (
+    digits.includes(numDigits) ||
+    digits.includes(numDigits.slice(-8)) ||
+    fuzzyContains(digits, numDigits, 0.9)
+  );
+};
+
 /**
  * @param {string} imageUrl   - publicly accessible URL of the uploaded image
  * @param {string} number     - document number to look for (PAN / DL / Aadhaar)
@@ -169,6 +217,13 @@ exports.numberExistsInImage = async (imageUrl, number) => {
   if (!found && numDigits.length >= 8 && canonDigits.includes(numDigits.slice(-8))) {
     found = true;
     strategy = 'tail8';
+  }
+  ///   5. digits-only rescue — a second recognize with the sparse-text
+  ///      digit-whitelisted worker. Catches numbers the mixed-script
+  ///      primary pass skipped entirely (see digitsRescuePass).
+  if (!found && (await digitsRescuePass(buf, numDigits).catch(() => false))) {
+    found = true;
+    strategy = 'digit-pass';
   }
 
   logger.info(
@@ -231,16 +286,23 @@ exports.aadhaarBackMarkersInImage = async (imageUrl, number) => {
   /// Number-on-back match — same digit-run / tail8 tolerance the front
   /// check uses (digits OCR far more reliably than the tiny footer text).
   let numberHit = false;
-  if (number) {
+  const numDigits = number ? canonicalise(number).replace(/\D/g, '') : '';
+  if (numDigits) {
     const canonDigits = canonicalise(raw).replace(/\D/g, '');
-    const numDigits = canonicalise(number).replace(/\D/g, '');
     numberHit =
       numDigits.length >= 8 &&
       (canonDigits.includes(numDigits) || canonDigits.includes(numDigits.slice(-8)));
   }
-  const found = Boolean(matched) || helplineHit || numberHit;
+  let found = Boolean(matched) || helplineHit || numberHit;
+  let via = matched || (helplineHit ? '1947+aadhaar' : numberHit ? 'number' : 'none');
+  /// Same digits-only rescue the front check uses — a back photo whose
+  /// footer text is blurred can still pass on its big number line.
+  if (!found && (await digitsRescuePass(buf, numDigits).catch(() => false))) {
+    found = true;
+    via = 'digit-pass';
+  }
   logger.info(
-    `[ocr] aadhaar-back found=${found} marker=${matched || (helplineHit ? '1947+aadhaar' : numberHit ? 'number' : 'none')} (extracted ${raw.length} chars, ${Date.now() - t0}ms)`,
+    `[ocr] aadhaar-back found=${found} marker=${via} (extracted ${raw.length} chars, ${Date.now() - t0}ms)`,
   );
   return { found, extracted: found ? undefined : raw.slice(0, 300) };
 };
