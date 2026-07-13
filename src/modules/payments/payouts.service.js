@@ -215,10 +215,21 @@ exports.reject = async ({ payoutId, notes }) => {
 
 /// Read APIs ---------------------------------------------------------
 
-exports.list = async ({ status, search, partnerId, scope, page = 1, pageSize = 25 } = {}) => {
+exports.list = async ({ status, search, partnerId, scope, from, to, page = 1, pageSize = 25 } = {}) => {
   const where = {};
   if (status && status !== 'all') where.status = status;
   if (partnerId) where.partnerId = Number(partnerId);
+  /// Date-range filter (weekly / monthly views + accountant exports).
+  /// Filters on createdAt — for weekly-settlement payouts that's the
+  /// settlement moment; `to` is inclusive (whole day).
+  if (from || to) {
+    where.createdAt = {
+      ...(from ? { gte: new Date(`${from}T00:00:00`) } : {}),
+      ...(to
+        ? { lt: new Date(new Date(`${to}T00:00:00`).getTime() + 24 * 60 * 60 * 1000) }
+        : {}),
+    };
+  }
   if (search) {
     const s = String(search).trim();
     where.partner = {

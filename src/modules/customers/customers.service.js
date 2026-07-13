@@ -414,3 +414,36 @@ exports.setDefaultAddress = async (customerId, addressId) => {
   });
   return addressShape({ ...existing, isDefault: true });
 };
+
+// ── Admin: create customer ──────────────────────────────────────────────────
+// Used by the admin Create-job flow when the person has never used the
+// app. Stored as `+91<10digits>` — the EXACT format the customer app
+// sends at OTP login — so when they later sign in with that number they
+// land on this same account and see the admin-created bookings.
+exports.adminCreate = async ({ name, phone, email }) => {
+  // `phone` arrives validator-normalised to bare 10 digits.
+  const canonical = `+91${phone}`;
+  // Dedupe across historical formats (bare 10-digit / 91-prefixed rows
+  // from older builds) so we never split one person into two accounts.
+  const existing = await prisma.customer.findFirst({
+    where: { phone: { in: [canonical, phone, `91${phone}`] } },
+    select: { id: true, phone: true, name: true },
+  });
+  if (existing) {
+    throw ApiError.conflict(
+      `A customer with this number already exists (${existing.name ?? existing.phone}) — search and select them instead.`,
+    );
+  }
+  const customer = await prisma.customer.create({
+    data: { phone: canonical, name, email: email ?? null },
+  });
+  return {
+    id: customer.id,
+    phone: customer.phone,
+    name: customer.name,
+    email: customer.email,
+    isActive: customer.isActive,
+    createdAt: customer.createdAt,
+    updatedAt: customer.updatedAt,
+  };
+};

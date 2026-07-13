@@ -259,3 +259,54 @@ exports.deleteCity = async (id) => {
     throw err;
   }
 };
+
+// ── Google Places proxy ─────────────────────────────────────────────────────
+// The admin panel can't call Google's Places REST endpoints from the
+// browser (no CORS), so these two thin proxies run the calls server-side
+// with GOOGLE_MAPS_API_KEY. India-biased, matching the customer app.
+
+const GOOGLE_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
+
+exports.searchPlaces = async (q) => {
+  if (!GOOGLE_KEY) throw ApiError.internal('GOOGLE_MAPS_API_KEY not set');
+  const params = new URLSearchParams({
+    input: q,
+    key: GOOGLE_KEY,
+    language: 'en',
+    components: 'country:in',
+  });
+  const res = await fetch(`https://maps.googleapis.com/maps/api/place/autocomplete/json?${params}`);
+  if (!res.ok) throw ApiError.internal('Places search failed');
+  const json = await res.json();
+  if (json.status !== 'OK' && json.status !== 'ZERO_RESULTS') {
+    throw ApiError.internal(`Places search failed (${json.status})`);
+  }
+  return (json.predictions ?? []).map((p) => ({
+    placeId: p.place_id,
+    mainText: p.structured_formatting?.main_text ?? p.description,
+    secondaryText: p.structured_formatting?.secondary_text ?? '',
+    description: p.description,
+  }));
+};
+
+exports.placeDetails = async (placeId) => {
+  if (!GOOGLE_KEY) throw ApiError.internal('GOOGLE_MAPS_API_KEY not set');
+  const params = new URLSearchParams({
+    place_id: placeId,
+    key: GOOGLE_KEY,
+    fields: 'geometry,formatted_address,address_components',
+  });
+  const res = await fetch(`https://maps.googleapis.com/maps/api/place/details/json?${params}`);
+  if (!res.ok) throw ApiError.internal('Place details failed');
+  const json = await res.json();
+  if (json.status !== 'OK' || !json.result) throw ApiError.notFound('Place not found');
+  const comps = json.result.address_components ?? [];
+  const pick = (type) => comps.find((c) => c.types?.includes(type))?.long_name;
+  return {
+    lat: json.result.geometry.location.lat,
+    lng: json.result.geometry.location.lng,
+    formatted: String(json.result.formatted_address ?? '').replace(/, India$/, ''),
+    city: pick('locality') ?? pick('administrative_area_level_2') ?? null,
+    pincode: pick('postal_code') ?? null,
+  };
+};

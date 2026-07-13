@@ -13,6 +13,12 @@ const {
   ledgerQuerySchema,
   razorpayCreateOrderSchema,
   razorpayVerifySchema,
+  razorpayAddOnOrderSchema,
+  razorpayAddOnVerifySchema,
+  weeklyQuerySchema,
+  weeklyMarkPaidSchema,
+  weeklyRemarkSchema,
+  monthlyReportQuerySchema,
 } = require('./payments.validator');
 const controller = require('./payments.controller');
 
@@ -43,6 +49,20 @@ router.post(
   validate(razorpayVerifySchema),
   controller.razorpayVerify,
 );
+// Add-on side-bill: charges the flat sum of the booking's UNPAID
+// partner-added services. Never touches the main bill's rollup.
+router.post(
+  '/razorpay/addon-order',
+  customerOnly,
+  validate(razorpayAddOnOrderSchema),
+  controller.razorpayAddOnOrder,
+);
+router.post(
+  '/razorpay/addon-verify',
+  customerOnly,
+  validate(razorpayAddOnVerifySchema),
+  controller.razorpayAddOnVerify,
+);
 
 // ── Admin: Commission rules ────────────────────────────────────────────────
 router.get('/commission', adminOnly, requirePermission('commission.view'), controller.getCommission);
@@ -54,6 +74,15 @@ router.put('/commission', adminOnly, requirePermission('commission.edit'), valid
 router.get('/earnings/partners', adminOnly, requirePermission('payouts.view'), validate(partnerSummariesQuerySchema), controller.listPartnerSummaries);
 router.get('/earnings/partners/:id/summary', adminOnly, requirePermission('payouts.view'), controller.getPartnerSummary);
 router.get('/earnings/partners/:id', adminOnly, requirePermission('payouts.view'), validate(partnerEarningsQuerySchema), controller.listPartnerEarnings);
+
+// ── Admin: Weekly settlements (Mon–Sun) ────────────────────────────────────
+// Aggregated per-partner earnings for a week + bulk mark-paid after the
+// admin has run the bank transfers from the exported CSV.
+router.get('/weekly', adminOnly, requirePermission('payouts.view'), validate(weeklyQuerySchema), controller.weeklySettlements);
+router.post('/weekly/mark-paid', adminOnly, requirePermission('payouts.mark_paid'), validate(weeklyMarkPaidSchema), controller.weeklyMarkPaid);
+router.post('/weekly/remark', adminOnly, requirePermission('payouts.mark_paid'), validate(weeklyRemarkSchema), controller.weeklySaveRemark);
+// Calendar-month settlement report with the full GST breakdown (accountant view).
+router.get('/report/monthly', adminOnly, requirePermission('payouts.view'), validate(monthlyReportQuerySchema), controller.monthlyReport);
 
 // ── Admin: Payouts ─────────────────────────────────────────────────────────
 router.post('/payouts', adminOnly, requirePermission('payouts.view'), validate(generatePayoutSchema), controller.generatePayout);

@@ -165,6 +165,11 @@ const findApplicableSurge = async ({ city, pincode, when, categoryIds }) => {
   };
 };
 
+/// Exported for booking creation — the SAME rule engine the cart quote
+/// uses, so the price shown in the cart and the price snapshotted on
+/// the booking can never disagree.
+exports.findApplicableSurge = findApplicableSurge;
+
 // ── Cart quote (used by customer app) ──────────────────────────────────────
 //
 // Looks up each line's service + its category's range, applies the

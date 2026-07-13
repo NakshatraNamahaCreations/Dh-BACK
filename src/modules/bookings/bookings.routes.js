@@ -6,6 +6,7 @@ const {
   createSchema,
   listMineQuerySchema,
   cancelSchema,
+  adminCreateSchema,
   adminListQuerySchema,
   disputesListQuerySchema,
   resolveDisputeSchema,
@@ -18,6 +19,8 @@ const {
   partnerIncomingQuerySchema,
   partnerStatusSchema,
   partnerMineQuerySchema,
+  partnerAddOnsSchema,
+  partnerRemoveAddOnSchema,
   partnerCancelSchema,
   rateBookingSchema,
   nearbyEtaQuerySchema,
@@ -36,9 +39,12 @@ router.get('/partner/mine', partnerOnly, validate(partnerMineQuerySchema), contr
 router.post('/partner/:id/accept', partnerOnly, validate(idParam), controller.partnerAccept);
 router.post('/partner/:id/cancel', partnerOnly, validate(partnerCancelSchema), controller.partnerCancel);
 router.post('/partner/:id/status', partnerOnly, validate(partnerStatusSchema), controller.partnerUpdateStatus);
+router.post('/partner/:id/addons', partnerOnly, validate(partnerAddOnsSchema), controller.partnerAddAddOns);
+router.delete('/partner/:id/addons/:addOnId', partnerOnly, validate(partnerRemoveAddOnSchema), controller.partnerRemoveAddOn);
 
 // ── Admin routes (registered before customer-scoped routes so /admin and
 //    /live etc. don't collide with the catch-all /:id) ─────────────────────
+router.post('/admin', adminOnly, requirePermission('bookings.edit'), validate(adminCreateSchema), controller.adminCreate);
 router.get('/admin', adminOnly, requirePermission('bookings.view'), validate(adminListQuerySchema), controller.adminList);
 router.get('/live', adminOnly, requirePermission('bookings.view'), controller.liveJobs);
 router.get('/disputes', adminOnly, requirePermission('bookings.view'), validate(disputesListQuerySchema), controller.listDisputes);

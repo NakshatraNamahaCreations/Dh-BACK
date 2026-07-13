@@ -284,6 +284,9 @@ const PARTNER_INCLUDE = {
   /// so the partner-app can show the actual partner share / platform
   /// commission split on the bill view.
   items: { include: { service: { select: { categoryId: true } } } },
+  /// Partner-added extra services ("Select Add-On" flow). Name/price/
+  /// image are snapshotted on the row, so no service join is needed.
+  addOns: { orderBy: { createdAt: 'asc' } },
   /// Join the canonical address row. New bookings store address only
   /// via `customerAddressId`; the snapshot columns on Booking are
   /// nullable + legacy. Including the relation here lets every shape
@@ -380,6 +383,32 @@ const resolveFare = (b) => {
   };
 };
 
+/// Add-on lines + totals shared by the customer and partner shapes.
+/// `addOnDueTotal` is the amount the customer still owes (unpaid rows
+/// only) — the number the Pay-Now button charges.
+const shapeAddOns = (b) => {
+  const addOns = (b.addOns ?? []).map((a) => ({
+    id: a.id,
+    serviceId: a.serviceId ?? null,
+    name: a.name,
+    price: a.price,
+    qty: a.qty,
+    durationMins: a.durationMins ?? null,
+    image: a.image ?? null,
+    isCustom: a.isCustom ?? false,
+    status: a.status ?? 'unpaid',
+    paidAt: a.paidAt ?? null,
+  }));
+  const addOnTotal = addOns.reduce((s, a) => s + a.price * a.qty, 0);
+  const addOnDueTotal = addOns
+    .filter((a) => a.status !== 'paid')
+    .reduce((s, a) => s + a.price * a.qty, 0);
+  /// Settled add-on money — rolls into the displayed grand total and the
+  /// partner's commission base once the customer has actually paid.
+  const addOnPaidTotal = addOnTotal - addOnDueTotal;
+  return { addOns, addOnTotal, addOnDueTotal, addOnPaidTotal };
+};
+
 /// `commissionMap` is an optional Map<categoryId, partnerPct>. When
 /// absent, falls back to the platform default (80%) so the helper
 /// remains usable in code paths that don't prefetch commission rules.
@@ -399,16 +428,21 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
   }));
 
   const fare = resolveFare(b);
+  const addOnShape = shapeAddOns(b);
+  /// PAID add-ons roll into the job's revenue — the customer has settled
+  /// that money, so the partner's Amount / Revenue / earning all include
+  /// it. Unpaid add-ons stay out until they're actually paid.
+  const revenueTotal = fare.grandTotal + addOnShape.addOnPaidTotal;
   const primaryCategoryId = b.items?.[0]?.service?.categoryId ?? null;
   const partnerCommissionPct =
     (commissionMap && primaryCategoryId != null
       ? commissionMap.get(primaryCategoryId)
       : undefined) ?? 80;
-  /// Commission base = grandTotal (customer's all-in price).
-  /// Partner gross = grandTotal × partnerPct%.
+  /// Commission base = grandTotal + paid add-ons (customer's all-in
+  /// settled amount). Partner gross = base × partnerPct%.
   /// Partner 5% GST is deducted from gross → net is what gets credited.
   /// Matches the earnings.service computeBreakdown design exactly.
-  const _partnerGross = Math.floor((fare.grandTotal * partnerCommissionPct) / 100);
+  const _partnerGross = Math.floor((revenueTotal * partnerCommissionPct) / 100);
   const _partnerGst   = Math.round(_partnerGross * 5 / 100);
   const partnerEarning = _partnerGross - _partnerGst; // net credited to partner
 
@@ -470,7 +504,9 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     /// (created before these columns existed) don't surface NaN/0 on
     /// the partner's bill view.
     total: fare.total,
-    grandTotal: fare.grandTotal,
+    /// Customer's all-in SETTLED amount: original grandTotal + paid
+    /// add-ons. Unpaid add-on money is excluded until it lands.
+    grandTotal: revenueTotal,
     gstAmount: fare.gstAmount,
     platformFee: fare.platformFee,
     /// Partner-side earnings split for THIS booking. `partnerEarning`
@@ -482,6 +518,10 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     partnerEarning,
     platformCommission: fare.total - partnerEarning,
     offeredPrice: b.offeredPrice ?? null,
+    /// High-demand pricing snapshot — non-null when surge raised this
+    /// booking's prices; the partner summary explains the higher rates.
+    surgeMultiplier: b.surgeMultiplier ?? null,
+    surgeRuleName: b.surgeRuleName ?? null,
     /// Payment lifecycle surfaced to the partner app so the partner can
     /// see whether the customer has paid yet — drives the "Awaiting
     /// payment" / "Paid" pill on the partner's booking views.
@@ -509,6 +549,10 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     arrivedAt: b.arrivedAt ?? null,
     jobStartedAt: b.jobStartedAt ?? null,
     jobCompletedAt: b.jobCompletedAt ?? null,
+    /// Partner-added extra services + their totals ("Select Add-On"
+    /// flow). `addOnDueTotal` > 0 drives the "awaiting add-on payment"
+    /// state on the job card.
+    ...addOnShape,
   };
 };
 
@@ -526,6 +570,9 @@ const BOOKING_INCLUDE = {
       },
     },
   },
+  /// Partner-added extra services — surfaced on the customer's booking
+  /// summary ("Added services" section) with their own Pay-Now flow.
+  addOns: { orderBy: { createdAt: 'asc' } },
   /// Same FK-first join the partner/admin shapes use — pulls the
   /// authoritative address from `customer_addresses` so consumers
   /// never have to read the legacy snapshot columns directly.
@@ -648,6 +695,11 @@ const shape = (b) => {
   /// edits to the coupon row).
   couponCode: b.couponCode ?? null,
   couponDiscount: b.couponDiscount ?? null,
+  /// High-demand pricing snapshot — non-null when a surge rule raised
+  /// this booking's item prices. Summaries surface it so the customer
+  /// knows WHY prices are above catalog.
+  surgeMultiplier: b.surgeMultiplier ?? null,
+  surgeRuleName: b.surgeRuleName ?? null,
   /// Job handoff codes — visible to the customer only. The customer
   /// reads these aloud to the partner at start / completion. Once the
   /// partner has verified the code we record the timestamp; UI can use
@@ -690,9 +742,30 @@ const shape = (b) => {
     image: it.service?.imageUrl ?? null,
     durationMins: it.service?.durationMins ?? null,
   })),
+  /// Partner-added extra services ("Added services" on the summary).
+  /// Billed separately from the original items — `addOnDueTotal` is what
+  /// the add-on Pay-Now button charges; 0 once everything is settled.
+  ...shapeAddOns(b),
   createdAt: b.createdAt,
   updatedAt: b.updatedAt,
   };
+};
+
+/// Admin "create job" — books on behalf of an existing customer using
+/// the exact same pipeline as the customer app (live catalog pricing,
+/// fare snapshot, OTPs, bookingRef, slot capacity). Thin wrapper that
+/// first verifies the target customer, so a typo'd id fails with a
+/// clean 404 instead of a Prisma FK error.
+exports.adminCreate = async ({ payload }) => {
+  const customer = await prisma.customer.findUnique({
+    where: { id: Number(payload.customerId) },
+    select: { id: true, isActive: true },
+  });
+  if (!customer) throw ApiError.notFound('Customer not found');
+  if (customer.isActive === false) {
+    throw ApiError.badRequest('This customer account is paused — reactivate it first.');
+  }
+  return exports.create({ customerId: customer.id, payload });
 };
 
 exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
@@ -813,12 +886,42 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
     cityId: bookingCityId,
   });
 
+  /// Surge pricing — the same rule engine the cart's price quote uses,
+  /// applied at CREATE time so the surged price is what actually gets
+  /// snapshotted and charged (previously surge only affected the BYOP
+  /// slider bounds; the booking itself was silently created at base
+  /// price). Keyed on the service address + the SCHEDULED time (demand
+  /// at service time, not checkout time). Fails open — a pricing-module
+  /// hiccup must never block a booking.
+  let surge = null;
+  try {
+    const pricingService = require('../pricing/pricing.service');
+    surge = await pricingService.findApplicableSurge({
+      city: saved?.city ?? inlineAddress?.city,
+      pincode: saved?.pincode ?? inlineAddress?.pincode,
+      when: new Date(payload.scheduledAt),
+      categoryIds: [...new Set(services.map((s) => s.categoryId))],
+    });
+  } catch {
+    surge = null;
+  }
+  const surgeMultFor = (svc) =>
+    surge && (surge.categoryId === null || surge.categoryId === svc.categoryId)
+      ? surge.multiplier
+      : 1;
+
+  /// True only when the surge actually raised at least one line — a
+  /// category-scoped rule can match the area/time but miss every item
+  /// in this cart, in which case we don't stamp the booking.
+  let surgeApplied = false;
   const items = payload.items.map((i) => {
     const svc = map.get(i.serviceId);
+    const mult = surgeMultFor(svc);
+    if (mult !== 1) surgeApplied = true;
     return {
       serviceId: i.serviceId,
       serviceName: svc.name,
-      basePrice: svc.basePrice,
+      basePrice: Math.round(svc.basePrice * mult),
       qty: i.qty,
     };
   });
@@ -942,6 +1045,10 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
         couponCode: couponData?.couponCode ?? null,
         couponDiscount: couponData ? couponData.discount : null,
         dispatchStatus: 'waiting',
+        /// Surge snapshot — lets every summary EXPLAIN why item prices
+        /// are above catalog (customer/partner confusion otherwise).
+        surgeMultiplier: surgeApplied ? surge.multiplier : null,
+        surgeRuleName: surgeApplied ? surge.ruleName : null,
         jobStartOtp: generateOtp(),
         jobCompleteOtp: generateOtp(),
         notes: payload.notes ?? null,
@@ -1064,12 +1171,20 @@ exports.listMine = async ({ customerId, status, bucket }) => {
     ///
     /// The rows stay in the DB for audit / support / fraud detection —
     /// we just stop surfacing the noise to the customer.
+    ///
+    /// NOTE: system-driven cancellations (noPartnerReason set) are NOT
+    /// blanket-hidden anymore. With the pay-first instant flow a
+    /// customer can PAY and then have the broadcast expire with no
+    /// partner — that booking MUST stay visible so they can see the
+    /// refund status. The "real booking" test below (partner assigned
+    /// OR money moved) already keeps the junk out: unpaid partnerless
+    /// attempts — abandoned searches AND unpaid broadcast expiries —
+    /// still never surface.
     delete where.status;
     where.OR = [
       { status: 'COMPLETED' },
       {
         status: 'CANCELLED',
-        noPartnerReason: null,
         /// Real booking: a partner was assigned at some point, OR the
         /// customer paid (paid / refund_pending / refunded).
         OR: [
@@ -1338,6 +1453,8 @@ const ADMIN_INCLUDE = {
       },
     },
   },
+  /// Partner-added extra services — audited on the admin booking detail.
+  addOns: { orderBy: { createdAt: 'asc' } },
   rating: {
     select: { id: true, stars: true, comment: true, createdAt: true, updatedAt: true },
   },
@@ -1451,6 +1568,8 @@ const adminShape = (b) => {
     grandTotal: b.grandTotal && b.grandTotal > 0 ? b.grandTotal : b.total,
     couponCode: b.couponCode,
     couponDiscount: b.couponDiscount,
+    surgeMultiplier: b.surgeMultiplier ?? null,
+    surgeRuleName: b.surgeRuleName ?? null,
     /// Payment rollup mirrored from the latest Payment row.
     paymentStatus: b.paymentStatus ?? 'unpaid',
     paymentMethod: b.paymentMethod ?? null,
@@ -1468,6 +1587,9 @@ const adminShape = (b) => {
       status: p.status,
       method: p.method,
       provider: p.provider,
+      /// "booking" (original bill) vs "addons" (partner-added services
+      /// side-bill) — lets the admin tell the two charge types apart.
+      purpose: p.purpose ?? 'booking',
       providerOrderId: p.providerOrderId,
       providerPaymentId: p.providerPaymentId,
       paidAt: p.paidAt,
@@ -1487,6 +1609,9 @@ const adminShape = (b) => {
       imageUrl: it.service?.imageUrl ?? null,
       category: it.service?.category?.name ?? '',
     })),
+    /// Partner-added extra services + totals (addOns / addOnTotal /
+    /// addOnDueTotal / addOnPaidTotal) for the booking-detail audit view.
+    ...shapeAddOns(b),
     createdAt: b.createdAt,
     updatedAt: b.updatedAt,
   };
@@ -3131,6 +3256,112 @@ exports.partnerUpdateStatus = async ({ bookingId, partnerId, status, otp }) => {
     await dispatchRegistry.clearActiveJob(partnerId).catch(() => {});
     require('../tracking/tracking.service').setBusyState({ partnerId, busy: false });
   }
+
+  const commissionMap = await loadCommissionMap();
+  return partnerShape(updated, null, commissionMap);
+};
+
+/// Partner adds extra services to a job they're on ("Select Add-On").
+/// Catalog picks carry `serviceId` (name/price/image snapshotted from the
+/// Service row); custom lines carry a free-form `name` + `price`. Only
+/// allowed while the job is live (CONFIRMED / IN_PROGRESS) — completed
+/// or cancelled jobs are immutable.
+exports.partnerAddAddOns = async ({ partnerId, bookingId, items }) => {
+  const id = Number(bookingId);
+  const b = await prisma.booking.findUnique({
+    where: { id },
+    select: { id: true, partnerId: true, customerId: true, status: true },
+  });
+  if (!b) throw ApiError.notFound('Booking not found');
+  if (b.partnerId !== partnerId) throw ApiError.forbidden('Not your booking');
+  if (b.status !== 'CONFIRMED' && b.status !== 'IN_PROGRESS') {
+    throw ApiError.badRequest('Add-ons can only be added while the job is active.');
+  }
+
+  /// Resolve catalog picks in one query; snapshot fields at add time so
+  /// later catalog edits never rewrite billing history.
+  const serviceIds = items.map((it) => it.serviceId).filter((x) => x != null);
+  const services = serviceIds.length
+    ? await prisma.service.findMany({
+        where: { id: { in: serviceIds }, active: true },
+        select: {
+          id: true,
+          name: true,
+          basePrice: true,
+          durationMins: true,
+          imageUrl: true,
+          thumbnailUrl: true,
+        },
+      })
+    : [];
+  const serviceMap = new Map(services.map((s) => [s.id, s]));
+
+  const rows = items.map((it) => {
+    if (it.serviceId != null) {
+      const s = serviceMap.get(it.serviceId);
+      if (!s) throw ApiError.badRequest(`Service ${it.serviceId} not found or inactive`);
+      return {
+        bookingId: id,
+        serviceId: s.id,
+        name: s.name,
+        price: s.basePrice,
+        qty: it.qty ?? 1,
+        durationMins: s.durationMins ?? null,
+        image: s.thumbnailUrl ?? s.imageUrl ?? null,
+        isCustom: false,
+        addedById: partnerId,
+      };
+    }
+    /// Custom add-on — validator guarantees name + price are present
+    /// when serviceId is absent.
+    return {
+      bookingId: id,
+      serviceId: null,
+      name: String(it.name).trim(),
+      price: it.price,
+      qty: it.qty ?? 1,
+      durationMins: null,
+      image: null,
+      isCustom: true,
+      addedById: partnerId,
+    };
+  });
+
+  await prisma.bookingAddOn.createMany({ data: rows });
+  const updated = await prisma.booking.findUnique({ where: { id }, include: PARTNER_INCLUDE });
+
+  /// Nudge the customer's booking screens (they also poll every 5s).
+  try {
+    dispatcher.emitToCustomer(b.customerId, 'booking.addons_updated', { bookingId: id });
+  } catch { /* socket optional — poll catches up */ }
+
+  const commissionMap = await loadCommissionMap();
+  return partnerShape(updated, null, commissionMap);
+};
+
+/// Partner removes an add-on they added — only while it's still unpaid.
+/// Once the customer has paid for a line it's part of billing history.
+exports.partnerRemoveAddOn = async ({ partnerId, bookingId, addOnId }) => {
+  const id = Number(bookingId);
+  const b = await prisma.booking.findUnique({
+    where: { id },
+    select: { id: true, partnerId: true, customerId: true },
+  });
+  if (!b) throw ApiError.notFound('Booking not found');
+  if (b.partnerId !== partnerId) throw ApiError.forbidden('Not your booking');
+
+  const addOn = await prisma.bookingAddOn.findUnique({ where: { id: Number(addOnId) } });
+  if (!addOn || addOn.bookingId !== id) throw ApiError.notFound('Add-on not found');
+  if (addOn.status === 'paid') {
+    throw ApiError.badRequest('This add-on is already paid and cannot be removed.');
+  }
+
+  await prisma.bookingAddOn.delete({ where: { id: addOn.id } });
+  const updated = await prisma.booking.findUnique({ where: { id }, include: PARTNER_INCLUDE });
+
+  try {
+    dispatcher.emitToCustomer(b.customerId, 'booking.addons_updated', { bookingId: id });
+  } catch { /* socket optional — poll catches up */ }
 
   const commissionMap = await loadCommissionMap();
   return partnerShape(updated, null, commissionMap);

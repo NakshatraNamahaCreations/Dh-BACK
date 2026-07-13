@@ -59,10 +59,27 @@ const addressIdParam = z.object({
   params: z.object({ id: z.coerce.number().int().positive() }),
 });
 
+/// Admin "create customer" (used by the Create-job flow when the person
+/// has never used the app). Phone normalises to the last 10 digits —
+/// same rule the OTP login uses — so when the customer later signs in
+/// with that number they land on THIS account and see their bookings.
+const adminCreateSchema = z.object({
+  body: z.object({
+    name: z.string().trim().min(2, 'Name is required').max(80),
+    phone: z
+      .string()
+      .trim()
+      .transform((p) => p.replace(/\D/g, '').slice(-10))
+      .refine((p) => /^[6-9]\d{9}$/.test(p), 'Enter a valid 10-digit mobile number'),
+    email: z.string().trim().email().max(120).optional(),
+  }),
+});
+
 module.exports = {
   idParam,
   listQuerySchema,
   createAddressSchema,
   updateAddressSchema,
   addressIdParam,
+  adminCreateSchema,
 };

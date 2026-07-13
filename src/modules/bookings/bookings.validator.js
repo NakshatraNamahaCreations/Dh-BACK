@@ -53,6 +53,36 @@ const createSchema = z.object({
     }),
 });
 
+/// Admin "create job on behalf of a customer" — same shape as the
+/// customer createSchema plus the target customerId. Coupons and BYOP
+/// (offeredPrice) are deliberately left out: those are customer-side
+/// flows; an admin books at catalog price. Payment stays "unpaid" —
+/// the admin collects via the existing Mark-Paid (cash) action or the
+/// customer pays in-app.
+const adminCreateSchema = z.object({
+  body: z
+    .object({
+      customerId: z.number().int().positive('customerId is required'),
+      items: z.array(itemSchema).min(1, 'Cart cannot be empty').max(20),
+      scheduledAt: z.string().datetime('scheduledAt must be ISO timestamp'),
+      slotLabel: z.string().trim().min(1).max(80),
+      isInstant: z.boolean().optional(),
+      customerAddressId: z.number().int().positive().optional(),
+      addressLabel: z.string().trim().min(1).max(40).default('Home'),
+      addressLine: z.string().trim().min(5, 'Full address is required').max(300).optional(),
+      city: z.string().trim().min(1).max(80).optional(),
+      pincode: z.string().trim().regex(/^\d{3,8}$/, 'Invalid pincode').optional(),
+      lat: z.number().min(-90).max(90).optional(),
+      lng: z.number().min(-180).max(180).optional(),
+      discount: z.number().int().min(0).max(10_000_000).optional(),
+      notes: z.string().trim().max(500).optional(),
+    })
+    .refine((v) => Boolean(v.customerAddressId) || (v.addressLine && v.city), {
+      message: 'Either customerAddressId or addressLine + city must be provided',
+      path: ['addressLine'],
+    }),
+});
+
 // ── Admin filters ───────────────────────────────────────────────────────────
 
 const adminListQuerySchema = z.object({
@@ -226,6 +256,33 @@ const partnerMineQuerySchema = z.object({
   }),
 });
 
+/// One add-on line: either a catalog pick (serviceId) or a custom line
+/// (name + price). qty defaults to 1 server-side.
+const addOnItemSchema = z
+  .object({
+    serviceId: z.number().int().positive().optional(),
+    name: z.string().trim().min(2, 'Name too short').max(80).optional(),
+    price: z.number().int().min(1, 'Price must be at least ₹1').max(100000).optional(),
+    qty: z.number().int().min(1).max(20).optional(),
+  })
+  .refine((it) => it.serviceId != null || (it.name && it.price != null), {
+    message: 'Each add-on needs a serviceId, or a name and price for custom add-ons',
+  });
+
+const partnerAddOnsSchema = z.object({
+  params: z.object({ id: z.coerce.number().int().positive() }),
+  body: z.object({
+    items: z.array(addOnItemSchema).min(1, 'Pick at least one add-on').max(20),
+  }),
+});
+
+const partnerRemoveAddOnSchema = z.object({
+  params: z.object({
+    id: z.coerce.number().int().positive(),
+    addOnId: z.coerce.number().int().positive(),
+  }),
+});
+
 /// Partner backing out of an accepted job. Reason is optional (the
 /// partner-app offers a quick reason list but lets them skip it) and
 /// capped like the customer cancel reason.
@@ -244,6 +301,7 @@ module.exports = {
   listMineQuerySchema,
   cancelSchema,
   partnerCancelSchema,
+  adminCreateSchema,
   adminListQuerySchema,
   disputesListQuerySchema,
   resolveDisputeSchema,
@@ -256,6 +314,8 @@ module.exports = {
   partnerIncomingQuerySchema,
   partnerStatusSchema,
   partnerMineQuerySchema,
+  partnerAddOnsSchema,
+  partnerRemoveAddOnSchema,
   rateBookingSchema,
   nearbyEtaQuerySchema,
 };

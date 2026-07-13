@@ -60,6 +60,9 @@ const payoutListQuerySchema = z.object({
     /// Geography filter — scopes payouts by Partner.cityId.
     cityId: z.coerce.number().int().positive().optional(),
     stateId: z.coerce.number().int().positive().optional(),
+    /// Date range (inclusive) — weekly / monthly history filters.
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     page: z.coerce.number().int().min(1).optional(),
     pageSize: z.coerce.number().int().min(1).max(100).optional(),
   }),
@@ -117,6 +120,42 @@ const razorpayVerifySchema = z.object({
   }),
 });
 
+/// Add-on side-bill — same field shapes as the main order/verify pair.
+const razorpayAddOnOrderSchema = razorpayCreateOrderSchema;
+const razorpayAddOnVerifySchema = razorpayVerifySchema;
+
+/// Weekly settlements — weekStart is any date inside the target week
+/// (server normalises to that week's Monday).
+const weeklyQuerySchema = z.object({
+  query: z.object({
+    weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'weekStart must be YYYY-MM-DD'),
+  }),
+});
+
+const weeklyMarkPaidSchema = z.object({
+  body: z.object({
+    weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'weekStart must be YYYY-MM-DD'),
+    /// Omitted/empty = settle EVERY partner with pending earnings that week.
+    partnerIds: z.array(z.number().int().positive()).max(1000).optional(),
+  }),
+});
+
+/// Monthly settlement report — calendar month, accountant view.
+const monthlyReportQuerySchema = z.object({
+  query: z.object({
+    month: z.string().regex(/^\d{4}-\d{2}$/, 'month must be YYYY-MM'),
+  }),
+});
+
+/// Weekly remark — empty remark clears the note.
+const weeklyRemarkSchema = z.object({
+  body: z.object({
+    weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'weekStart must be YYYY-MM-DD'),
+    partnerId: z.number().int().positive(),
+    remark: z.string().trim().max(500).optional().default(''),
+  }),
+});
+
 module.exports = {
   idParam,
   saveCommissionSchema,
@@ -130,4 +169,10 @@ module.exports = {
   ledgerQuerySchema,
   razorpayCreateOrderSchema,
   razorpayVerifySchema,
+  razorpayAddOnOrderSchema,
+  razorpayAddOnVerifySchema,
+  weeklyQuerySchema,
+  weeklyMarkPaidSchema,
+  weeklyRemarkSchema,
+  monthlyReportQuerySchema,
 };

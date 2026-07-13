@@ -7,6 +7,7 @@ const {
   createAddressSchema,
   updateAddressSchema,
   addressIdParam,
+  adminCreateSchema,
 } = require('./customers.validator');
 const controller = require('./customers.controller');
 
@@ -40,6 +41,7 @@ router.post(
 );
 
 // ── Admin ──────────────────────────────────────────────────────────────────
+router.post('/', adminOnly, validate(adminCreateSchema), controller.adminCreate);
 router.get('/', adminOnly, validate(listQuerySchema), controller.list);
 router.get('/:id', adminOnly, validate(idParam), controller.get);
 router.post('/:id/toggle', adminOnly, validate(idParam), controller.toggleActive);

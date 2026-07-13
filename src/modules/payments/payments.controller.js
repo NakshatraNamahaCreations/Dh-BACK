@@ -35,6 +35,35 @@ exports.getPartnerSummary = asyncHandler(async (req, res) => {
   success(res, data, 'Partner summary fetched');
 });
 
+// ── Weekly settlements (Mon–Sun) ───────────────────────────────────────────
+
+exports.weeklySettlements = asyncHandler(async (req, res) => {
+  const data = await earnings.weeklySettlements({ weekStart: req.query.weekStart });
+  success(res, data, 'Weekly settlements fetched');
+});
+
+exports.weeklyMarkPaid = asyncHandler(async (req, res) => {
+  const data = await earnings.weeklyMarkPaid({
+    weekStart: req.body.weekStart,
+    partnerIds: req.body.partnerIds,
+  });
+  success(res, data, 'Weekly settlements marked paid');
+});
+
+exports.monthlyReport = asyncHandler(async (req, res) => {
+  const data = await earnings.monthlyReport({ month: req.query.month });
+  success(res, data, 'Monthly report fetched');
+});
+
+exports.weeklySaveRemark = asyncHandler(async (req, res) => {
+  const data = await earnings.weeklySaveRemark({
+    weekStart: req.body.weekStart,
+    partnerId: req.body.partnerId,
+    remark: req.body.remark,
+  });
+  success(res, data, 'Remark saved');
+});
+
 exports.listPartnerEarnings = asyncHandler(async (req, res) => {
   const { data, meta } = await earnings.listForPartner({
     partnerId: req.params.id,
@@ -120,6 +149,25 @@ exports.razorpayVerify = asyncHandler(async (req, res) => {
     razorpaySignature: req.body.razorpaySignature,
   });
   success(res, { bookingId: booking.id, paymentStatus: booking.paymentStatus }, 'Payment verified');
+});
+
+exports.razorpayAddOnOrder = asyncHandler(async (req, res) => {
+  const data = await razorpay.createAddOnOrder({
+    bookingId: req.body.bookingId,
+    customerId: req.user.sub,
+  });
+  success(res, data, 'Razorpay add-on order created');
+});
+
+exports.razorpayAddOnVerify = asyncHandler(async (req, res) => {
+  const data = await razorpay.verifyAddOnPayment({
+    bookingId: req.body.bookingId,
+    customerId: req.user.sub,
+    razorpayOrderId: req.body.razorpayOrderId,
+    razorpayPaymentId: req.body.razorpayPaymentId,
+    razorpaySignature: req.body.razorpaySignature,
+  });
+  success(res, data, 'Add-on payment verified');
 });
 
 exports.razorpayWebhook = asyncHandler(async (req, res) => {

@@ -1,7 +1,7 @@
 const { verifyToken } = require('../utils/jwt');
 const ApiError = require('../utils/ApiError');
 
-const authenticate = (req, res, next) => {
+const authenticate = async (req, res, next) => {
   try {
     const header = req.headers.authorization;
     if (!header || !header.startsWith('Bearer ')) {
@@ -10,11 +10,35 @@ const authenticate = (req, res, next) => {
     const token = header.slice(7);
     const payload = verifyToken(token);
     /// Payload shape:
-    ///   - CUSTOMER / PARTNER: { sub, type }
-    ///   - ADMIN:              { sub, type, role, cityIds }
+    ///   - CUSTOMER:  { sub, type }
+    ///   - PARTNER:   { sub, type, sid } (sid = single-device session id)
+    ///   - ADMIN:     { sub, type, role, cityIds }
     /// role/cityIds are only present on admin tokens; consumers must
     /// guard accordingly (or use the scope helper which handles the
     /// missing-fields case).
+
+    /// Single-device gate for partners: the token's `sid` must match the
+    /// partner row's currentSessionId (re-minted on every OTP login).
+    /// A mismatch means the account logged in on ANOTHER device since
+    /// this token was issued → 401 so the stale device signs out.
+    /// Legacy grace: rows with a null currentSessionId (no login since
+    /// the feature shipped) accept any valid token.
+    if (payload.type === 'PARTNER') {
+      const prisma = require('../config/prisma');
+      const partner = await prisma.partner.findUnique({
+        where: { id: Number(payload.sub) },
+        select: { currentSessionId: true },
+      });
+      if (
+        partner?.currentSessionId != null &&
+        payload.sid !== partner.currentSessionId
+      ) {
+        throw ApiError.unauthorized(
+          'You were signed in on another device. Please log in again.',
+        );
+      }
+    }
+
     req.user = payload;
     next();
   } catch (err) {

@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const prisma = require('../../config/prisma');
 const logger = require('../../config/logger');
 const ApiError = require('../../utils/ApiError');
@@ -66,7 +67,19 @@ const partnerVerifyOtp = async ({ phone, code, name }) => {
     } catch { /* notification surface should never block login */ }
   }
 
-  const token = signToken({ sub: partner.id, type: 'PARTNER' });
+  /// Single-device login. Mint a fresh session id on EVERY partner
+  /// login and persist it as the only session allowed to act as this
+  /// partner. The id rides in the JWT (`sid`); the auth middleware
+  /// rejects any partner token whose sid doesn't match the row — so
+  /// logging in on a new device force-logs-out the previous one on its
+  /// next API call.
+  const sessionId = crypto.randomUUID();
+  await prisma.partner.update({
+    where: { id: partner.id },
+    data: { currentSessionId: sessionId },
+  });
+
+  const token = signToken({ sub: partner.id, type: 'PARTNER', sid: sessionId });
   return { user: partner, token };
 };
 

@@ -8,6 +8,8 @@ const {
   updateStateSchema,
   createCitySchema,
   updateCitySchema,
+  placesSearchQuerySchema,
+  placeDetailsQuerySchema,
 } = require('./geography.validator');
 const controller = require('./geography.controller');
 
@@ -21,6 +23,12 @@ const adminOnly = [authenticate, requireType('ADMIN')];
 router.get('/cities/active', controller.listActiveCities);
 
 // ── Admin ──────────────────────────────────────────────────────────────────
+// Google Places proxy for the Create-job address search — the browser
+// can't hit Google's REST endpoints directly (CORS), so the key lives
+// server-side and these two endpoints relay.
+router.get('/places/search', adminOnly, validate(placesSearchQuerySchema), controller.searchPlaces);
+router.get('/places/details', adminOnly, validate(placeDetailsQuerySchema), controller.placeDetails);
+
 router.get('/states', adminOnly, controller.listStates);
 router.post('/states', adminOnly, validate(createStateSchema), controller.createState);
 router.patch('/states/:id', adminOnly, validate(updateStateSchema), controller.updateState);

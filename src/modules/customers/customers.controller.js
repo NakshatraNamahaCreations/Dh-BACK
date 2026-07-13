@@ -48,3 +48,9 @@ exports.setMyDefaultAddress = asyncHandler(async (req, res) => {
   const item = await service.setDefaultAddress(req.user.sub, req.params.id);
   success(res, item, 'Default address updated');
 });
+
+// ── Admin: create customer (Create-job flow) ────────────────────────────────
+exports.adminCreate = asyncHandler(async (req, res) => {
+  const item = await service.adminCreate(req.body);
+  created(res, item, 'Customer created');
+});

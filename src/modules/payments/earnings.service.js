@@ -76,6 +76,7 @@ exports.creditForBooking = async (bookingId) => {
     where: { id: Number(bookingId) },
     include: {
       items: { include: { service: { select: { categoryId: true } } } },
+      addOns: { select: { price: true, qty: true, status: true } },
     },
   });
   if (!booking) throw ApiError.notFound('Booking not found');
@@ -88,7 +89,12 @@ exports.creditForBooking = async (bookingId) => {
   // Use grandTotal (what customer paid) as the commission base, not
   // the pre-tax `total`. grandTotal is the all-in price; partner earns
   // their % of that, then 5% GST is deducted from their share.
-  const base = booking.grandTotal ?? booking.total;
+  // PAID add-ons join the base — the customer settled that money for
+  // this job too. Unpaid add-ons are excluded (no money came in).
+  const addOnPaidTotal = (booking.addOns ?? [])
+    .filter((a) => a.status === 'paid')
+    .reduce((s, a) => s + a.price * a.qty, 0);
+  const base = (booking.grandTotal ?? booking.total) + addOnPaidTotal;
   const bd = computeBreakdown(base, partnerPct);
 
   /// Upsert by bookingId so idempotency is enforced at the DB level.
@@ -409,4 +415,350 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
     data,
     meta: { page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)) },
   };
+};
+
+// ── Weekly settlements (Monday → Sunday) ───────────────────────────────────
+// Admin "pay the partners weekly" workflow: aggregate every earning
+// credited inside the week per partner (jobs, gross, commission split,
+// payable) alongside the partner's bank details, export it as CSV, pay
+// through the bank, then bulk-flip the week's earnings to paid.
+
+/// Normalise ANY date inside a week to that week's Monday 00:00 local,
+/// returning [monday, nextMonday).
+const weekRange = (weekStartStr) => {
+  const start = new Date(`${weekStartStr}T00:00:00`);
+  if (Number.isNaN(start.getTime())) throw ApiError.badRequest('Invalid weekStart date');
+  const day = start.getDay(); // 0 = Sunday … 6 = Saturday
+  start.setDate(start.getDate() + (day === 0 ? -6 : 1 - day));
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 7);
+  return { start, end };
+};
+
+exports.weeklySettlements = async ({ weekStart }) => {
+  const { start, end } = weekRange(weekStart);
+  const rows = await prisma.partnerEarning.findMany({
+    where: { createdAt: { gte: start, lt: end } },
+    include: {
+      partner: {
+        select: {
+          id: true,
+          name: true,
+          businessName: true,
+          phone: true,
+          document: { select: { bankAccount: true, bankIfsc: true } },
+        },
+      },
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  const byPartner = new Map();
+  for (const e of rows) {
+    let agg = byPartner.get(e.partnerId);
+    if (!agg) {
+      agg = {
+        partnerId: e.partnerId,
+        name: e.partner?.name ?? e.partner?.businessName ?? `Partner #${e.partnerId}`,
+        phone: e.partner?.phone ?? '',
+        bankAccount: e.partner?.document?.bankAccount ?? null,
+        bankIfsc: e.partner?.document?.bankIfsc ?? null,
+        jobs: 0,
+        grossAmount: 0,
+        commission: 0,
+        partnerGst: 0,
+        payable: 0,
+        paidJobs: 0,
+      };
+      byPartner.set(e.partnerId, agg);
+    }
+    agg.jobs += 1;
+    agg.grossAmount += e.bookingAmount;
+    agg.commission += e.dhoondCommission;
+    agg.partnerGst += e.partnerGst;
+    /// What actually lands in the partner's bank for the week.
+    agg.payable += e.netAmount;
+    if (e.status === 'paid') agg.paidJobs += 1;
+  }
+
+  /// This week's still-unpaid net per partner (drives "week pending").
+  const weekPendingByPartner = new Map();
+  for (const e of rows) {
+    if (e.status === 'paid' || e.status === 'reversed') continue;
+    weekPendingByPartner.set(
+      e.partnerId,
+      (weekPendingByPartner.get(e.partnerId) ?? 0) + e.netAmount,
+    );
+  }
+
+  /// Carry-forward: unpaid earnings from BEFORE this week — the "last
+  /// week(s) pending" the accountant must chase. Grouped per partner so
+  /// old dues surface even when the partner had no jobs this week.
+  const carryRows = await prisma.partnerEarning.groupBy({
+    by: ['partnerId'],
+    where: { createdAt: { lt: start }, status: { notIn: ['paid', 'reversed'] } },
+    _sum: { netAmount: true },
+    _count: { _all: true },
+  });
+  const carryByPartner = new Map(
+    carryRows.map((c) => [c.partnerId, { amount: c._sum.netAmount ?? 0, jobs: c._count._all }]),
+  );
+
+  /// Partners with old dues but NO earnings this week still need a row
+  /// (otherwise their dues silently vanish from the screen).
+  const missingIds = carryRows
+    .map((c) => c.partnerId)
+    .filter((id) => !byPartner.has(id) && (carryByPartner.get(id)?.amount ?? 0) > 0);
+  if (missingIds.length) {
+    const partners = await prisma.partner.findMany({
+      where: { id: { in: missingIds } },
+      select: {
+        id: true,
+        name: true,
+        businessName: true,
+        phone: true,
+        document: { select: { bankAccount: true, bankIfsc: true } },
+      },
+    });
+    for (const p of partners) {
+      byPartner.set(p.id, {
+        partnerId: p.id,
+        name: p.name ?? p.businessName ?? `Partner #${p.id}`,
+        phone: p.phone ?? '',
+        bankAccount: p.document?.bankAccount ?? null,
+        bankIfsc: p.document?.bankIfsc ?? null,
+        jobs: 0,
+        grossAmount: 0,
+        commission: 0,
+        partnerGst: 0,
+        payable: 0,
+        paidJobs: 0,
+      });
+    }
+  }
+
+  /// Admin remarks for this week ("transfer bounced", "IFSC wrong…") —
+  /// one per partner, attached to the aggregated row + the CSV export.
+  const notes = await prisma.weeklySettlementNote.findMany({
+    where: { weekStart: start },
+    select: { partnerId: true, remark: true },
+  });
+  const remarkByPartner = new Map(notes.map((n) => [n.partnerId, n.remark]));
+
+  const items = [...byPartner.values()]
+    .map((a) => {
+      const weekPending = weekPendingByPartner.get(a.partnerId) ?? 0;
+      const carry = carryByPartner.get(a.partnerId) ?? { amount: 0, jobs: 0 };
+      return {
+        ...a,
+        weekPending,
+        /// Old dues from previous weeks (still unpaid).
+        carryForward: carry.amount,
+        carryForwardJobs: carry.jobs,
+        /// Everything the partner is owed as of this week's end.
+        totalDue: weekPending + carry.amount,
+        status:
+          a.jobs === 0
+            ? 'pending' // carry-forward-only row
+            : a.paidJobs === a.jobs
+              ? 'paid'
+              : a.paidJobs > 0
+                ? 'partial'
+                : 'pending',
+        remark: remarkByPartner.get(a.partnerId) ?? null,
+      };
+    })
+    .sort((x, y) => y.totalDue - x.totalDue || y.payable - x.payable);
+
+  return {
+    weekStart: start.toISOString(),
+    weekEnd: new Date(end.getTime() - 1).toISOString(),
+    totals: {
+      partners: items.length,
+      jobs: items.reduce((s, a) => s + a.jobs, 0),
+      payable: items.reduce((s, a) => s + a.payable, 0),
+      pendingPayable: items.reduce((s, a) => s + a.weekPending, 0),
+      carryForward: items.reduce((s, a) => s + a.carryForward, 0),
+      totalDue: items.reduce((s, a) => s + a.totalDue, 0),
+    },
+    items,
+  };
+};
+
+/// Bulk-settle: flip every not-yet-paid earning UP TO the end of the
+/// selected week (i.e. this week's dues + all carry-forward from earlier
+/// weeks) to paid — optionally scoped to specific partners (the admin's
+/// ticked rows). Matches the real bank transfer, which pays the
+/// partner's TOTAL DUE, not just the week slice.
+///
+/// Each settled partner also gets a Payout record (status "paid") with
+/// the covered earnings linked to it — so the settlement shows up in
+/// the Payout history tab exactly like the classic generate → approve →
+/// mark-paid flow, and the audit trail stays in one place. Idempotent;
+/// already-paid rows are untouched.
+exports.weeklyMarkPaid = async ({ weekStart, partnerIds }) => {
+  const { start, end } = weekRange(weekStart);
+  const due = await prisma.partnerEarning.findMany({
+    where: {
+      createdAt: { lt: end },
+      status: { notIn: ['paid', 'reversed'] },
+      ...(Array.isArray(partnerIds) && partnerIds.length
+        ? { partnerId: { in: partnerIds.map(Number) } }
+        : {}),
+    },
+    select: { id: true, partnerId: true, netAmount: true, earnedAmount: true, createdAt: true },
+  });
+  if (!due.length) return { updated: 0, payouts: 0 };
+
+  const byPartner = new Map();
+  for (const e of due) {
+    if (!byPartner.has(e.partnerId)) byPartner.set(e.partnerId, []);
+    byPartner.get(e.partnerId).push(e);
+  }
+
+  const now = new Date();
+  const weekLabel = start.toISOString().slice(0, 10);
+  let updated = 0;
+
+  for (const [partnerId, earnings] of byPartner) {
+    const amount = earnings.reduce(
+      (s, e) => s + (e.netAmount > 0 ? e.netAmount : e.earnedAmount),
+      0,
+    );
+    const periodStart = earnings.reduce(
+      (min, e) => (e.createdAt < min ? e.createdAt : min),
+      earnings[0].createdAt,
+    );
+    // One transaction per partner — payout row + earning links land
+    // together or not at all.
+    await prisma.$transaction(async (tx) => {
+      const payout = await tx.payout.create({
+        data: {
+          partnerId,
+          amount,
+          earningsCount: earnings.length,
+          status: 'paid',
+          periodStart,
+          periodEnd: new Date(end.getTime() - 1),
+          paidAt: now,
+          notes: `Weekly settlement (week of ${weekLabel}) — bulk marked paid from Payout management`,
+        },
+      });
+      await tx.partnerEarning.updateMany({
+        where: { id: { in: earnings.map((e) => e.id) } },
+        data: { status: 'paid', paidAt: now, payoutId: payout.id },
+      });
+    });
+    updated += earnings.length;
+  }
+
+  return { updated, payouts: byPartner.size };
+};
+
+/// Monthly settlement report — calendar-month aggregation per partner
+/// with the FULL GST breakdown, built for the accountant: partner gross,
+/// partner 5% GST, partner net, Dhoond commission, Dhoond 18% GST,
+/// Dhoond net, and how much of the month is settled vs outstanding.
+exports.monthlyReport = async ({ month }) => {
+  const start = new Date(`${month}-01T00:00:00`);
+  if (Number.isNaN(start.getTime())) throw ApiError.badRequest('Invalid month');
+  const end = new Date(start);
+  end.setMonth(end.getMonth() + 1);
+
+  const rows = await prisma.partnerEarning.findMany({
+    where: { createdAt: { gte: start, lt: end }, status: { not: 'reversed' } },
+    include: {
+      partner: {
+        select: {
+          id: true,
+          name: true,
+          businessName: true,
+          phone: true,
+          document: { select: { bankAccount: true, bankIfsc: true } },
+        },
+      },
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  const byPartner = new Map();
+  for (const e of rows) {
+    let agg = byPartner.get(e.partnerId);
+    if (!agg) {
+      agg = {
+        partnerId: e.partnerId,
+        name: e.partner?.name ?? e.partner?.businessName ?? `Partner #${e.partnerId}`,
+        phone: e.partner?.phone ?? '',
+        bankAccount: e.partner?.document?.bankAccount ?? null,
+        bankIfsc: e.partner?.document?.bankIfsc ?? null,
+        jobs: 0,
+        grossAmount: 0,
+        partnerGross: 0,
+        partnerGst: 0,
+        partnerNet: 0,
+        dhoondCommission: 0,
+        dhoondGst: 0,
+        dhoondNet: 0,
+        paidAmount: 0,
+        pendingAmount: 0,
+      };
+      byPartner.set(e.partnerId, agg);
+    }
+    agg.jobs += 1;
+    agg.grossAmount += e.bookingAmount;
+    agg.partnerGross += e.earnedAmount;
+    agg.partnerGst += e.partnerGst;
+    agg.partnerNet += e.netAmount;
+    agg.dhoondCommission += e.dhoondCommission;
+    agg.dhoondGst += e.dhoondGst;
+    agg.dhoondNet += e.dhoondNet;
+    if (e.status === 'paid') agg.paidAmount += e.netAmount;
+    else agg.pendingAmount += e.netAmount;
+  }
+
+  const items = [...byPartner.values()].sort((x, y) => y.partnerNet - x.partnerNet);
+  const sum = (key) => items.reduce((s, a) => s + a[key], 0);
+
+  return {
+    month,
+    monthStart: start.toISOString(),
+    monthEnd: new Date(end.getTime() - 1).toISOString(),
+    totals: {
+      partners: items.length,
+      jobs: sum('jobs'),
+      grossAmount: sum('grossAmount'),
+      partnerGross: sum('partnerGross'),
+      partnerGst: sum('partnerGst'),
+      partnerNet: sum('partnerNet'),
+      dhoondCommission: sum('dhoondCommission'),
+      dhoondGst: sum('dhoondGst'),
+      dhoondNet: sum('dhoondNet'),
+      paidAmount: sum('paidAmount'),
+      pendingAmount: sum('pendingAmount'),
+    },
+    items,
+  };
+};
+
+/// Upsert (or clear, when remark is empty) the admin note on a
+/// partner's weekly settlement — "transfer bounced, retry Friday",
+/// "wrong IFSC — asked partner to update bank", etc.
+exports.weeklySaveRemark = async ({ weekStart, partnerId, remark }) => {
+  const { start } = weekRange(weekStart);
+  const text = String(remark ?? '').trim();
+  if (!text) {
+    await prisma.weeklySettlementNote.deleteMany({
+      where: { partnerId: Number(partnerId), weekStart: start },
+    });
+    return { partnerId: Number(partnerId), remark: null };
+  }
+  const note = await prisma.weeklySettlementNote.upsert({
+    where: {
+      partnerId_weekStart: { partnerId: Number(partnerId), weekStart: start },
+    },
+    create: { partnerId: Number(partnerId), weekStart: start, remark: text },
+    update: { remark: text },
+  });
+  return { partnerId: note.partnerId, remark: note.remark };
 };

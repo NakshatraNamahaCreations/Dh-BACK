@@ -176,14 +176,17 @@ const syncBookingRollup = async (tx, bookingId) => {
   /// being shadowed by a later failed attempt on the same booking
   /// (which shouldn't happen with our flow, but is the safe ordering
   /// regardless).
+  /// Only "booking" purpose rows participate — add-on charges (purpose
+  /// "addons") have their own lifecycle on the BookingAddOn rows and
+  /// must never flip the main bill's paymentStatus.
   const paid = await tx.payment.findFirst({
-    where: { bookingId, status: { in: ['paid', 'refunded'] } },
+    where: { bookingId, purpose: 'booking', status: { in: ['paid', 'refunded'] } },
     orderBy: { createdAt: 'desc' },
   });
   const latest =
     paid ??
     (await tx.payment.findFirst({
-      where: { bookingId },
+      where: { bookingId, purpose: 'booking' },
       orderBy: { createdAt: 'desc' },
     }));
 
@@ -256,6 +259,7 @@ exports.createOrder = async ({ bookingId, customerId }) => {
       bookingId: booking.id,
       provider: 'razorpay',
       status: 'pending',
+      purpose: 'booking',
     },
     orderBy: { createdAt: 'desc' },
   });
@@ -463,6 +467,142 @@ exports.verifyPayment = async ({
   return result;
 };
 
+/// Mark the add-ons covered by a captured "addons" Payment as paid.
+/// Shared by the verify path and the webhook backup path — idempotent
+/// (updateMany on still-unpaid rows only).
+const applyAddOnCapture = async (tx, payment, providerPaymentId, signature = null) => {
+  await tx.payment.update({
+    where: { id: payment.id },
+    data: {
+      status: 'paid',
+      method: 'razorpay',
+      providerPaymentId,
+      ...(signature ? { providerSignature: signature } : {}),
+      paidAt: new Date(),
+    },
+  });
+  await tx.bookingAddOn.updateMany({
+    where: { id: { in: payment.addOnIds ?? [] }, status: { not: 'paid' } },
+    data: { status: 'paid', paidAt: new Date() },
+  });
+};
+
+/// Build a Razorpay order covering the booking's UNPAID add-ons.
+/// Separate from `createOrder` on purpose: the amount is the flat sum of
+/// unpaid add-on lines (no GST/fee re-split), the Payment row is tagged
+/// purpose="addons" with an id snapshot, and the main bill's rollup is
+/// never touched. Any older pending add-on order is retired first —
+/// simpler and safer than reuse, since partners can add/remove lines
+/// between attempts.
+exports.createAddOnOrder = async ({ bookingId, customerId }) => {
+  const customerIdNum = Number(customerId);
+  const booking = await prisma.booking.findUnique({
+    where: { id: Number(bookingId) },
+    select: { id: true, customerId: true, status: true },
+  });
+  if (!booking) throw ApiError.notFound('Booking not found');
+  if (booking.customerId !== customerIdNum) throw ApiError.forbidden('Not your booking');
+  if (booking.status === 'CANCELLED') throw ApiError.badRequest('Booking is cancelled');
+
+  const due = await prisma.bookingAddOn.findMany({
+    where: { bookingId: booking.id, status: { not: 'paid' } },
+    select: { id: true, price: true, qty: true },
+  });
+  if (!due.length) throw ApiError.badRequest('No unpaid add-ons on this booking');
+  const payable = due.reduce((s, a) => s + a.price * a.qty, 0);
+  const amountPaise = payable * 100;
+
+  /// Retire any older pending add-on order — the line-set or amount may
+  /// have changed since it was minted, and a stale Razorpay order id
+  /// surfaces as the opaque "Uh! oh!" checkout error.
+  await prisma.payment.updateMany({
+    where: { bookingId: booking.id, purpose: 'addons', status: 'pending' },
+    data: { status: 'failed', failureReason: 'Superseded by a fresh add-on order' },
+  });
+
+  const order = await client().orders.create({
+    amount: amountPaise,
+    currency: 'INR',
+    receipt: `addons_${booking.id}_${Date.now() % 1e8}`,
+    notes: {
+      kind: 'booking_addons',
+      bookingId: String(booking.id),
+      customerId: String(customerIdNum),
+    },
+  });
+  logger.info(
+    `[razorpay] minted add-on order ${order.id} for booking ${booking.id} (amount=${amountPaise} paise, lines=${due.length})`,
+  );
+
+  await prisma.payment.create({
+    data: {
+      bookingId: booking.id,
+      amount: payable,
+      currency: 'INR',
+      status: 'pending',
+      method: 'razorpay',
+      provider: 'razorpay',
+      providerOrderId: order.id,
+      purpose: 'addons',
+      addOnIds: due.map((a) => a.id),
+    },
+  });
+
+  return { orderId: order.id, amount: amountPaise, currency: 'INR', keyId: KEY_ID };
+};
+
+/// Verify an add-on Checkout result and settle the covered add-on lines.
+/// Mirrors `verifyPayment`'s HMAC check but never touches the booking
+/// rollup, dispatch, or invoicing — add-ons are a side-bill.
+exports.verifyAddOnPayment = async ({
+  bookingId,
+  customerId,
+  razorpayOrderId,
+  razorpayPaymentId,
+  razorpaySignature,
+}) => {
+  if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+    throw ApiError.badRequest('Missing Razorpay fields');
+  }
+  if (!KEY_SECRET) throw ApiError.internal('RAZORPAY_KEY_SECRET not set');
+
+  const customerIdNum = Number(customerId);
+  const booking = await prisma.booking.findUnique({
+    where: { id: Number(bookingId) },
+    select: { id: true, customerId: true },
+  });
+  if (!booking) throw ApiError.notFound('Booking not found');
+  if (booking.customerId !== customerIdNum) throw ApiError.forbidden('Not your booking');
+
+  const payment = await prisma.payment.findFirst({
+    where: { bookingId: booking.id, providerOrderId: razorpayOrderId, purpose: 'addons' },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!payment) throw ApiError.badRequest('Order id not found for this booking');
+
+  const expected = crypto
+    .createHmac('sha256', KEY_SECRET)
+    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+    .digest('hex');
+  if (expected !== razorpaySignature) {
+    logger.warn(
+      `[razorpay] add-on signature mismatch for booking ${booking.id}: order=${razorpayOrderId}`,
+    );
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { status: 'failed', failureReason: 'Signature verification failed' },
+    });
+    throw ApiError.badRequest('Signature verification failed');
+  }
+
+  if (payment.status !== 'paid') {
+    await prisma.$transaction(async (tx) => {
+      await applyAddOnCapture(tx, payment, razorpayPaymentId, razorpaySignature);
+    });
+  }
+  return { bookingId: booking.id, addOnPaymentStatus: 'paid' };
+};
+
 /// Issue a refund for a paid booking. Called from cancelOwn /
 /// adminCancel / no-partner expiry — anywhere a paid Booking gets
 /// flipped to CANCELLED. Idempotent: if the latest Payment is already
@@ -508,6 +648,10 @@ exports.refundForBooking = async ({ bookingId, reason, refundAmount = null } = {
       status: 'paid',
       provider: 'razorpay',
       providerPaymentId: { not: null },
+      /// Cancel-refunds target the ORIGINAL bill. Add-on charges
+      /// (purpose "addons") are separate captures with their own money
+      /// trail — never silently swap one in as "the" booking payment.
+      purpose: 'booking',
     },
     orderBy: { paidAt: 'desc' },
   });
@@ -768,6 +912,13 @@ exports.handleWebhook = async ({ rawBody, signature }) => {
     return handlePartnerOnboardingWebhook(event, entity);
   }
 
+  /// Add-on side-bill — settle the covered BookingAddOn rows without
+  /// touching the main booking rollup / dispatch / invoicing. Backup
+  /// for the explicit verify call (app closed mid-checkout etc.).
+  if (entity.notes?.kind === 'booking_addons') {
+    return handleAddOnWebhook(event, entity);
+  }
+
   /// Try to recover the bookingId from the order's notes (we set this
   /// in createOrder). Fall back to the receipt format `booking_{id}`.
   const orderId = entity.order_id;
@@ -887,6 +1038,35 @@ async function handleRefundWebhook(event, payload) {
   /// refund.created and any other refund.* events are informational —
   /// our state machine doesn't need them.
   return { ok: true, ignored: true };
+}
+
+/// Backup path for add-on charges — mirrors the booking-payment webhook
+/// branch but settles BookingAddOn rows instead of the booking rollup.
+async function handleAddOnWebhook(event, entity) {
+  if (event !== 'payment.captured' && event !== 'payment.failed') {
+    return { ok: true, ignored: true };
+  }
+  const orderId = entity.order_id;
+  const bookingId = Number(entity.notes?.bookingId);
+  if (!orderId || !Number.isFinite(bookingId)) return { ok: true, ignored: true };
+
+  const payment = await prisma.payment.findFirst({
+    where: { bookingId, providerOrderId: orderId, purpose: 'addons' },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!payment) return { ok: true, ignored: true };
+
+  if (event === 'payment.captured' && payment.status !== 'paid') {
+    await prisma.$transaction(async (tx) => {
+      await applyAddOnCapture(tx, payment, entity.id);
+    });
+  } else if (event === 'payment.failed' && payment.status !== 'paid') {
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { status: 'failed', failureReason: entity.error_description ?? 'Payment failed' },
+    });
+  }
+  return { ok: true };
 }
 
 /// Backup path for the partner onboarding fee — fires when the app

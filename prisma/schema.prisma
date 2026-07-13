@@ -143,6 +143,12 @@ model Partner {
   /// Single-char gender code — 'm', 'f' or 'o'. Free-form string so we
   /// can add codes later without a migration.
   gender        String?
+  /// Single-device login: id of the ONLY session allowed to act as this
+  /// partner. Re-minted on every OTP login and baked into the JWT
+  /// (`sid` claim); the auth middleware rejects partner tokens whose
+  /// sid doesn't match, which force-logs-out the previous device.
+  /// Null = legacy account that hasn't logged in since the feature.
+  currentSessionId String?
   callVerified  Boolean  @default(false)
   /// Onboarding fee — admin sets per partner (kit cost + signup fee)
   /// after call verification. Null means "admin hasn't set it yet";
@@ -247,6 +253,7 @@ model Partner {
   adjustments  PartnerAdjustment[]
   payouts      Payout[]
   notifications PartnerNotification[]
+  weeklyNotes  WeeklySettlementNote[]
   ratings      BookingRating[]
 
   @@index([isVerified, createdAt])
@@ -533,6 +540,7 @@ model Service {
   subCategory   SubCategory? @relation(fields: [subCategoryId], references: [id], onDelete: SetNull)
 
   bookingItems  BookingItem[]
+  bookingAddOns BookingAddOn[]
   faqs          ServiceFaq[]
 
   createdAt     DateTime @default(now())
@@ -660,6 +668,13 @@ model Booking {
   couponCode      String?
   couponDiscount  Int?
 
+  /// High-demand (surge) pricing snapshot — set at create time when a
+  /// surge rule raised the item prices, so customer/partner/admin
+  /// summaries can EXPLAIN why prices are above catalog. Null = no
+  /// surge applied to this booking.
+  surgeMultiplier Float?
+  surgeRuleName   String?
+
   /// Payment lifecycle ROLLUP. Values: unpaid | pending | paid | failed | refunded.
   /// This is a denormalised cache of the latest Payment row's status so
   /// list endpoints (customer/partner/admin) can render a "Paid" pill
@@ -703,6 +718,11 @@ model Booking {
   jobCompletedAt  DateTime?
 
   items           BookingItem[]
+  /// Extra services the assigned partner adds mid-job (Figma "Select
+  /// Add-On" flow). Kept OFF the original bill — add-ons carry their own
+  /// flat customer-facing price and are paid through a separate Razorpay
+  /// order; the original subtotal/total/grandTotal never change.
+  addOns          BookingAddOn[]
   /// Partner credit. One earning row per completed booking — created
   /// the moment a partner marks the job COMPLETED. Optional because
   /// PENDING / CANCELLED bookings have no earning attached.
@@ -769,6 +789,47 @@ model BookingItem {
   @@map("booking_items")
 }
 
+/// An extra service the assigned partner added to an in-flight job
+/// ("Select Add-On" flow in the partner app). Two flavours:
+///   catalog — `serviceId` set; name/price/image/duration snapshotted
+///             from the Service row at add time.
+///   custom  — partner typed a free-form name + price (`isCustom`).
+/// Add-ons are billed SEPARATELY from the original booking: the customer
+/// pays the flat sum of unpaid add-ons through a dedicated Razorpay
+/// order (Payment.purpose = "addons"); Booking.grandTotal is untouched.
+model BookingAddOn {
+  id           Int      @id @default(autoincrement())
+  bookingId    Int
+  booking      Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  /// Nullable + SetNull mirrors BookingItem — catalog service can be
+  /// deleted later without losing the historical add-on line.
+  serviceId    Int?
+  service      Service? @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+
+  /// snapshot at add time — survives later catalog edits
+  name         String
+  /// Flat customer-facing price in whole INR (inclusive; no extra
+  /// GST/fee split is applied to add-ons).
+  price        Int
+  qty          Int      @default(1)
+  durationMins Int?
+  image        String?
+  isCustom     Boolean  @default(false)
+
+  /// unpaid → paid. No pending state — the Payment row carries the
+  /// in-flight order; this flips only when money lands.
+  status       String   @default("unpaid")
+  paidAt       DateTime?
+  /// Partner who added it — plain audit column, deliberately no FK so
+  /// partner-account deletion never touches billing history.
+  addedById    Int?
+
+  createdAt    DateTime @default(now())
+
+  @@index([bookingId])
+  @@map("booking_add_ons")
+}
+
 /// Customer's star-rating for a completed booking. Exactly one row per
 /// booking (enforced by @unique on bookingId) — the customer can edit
 /// their rating by upserting against the bookingId. The partner
@@ -822,6 +883,16 @@ model Payment {
   method            String?
   failureReason     String?
 
+  /// What this charge is for: "booking" (the original bill — default,
+  /// also true for all legacy rows) or "addons" (partner-added extra
+  /// services). The Booking paymentStatus rollup reads ONLY "booking"
+  /// rows so an add-on charge can never flip the main bill's status.
+  purpose           String   @default("booking")
+  /// For purpose="addons": snapshot of the BookingAddOn ids this order
+  /// covers, taken at order-mint time so add-ons added between mint and
+  /// capture aren't accidentally marked paid.
+  addOnIds          Int[]    @default([])
+
   /// Provider-specific identifiers. For Razorpay these correspond to
   /// the `order_xxx`, `pay_xxx`, and HMAC signature returned by Checkout.
   provider          String   @default("razorpay")
@@ -840,6 +911,24 @@ model Payment {
   @@index([status])
   @@index([providerOrderId])
   @@map("payments")
+}
+
+/// Admin remark attached to a partner's WEEKLY settlement (Monday-
+/// anchored week). Tracks why a week wasn't paid (bounced transfer,
+/// wrong bank details, partner dispute...) or how it was settled.
+/// One row per partner+week — upserted from the Weekly settlements tab.
+model WeeklySettlementNote {
+  id        Int      @id @default(autoincrement())
+  partnerId Int
+  partner   Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  /// Monday 00:00 of the week the note belongs to.
+  weekStart DateTime
+  remark    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([partnerId, weekStart])
+  @@map("weekly_settlement_notes")
 }
 
 /// Per-category commission rule. `partnerPct` is the % of each

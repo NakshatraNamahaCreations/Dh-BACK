@@ -76,6 +76,11 @@ exports.rateBooking = asyncHandler(async (req, res) => {
 
 // ── Admin endpoints ─────────────────────────────────────────────────────────
 
+exports.adminCreate = asyncHandler(async (req, res) => {
+  const item = await service.adminCreate({ payload: req.body });
+  success(res, item, 'Booking created', 201);
+});
+
 exports.adminList = asyncHandler(async (req, res) => {
   const { scopeByAdmin } = require('../../middlewares/adminScope');
   const scope = await scopeByAdmin(req, {
@@ -201,4 +206,22 @@ exports.partnerUpdateStatus = asyncHandler(async (req, res) => {
     otp: req.body.otp,
   });
   success(res, item, 'Status updated');
+});
+
+exports.partnerAddAddOns = asyncHandler(async (req, res) => {
+  const item = await service.partnerAddAddOns({
+    bookingId: req.params.id,
+    partnerId: req.user.sub,
+    items: req.body.items,
+  });
+  success(res, item, 'Add-ons added');
+});
+
+exports.partnerRemoveAddOn = asyncHandler(async (req, res) => {
+  const item = await service.partnerRemoveAddOn({
+    bookingId: req.params.id,
+    partnerId: req.user.sub,
+    addOnId: req.params.addOnId,
+  });
+  success(res, item, 'Add-on removed');
 });

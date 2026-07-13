@@ -57,6 +57,19 @@ const updateCitySchema = z.object({
     .refine((v) => Object.keys(v).length > 0, { message: 'No fields to update' }),
 });
 
+/// Google Places proxy (admin "Create job" address search).
+const placesSearchQuerySchema = z.object({
+  query: z.object({
+    q: z.string().trim().min(2, 'Type at least 2 characters').max(120),
+  }),
+});
+
+const placeDetailsQuerySchema = z.object({
+  query: z.object({
+    placeId: z.string().trim().min(5).max(300),
+  }),
+});
+
 module.exports = {
   idParam,
   listCitiesQuerySchema,
@@ -64,4 +77,6 @@ module.exports = {
   updateStateSchema,
   createCitySchema,
   updateCitySchema,
+  placesSearchQuerySchema,
+  placeDetailsQuerySchema,
 };
