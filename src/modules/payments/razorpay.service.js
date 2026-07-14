@@ -603,6 +603,71 @@ exports.verifyAddOnPayment = async ({
   return { bookingId: booking.id, addOnPaymentStatus: 'paid' };
 };
 
+/// LAST-CHANCE reconciliation before a booking is auto-cancelled or
+/// deleted for non-payment. Asks Razorpay directly whether the order
+/// was actually paid — covering webhook lag/misconfig and the UPI
+/// "debited but stuck in authorized" case. If a captured (or
+/// capturable) payment exists, walk the same paid-transition the
+/// webhook would have done and report 'paid' so the caller SKIPS the
+/// cancel. Returns 'unpaid' when there's genuinely no money.
+exports.reconcileOrderForBooking = async (bookingId) => {
+  const payment = await prisma.payment.findFirst({
+    where: {
+      bookingId: Number(bookingId),
+      provider: 'razorpay',
+      purpose: 'booking',
+      status: 'pending',
+      providerOrderId: { not: null },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!payment) return 'unpaid';
+
+  const result = await client().orders.fetchPayments(payment.providerOrderId);
+  const attempts = result?.items ?? [];
+
+  let winning = attempts.find((p) => p.status === 'captured');
+  if (!winning) {
+    const authorized = attempts.find((p) => p.status === 'authorized');
+    if (authorized) {
+      /// Money is debited but uncaptured — capture it now instead of
+      /// letting the booking die and Razorpay auto-refund days later.
+      await client().payments.capture(
+        authorized.id,
+        authorized.amount,
+        authorized.currency ?? 'INR',
+      );
+      winning = authorized;
+      logger.info(
+        `[razorpay] reconcile: captured authorized payment ${authorized.id} for booking ${bookingId}`,
+      );
+    }
+  }
+  if (!winning) return 'unpaid';
+
+  /// Same transition as the payment.captured webhook branch.
+  await prisma.$transaction(async (tx) => {
+    await tx.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: 'paid',
+        method: 'razorpay',
+        providerPaymentId: winning.id,
+        paidAt: new Date(),
+      },
+    });
+    await syncBookingRollup(tx, payment.bookingId);
+  });
+  await triggerDispatchIfNeeded(payment.bookingId);
+  dispatchQueue.enqueuePaymentSuccess(payment.bookingId).catch((err) => {
+    logger.warn(
+      `payment_success enqueue (reconcile) failed for booking ${payment.bookingId}: ${err.message}`,
+    );
+  });
+  logger.info(`[razorpay] reconcile: booking ${bookingId} recovered as PAID`);
+  return 'paid';
+};
+
 /// Issue a refund for a paid booking. Called from cancelOwn /
 /// adminCancel / no-partner expiry — anywhere a paid Booking gets
 /// flipped to CANCELLED. Idempotent: if the latest Payment is already
@@ -932,6 +997,27 @@ exports.handleWebhook = async ({ rawBody, signature }) => {
   });
   if (!payment) return { ok: true, ignored: true };
 
+  /// UPI-intent safety net: the customer's bank debits at AUTHORIZE
+  /// time, but the order only completes at CAPTURE. If dashboard
+  /// auto-capture is off/slow, payments strand in 'authorized' (the
+  /// customer sees "Uh! oh!" + money gone) until Razorpay auto-refunds.
+  /// Capture it ourselves the moment we hear about it — idempotent;
+  /// if auto-capture races us, Razorpay returns already-captured and
+  /// the payment.captured webhook below settles the rest.
+  if (event === 'payment.authorized' && payment.status !== 'paid') {
+    try {
+      await client().payments.capture(entity.id, entity.amount, entity.currency ?? 'INR');
+      logger.info(
+        `[razorpay] server-side captured authorized payment ${entity.id} for booking ${bookingId}`,
+      );
+    } catch (err) {
+      logger.warn(
+        `[razorpay] capture of authorized payment ${entity.id} failed (${err.error?.description ?? err.message}) — waiting on captured/failed webhook`,
+      );
+    }
+    return { ok: true };
+  }
+
   /// Map Razorpay events to Payment.status. Idempotent — we never
   /// overwrite a paid row with a later failed event for the same order.
   if (event === 'payment.captured' && payment.status !== 'paid') {
@@ -947,6 +1033,32 @@ exports.handleWebhook = async ({ rawBody, signature }) => {
       });
       await syncBookingRollup(tx, bookingId);
     });
+    /// LATE CAPTURE on a booking that's already CANCELLED (e.g. the
+    /// UPI payment stranded in 'authorized', the pay-deadline worker
+    /// cancelled the booking, and the capture landed minutes later).
+    /// The customer's money is with us for a dead booking — refund it
+    /// immediately instead of waiting for a support ticket.
+    const bookingNow = await prisma.booking.findUnique({
+      where: { id: bookingId },
+      select: { status: true },
+    });
+    if (bookingNow?.status === 'CANCELLED') {
+      logger.warn(
+        `[razorpay] capture landed on CANCELLED booking ${bookingId} — auto-refunding`,
+      );
+      try {
+        await exports.refundForBooking({
+          bookingId,
+          reason: 'Payment captured after the booking was auto-cancelled',
+        });
+      } catch (err) {
+        logger.warn(
+          `[razorpay] auto-refund for cancelled booking ${bookingId} failed: ${err.message} — admin retry needed`,
+        );
+      }
+      return { ok: true };
+    }
+
     /// Backup trigger — fires when verify never ran (e.g. user closed
     /// the app mid-Razorpay-flow but the payment still captured).
     /// Idempotent with the verify-path trigger via the queue's

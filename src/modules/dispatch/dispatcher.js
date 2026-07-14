@@ -914,6 +914,30 @@ const handlePaymentExpire = async ({ bookingId }) => {
     return;
   }
 
+  /// LAST-CHANCE RECONCILIATION before destroying the row. The payment
+  /// may have succeeded at Razorpay without us hearing about it yet —
+  /// webhook lag/misconfig, or a UPI payment stranded in 'authorized'
+  /// (the "PhonePe debited but the app showed an error" case). Deleting
+  /// the booking would also cascade-delete its Payment rows and orphan
+  /// the customer's money. Ask Razorpay directly; if it's paid (or
+  /// capturable), the reconciler marks the booking paid + triggers
+  /// dispatch, and we skip the cancel entirely. Fails open to the
+  /// normal expiry path on any Razorpay/API hiccup.
+  try {
+    const razorpayService = require('../payments/razorpay.service');
+    const outcome = await razorpayService.reconcileOrderForBooking(booking.id);
+    if (outcome === 'paid') {
+      logger.info(
+        `payment_expire: booking ${bookingId} reconciled as PAID at Razorpay — cancel skipped`,
+      );
+      return;
+    }
+  } catch (err) {
+    logger.warn(
+      `payment_expire: Razorpay reconciliation for booking ${bookingId} failed (${err.message}) — proceeding with expiry`,
+    );
+  }
+
   /// If a PARTNER cancelled this booking earlier (it has a
   /// cancellation_penalty adjustment), KEEP it as CANCELLED instead of
   /// hard-deleting — otherwise it vanishes from that partner's Past tab.
