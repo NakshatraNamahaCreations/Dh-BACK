@@ -82,6 +82,31 @@ const DISPATCH_WAVES = [
 const FINAL_DISPATCH_WAVE = DISPATCH_WAVES[DISPATCH_WAVES.length - 1];
 const DISPATCH_TOTAL_MS = FINAL_DISPATCH_WAVE.offsetMs + DISPATCH_WINDOW_MS;
 
+/// BYOP ("Book at your price") broadcasts get exactly TWO attempts —
+/// one initial broadcast + one final retry — BOTH at the widest
+/// configured radius (stage 2) so every eligible partner is reached
+/// both times. After the second attempt the expire job stops dispatch
+/// completely and the customer sees the +₹ price-bump options.
+///
+/// Rationale: the 6-wave widening ladder re-alerted partners inside
+/// the smallest ring up to SIX times for one BYOP booking (every wave
+/// includes them again) — partners reported 3-4 duplicate job alerts
+/// at a price they'd already ignored. Two attempts is the configured
+/// retry limit for price offers; a higher price is a NEW booking.
+const BYOP_DISPATCH_WAVES = [
+  { wave: 1, radiusKm: 7, stage: 2, offsetMs: 0, retry: false },
+  { wave: 2, radiusKm: 7, stage: 2, offsetMs: DISPATCH_STEP_MS, retry: true },
+];
+const BYOP_FINAL_WAVE = BYOP_DISPATCH_WAVES[BYOP_DISPATCH_WAVES.length - 1];
+const BYOP_DISPATCH_TOTAL_MS = BYOP_FINAL_WAVE.offsetMs + DISPATCH_WINDOW_MS;
+
+/// Wave plan + total window for a booking. BYOP (offeredPrice set)
+/// gets the two-attempt plan; everything else keeps the 6-wave ladder.
+const isByopBooking = (booking) => booking.offeredPrice != null;
+const wavePlanFor = (booking) => (isByopBooking(booking) ? BYOP_DISPATCH_WAVES : DISPATCH_WAVES);
+const dispatchTotalMsFor = (booking) =>
+  isByopBooking(booking) ? BYOP_DISPATCH_TOTAL_MS : DISPATCH_TOTAL_MS;
+
 /// The 6 waves widen in 3 STAGES (initial + retry per radius). This maps a
 /// wave number to its stage index (0,1,2) so we can look up the admin-
 /// configured radius for that stage: waves 1-2 → stage 0, 3-4 → 1, 5-6 → 2.
@@ -96,7 +121,9 @@ const waveRadiusStage = (waveNumber) => Math.floor((waveNumber - 1) / 2);
 const resolveWaveRadiusKm = async (waveSpec) => {
   try {
     const { radii } = await require('../policy/policy.service').getDispatch();
-    const stage = waveRadiusStage(waveSpec.wave);
+    /// BYOP wave specs pin their stage explicitly (both attempts use the
+    /// widest ring); the standard ladder derives it from the wave number.
+    const stage = waveSpec.stage ?? waveRadiusStage(waveSpec.wave);
     const r = radii?.[stage];
     return Number.isFinite(r) && r > 0 ? r : waveSpec.radiusKm;
   } catch {
@@ -156,11 +183,12 @@ const scheduleAllForBooking = async (booking) => {
   const start = dispatchStartAt(booking).getTime();
   const now = Date.now();
 
-  for (const w of DISPATCH_WAVES) {
+  /// BYOP → 2 attempts then stop; everything else → the 6-wave ladder.
+  for (const w of wavePlanFor(booking)) {
     const delay = Math.max(0, start + w.offsetMs - now);
     await queue.enqueueWave(booking.id, w.wave, delay);
   }
-  const expireDelay = Math.max(0, start + DISPATCH_TOTAL_MS - now);
+  const expireDelay = Math.max(0, start + dispatchTotalMsFor(booking) - now);
   await queue.enqueueExpire(booking.id, expireDelay);
 };
 
@@ -228,9 +256,6 @@ const emitToCustomer = (customerId, event, payload) => {
 
 /// One wave: find candidates, mark them visible, push to sockets.
 const handleWave = async ({ bookingId, wave: waveNumber }) => {
-  const waveSpec = DISPATCH_WAVES.find((w) => w.wave === waveNumber);
-  if (!waveSpec) return;
-
   /// Re-read the booking — the row may have transitioned out of
   /// PENDING since we were enqueued (partner accepted, admin
   /// cancelled, or the previous wave expired into CANCELLED).
@@ -263,6 +288,11 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
   if (!booking) return;
   if (booking.status !== 'PENDING' || booking.partnerId != null) return;
   if (booking.lat == null || booking.lng == null) return;
+
+  /// Resolve the wave spec from THIS booking's plan (BYOP = 2 attempts
+  /// at the widest ring, standard = 6-wave ladder).
+  const waveSpec = wavePlanFor(booking).find((w) => w.wave === waveNumber);
+  if (!waveSpec) return;
 
   /// Admin-configurable radius for this wave's stage (3/5/7km by default,
   /// editable from the admin Dispatch Rules page). Resolved fresh here so
@@ -395,7 +425,7 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       data: {
         dispatchStatus: 'broadcasting',
         dispatchStartedAt: dispatchStartAt(booking),
-        dispatchExpiresAt: new Date(dispatchStartAt(booking).getTime() + DISPATCH_TOTAL_MS),
+        dispatchExpiresAt: new Date(dispatchStartAt(booking).getTime() + dispatchTotalMsFor(booking)),
         dispatchRadiusKm: radiusKm,
         dispatchWave: waveSpec.wave,
       },

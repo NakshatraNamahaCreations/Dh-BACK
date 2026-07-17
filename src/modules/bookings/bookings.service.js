@@ -176,6 +176,28 @@ const DISPATCH_WAVES = [
 ];
 const FINAL_DISPATCH_WAVE = DISPATCH_WAVES[DISPATCH_WAVES.length - 1];
 const DISPATCH_TOTAL_MS = FINAL_DISPATCH_WAVE.endsAtMs;
+
+/// BYOP mirror of `dispatcher.BYOP_DISPATCH_WAVES` — price offers get
+/// exactly TWO attempts (initial + final retry), both at the widest
+/// ring, then dispatch stops and the customer sees the bump options.
+const BYOP_DISPATCH_WAVES = [
+  { wave: 1, radiusKm: 7, startsAtMs: 0, endsAtMs: DISPATCH_WINDOW_MS },
+  {
+    wave: 2,
+    radiusKm: 7,
+    startsAtMs: DISPATCH_STEP_MS,
+    endsAtMs: DISPATCH_STEP_MS + DISPATCH_WINDOW_MS,
+  },
+];
+const BYOP_DISPATCH_TOTAL_MS = BYOP_DISPATCH_WAVES[BYOP_DISPATCH_WAVES.length - 1].endsAtMs;
+
+/// Wave plan + total window for a booking — BYOP (offeredPrice set)
+/// runs the two-attempt plan, everything else the 6-wave ladder.
+const wavePlanFor = (booking) =>
+  booking.offeredPrice != null ? BYOP_DISPATCH_WAVES : DISPATCH_WAVES;
+const dispatchTotalMsFor = (booking) =>
+  booking.offeredPrice != null ? BYOP_DISPATCH_TOTAL_MS : DISPATCH_TOTAL_MS;
+
 // Lead time before a scheduled slot at which dispatch begins. MUST stay
 // in sync with the same constant in dispatch/dispatcher.js.
 const SCHEDULE_DISPATCH_LEAD_MS = 30 * 60 * 1000;
@@ -189,8 +211,8 @@ const dispatchWindowFor = (booking, now = new Date()) => {
   const start = broadcastStartFor(booking);
   const elapsedMs = now.getTime() - start.getTime();
   if (elapsedMs < 0) return null;
-  if (elapsedMs >= DISPATCH_TOTAL_MS) return null;
-  return DISPATCH_WAVES.find((w) => elapsedMs >= w.startsAtMs && elapsedMs < w.endsAtMs) ?? null;
+  if (elapsedMs >= dispatchTotalMsFor(booking)) return null;
+  return wavePlanFor(booking).find((w) => elapsedMs >= w.startsAtMs && elapsedMs < w.endsAtMs) ?? null;
 };
 
 const expireBroadcasts = async (now = new Date()) => {
@@ -221,7 +243,9 @@ const expireBroadcasts = async (now = new Date()) => {
     take: 200,
   });
 
-  const expired = pending.filter((b) => now.getTime() - broadcastStartFor(b).getTime() >= DISPATCH_TOTAL_MS);
+  const expired = pending.filter(
+    (b) => now.getTime() - broadcastStartFor(b).getTime() >= dispatchTotalMsFor(b),
+  );
   if (expired.length === 0) return;
 
   /// Per-booking transition so the coupon refund is gated on the
@@ -2631,7 +2655,7 @@ exports.partnerIncoming = async ({ partnerId, lat, lng }) => {
           data: {
             dispatchStatus: 'broadcasting',
             dispatchStartedAt: broadcastStartFor(b),
-            dispatchExpiresAt: new Date(broadcastStartFor(b).getTime() + DISPATCH_TOTAL_MS),
+            dispatchExpiresAt: new Date(broadcastStartFor(b).getTime() + dispatchTotalMsFor(b)),
             dispatchRadiusKm: wave.radiusKm,
             dispatchWave: wave.wave,
           },
