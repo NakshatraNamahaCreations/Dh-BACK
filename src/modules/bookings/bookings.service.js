@@ -306,8 +306,13 @@ const PARTNER_INCLUDE = {
   customer: { select: { id: true, name: true, phone: true } },
   /// Service.categoryId is needed for per-category commission lookup
   /// so the partner-app can show the actual partner share / platform
-  /// commission split on the bill view.
-  items: { include: { service: { select: { categoryId: true } } } },
+  /// commission split on the bill view. imageUrl/thumbnailUrl feed the
+  /// primary-service thumbnail on the partner's My Jobs card.
+  items: {
+    include: {
+      service: { select: { categoryId: true, imageUrl: true, thumbnailUrl: true } },
+    },
+  },
   /// Partner-added extra services ("Select Add-On" flow). Name/price/
   /// image are snapshotted on the row, so no service join is needed.
   addOns: { orderBy: { createdAt: 'asc' } },
@@ -501,6 +506,12 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     /// Human-facing Booking ID shared across customer/partner/admin.
     bookingRef: b.bookingRef ?? `#${b.id}`,
     service: b.items?.[0]?.serviceName ?? 'Service',
+    /// PRIMARY service's own image (square thumb preferred, hero image
+    /// fallback) — resolved from the FIRST booking item's service join so
+    /// the My Jobs card always shows the booked service's art, never
+    /// another service's.
+    serviceImage:
+      b.items?.[0]?.service?.thumbnailUrl ?? b.items?.[0]?.service?.imageUrl ?? null,
     services,
     customerName: b.customer?.name ?? 'Customer',
     /// Hidden until paid (see maskContact). The app shows "Available

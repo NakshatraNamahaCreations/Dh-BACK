@@ -436,10 +436,26 @@ const weekRange = (weekStartStr) => {
   return { start, end };
 };
 
-exports.weeklySettlements = async ({ weekStart }) => {
+/// Prisma WHERE fragment scoping a PartnerEarning query to partners whose
+/// HOME CITY falls inside the admin's / the UI's State→City filter.
+/// `scope.cityIds === null` (SUPER admin, no filter picked) → no-op.
+/// Empty array → forced no-match (`cityId = -1`), same convention as
+/// `applyScopeToWhere` in middlewares/adminScope.
+const partnerCityWhere = (scope) => {
+  if (!scope || scope.cityIds == null) return {};
+  const cityFilter =
+    scope.cityIds.length === 0
+      ? -1
+      : scope.cityIds.length === 1
+        ? scope.cityIds[0]
+        : { in: scope.cityIds };
+  return { partner: { cityId: cityFilter } };
+};
+
+exports.weeklySettlements = async ({ weekStart, scope }) => {
   const { start, end } = weekRange(weekStart);
   const rows = await prisma.partnerEarning.findMany({
-    where: { createdAt: { gte: start, lt: end } },
+    where: { createdAt: { gte: start, lt: end }, ...partnerCityWhere(scope) },
     include: {
       partner: {
         select: {
@@ -447,6 +463,8 @@ exports.weeklySettlements = async ({ weekStart }) => {
           name: true,
           businessName: true,
           phone: true,
+          city: true,
+          cityRef: { select: { name: true, state: { select: { name: true } } } },
           document: { select: { bankAccount: true, bankIfsc: true } },
         },
       },
@@ -462,6 +480,11 @@ exports.weeklySettlements = async ({ weekStart }) => {
         partnerId: e.partnerId,
         name: e.partner?.name ?? e.partner?.businessName ?? `Partner #${e.partnerId}`,
         phone: e.partner?.phone ?? '',
+        /// Home-city geography for the admin table's Location column.
+        /// cityRef (Geography row) wins; legacy free-text city is the
+        /// fallback for rows pre-dating the cityId backfill.
+        city: e.partner?.cityRef?.name ?? e.partner?.city ?? null,
+        state: e.partner?.cityRef?.state?.name ?? null,
         bankAccount: e.partner?.document?.bankAccount ?? null,
         bankIfsc: e.partner?.document?.bankIfsc ?? null,
         jobs: 0,
@@ -497,7 +520,11 @@ exports.weeklySettlements = async ({ weekStart }) => {
   /// old dues surface even when the partner had no jobs this week.
   const carryRows = await prisma.partnerEarning.groupBy({
     by: ['partnerId'],
-    where: { createdAt: { lt: start }, status: { notIn: ['paid', 'reversed'] } },
+    where: {
+      createdAt: { lt: start },
+      status: { notIn: ['paid', 'reversed'] },
+      ...partnerCityWhere(scope),
+    },
     _sum: { netAmount: true },
     _count: { _all: true },
   });
@@ -518,6 +545,8 @@ exports.weeklySettlements = async ({ weekStart }) => {
         name: true,
         businessName: true,
         phone: true,
+        city: true,
+        cityRef: { select: { name: true, state: { select: { name: true } } } },
         document: { select: { bankAccount: true, bankIfsc: true } },
       },
     });
@@ -526,6 +555,8 @@ exports.weeklySettlements = async ({ weekStart }) => {
         partnerId: p.id,
         name: p.name ?? p.businessName ?? `Partner #${p.id}`,
         phone: p.phone ?? '',
+        city: p.cityRef?.name ?? p.city ?? null,
+        state: p.cityRef?.state?.name ?? null,
         bankAccount: p.document?.bankAccount ?? null,
         bankIfsc: p.document?.bankIfsc ?? null,
         jobs: 0,
@@ -597,7 +628,7 @@ exports.weeklySettlements = async ({ weekStart }) => {
 /// the Payout history tab exactly like the classic generate → approve →
 /// mark-paid flow, and the audit trail stays in one place. Idempotent;
 /// already-paid rows are untouched.
-exports.weeklyMarkPaid = async ({ weekStart, partnerIds }) => {
+exports.weeklyMarkPaid = async ({ weekStart, partnerIds, scope }) => {
   const { start, end } = weekRange(weekStart);
   const due = await prisma.partnerEarning.findMany({
     where: {
@@ -606,6 +637,10 @@ exports.weeklyMarkPaid = async ({ weekStart, partnerIds }) => {
       ...(Array.isArray(partnerIds) && partnerIds.length
         ? { partnerId: { in: partnerIds.map(Number) } }
         : {}),
+      /// Geography guard — "Mark week paid" with a State/City filter (or
+      /// a CITY_MANAGER's assignment) must only settle partners in scope,
+      /// never the whole platform.
+      ...partnerCityWhere(scope),
     },
     select: { id: true, partnerId: true, netAmount: true, earnedAmount: true, createdAt: true },
   });
@@ -660,14 +695,18 @@ exports.weeklyMarkPaid = async ({ weekStart, partnerIds }) => {
 /// with the FULL GST breakdown, built for the accountant: partner gross,
 /// partner 5% GST, partner net, Dhoond commission, Dhoond 18% GST,
 /// Dhoond net, and how much of the month is settled vs outstanding.
-exports.monthlyReport = async ({ month }) => {
+exports.monthlyReport = async ({ month, scope }) => {
   const start = new Date(`${month}-01T00:00:00`);
   if (Number.isNaN(start.getTime())) throw ApiError.badRequest('Invalid month');
   const end = new Date(start);
   end.setMonth(end.getMonth() + 1);
 
   const rows = await prisma.partnerEarning.findMany({
-    where: { createdAt: { gte: start, lt: end }, status: { not: 'reversed' } },
+    where: {
+      createdAt: { gte: start, lt: end },
+      status: { not: 'reversed' },
+      ...partnerCityWhere(scope),
+    },
     include: {
       partner: {
         select: {
@@ -675,6 +714,8 @@ exports.monthlyReport = async ({ month }) => {
           name: true,
           businessName: true,
           phone: true,
+          city: true,
+          cityRef: { select: { name: true, state: { select: { name: true } } } },
           document: { select: { bankAccount: true, bankIfsc: true } },
         },
       },
@@ -690,6 +731,8 @@ exports.monthlyReport = async ({ month }) => {
         partnerId: e.partnerId,
         name: e.partner?.name ?? e.partner?.businessName ?? `Partner #${e.partnerId}`,
         phone: e.partner?.phone ?? '',
+        city: e.partner?.cityRef?.name ?? e.partner?.city ?? null,
+        state: e.partner?.cityRef?.state?.name ?? null,
         bankAccount: e.partner?.document?.bankAccount ?? null,
         bankIfsc: e.partner?.document?.bankIfsc ?? null,
         jobs: 0,

@@ -38,20 +38,36 @@ exports.getPartnerSummary = asyncHandler(async (req, res) => {
 // ── Weekly settlements (Mon–Sun) ───────────────────────────────────────────
 
 exports.weeklySettlements = asyncHandler(async (req, res) => {
-  const data = await earnings.weeklySettlements({ weekStart: req.query.weekStart });
+  const scope = await scopeByAdmin(req, {
+    cityId: req.query.cityId,
+    stateId: req.query.stateId,
+  });
+  const data = await earnings.weeklySettlements({ weekStart: req.query.weekStart, scope });
   success(res, data, 'Weekly settlements fetched');
 });
 
 exports.weeklyMarkPaid = asyncHandler(async (req, res) => {
+  /// Scope from the body's geo filter (mirrors the UI's active State/City
+  /// selection) intersected with the admin's own city assignment — so
+  /// "Mark week paid" can never settle partners outside the filtered view.
+  const scope = await scopeByAdmin(req, {
+    cityId: req.body.cityId,
+    stateId: req.body.stateId,
+  });
   const data = await earnings.weeklyMarkPaid({
     weekStart: req.body.weekStart,
     partnerIds: req.body.partnerIds,
+    scope,
   });
   success(res, data, 'Weekly settlements marked paid');
 });
 
 exports.monthlyReport = asyncHandler(async (req, res) => {
-  const data = await earnings.monthlyReport({ month: req.query.month });
+  const scope = await scopeByAdmin(req, {
+    cityId: req.query.cityId,
+    stateId: req.query.stateId,
+  });
+  const data = await earnings.monthlyReport({ month: req.query.month, scope });
   success(res, data, 'Monthly report fetched');
 });
 

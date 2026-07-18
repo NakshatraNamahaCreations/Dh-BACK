@@ -129,6 +129,9 @@ const razorpayAddOnVerifySchema = razorpayVerifySchema;
 const weeklyQuerySchema = z.object({
   query: z.object({
     weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'weekStart must be YYYY-MM-DD'),
+    /// Geography filter — scopes rows by the partner's home city.
+    cityId: z.coerce.number().int().positive().optional(),
+    stateId: z.coerce.number().int().positive().optional(),
   }),
 });
 
@@ -137,6 +140,10 @@ const weeklyMarkPaidSchema = z.object({
     weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'weekStart must be YYYY-MM-DD'),
     /// Omitted/empty = settle EVERY partner with pending earnings that week.
     partnerIds: z.array(z.number().int().positive()).max(1000).optional(),
+    /// Mirrors the UI's active State/City filter so a bulk "Mark week
+    /// paid" only settles partners inside the filtered view.
+    cityId: z.number().int().positive().optional(),
+    stateId: z.number().int().positive().optional(),
   }),
 });
 
@@ -144,6 +151,9 @@ const weeklyMarkPaidSchema = z.object({
 const monthlyReportQuerySchema = z.object({
   query: z.object({
     month: z.string().regex(/^\d{4}-\d{2}$/, 'month must be YYYY-MM'),
+    /// Geography filter — scopes rows by the partner's home city.
+    cityId: z.coerce.number().int().positive().optional(),
+    stateId: z.coerce.number().int().positive().optional(),
   }),
 });
 
