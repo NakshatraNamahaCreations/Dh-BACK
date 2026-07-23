@@ -33,9 +33,19 @@ exports.saveDispatch = asyncHandler(async (req, res) => {
 });
 
 /// PUBLIC — the launching app fetches its update config (no auth; called
-/// before login). `?app=customer|partner`.
+/// before login). `?app=customer|partner&platform=android|ios`.
+///
+/// Older shipped builds don't send `platform`, so fall back to sniffing
+/// the User-Agent: React Native's iOS fetch stack identifies itself with
+/// CFNetwork/Darwin, Android with okhttp. This lets ALREADY-INSTALLED
+/// iOS builds receive the App Store URL without an app update.
 exports.getAppConfig = asyncHandler(async (req, res) => {
-  const data = await service.getAppConfig(req.query.app);
+  let platform = req.query.platform;
+  if (!platform) {
+    const ua = String(req.headers['user-agent'] ?? '');
+    if (/CFNetwork|Darwin|iPhone|iPad|iOS/i.test(ua)) platform = 'ios';
+  }
+  const data = await service.getAppConfig(req.query.app, platform);
   success(res, data, 'App config fetched');
 });
 

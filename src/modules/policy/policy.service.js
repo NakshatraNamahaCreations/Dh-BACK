@@ -130,12 +130,23 @@ exports.saveAppVersions = async (config) => writeSetting(APP_VERSIONS_KEY, confi
 exports.DEFAULT_APP_VERSIONS = DEFAULT_APP_VERSIONS;
 
 /// Single-app config served to the launching app. `app` is 'customer' |
-/// 'partner'; anything else falls back to the customer block. Returns just
-/// that app's { latestVersion, minVersion, storeUrl, message }.
-exports.getAppConfig = async (app) => {
+/// 'partner'; anything else falls back to the customer block. Returns a
+/// FLAT { latestVersion, minVersion, storeUrl, message } resolved for the
+/// caller's platform:
+///   - android (default): the base fields — unchanged behaviour.
+///   - ios: the block's optional `ios` overrides (own version pair +
+///     App Store URL, since iOS ships on its own cadence). Falls back to
+///     the Android values when no iOS block is configured, so pre-launch
+///     iOS builds never break on a missing config.
+exports.getAppConfig = async (app, platform) => {
   const all = await exports.getAppVersions();
   const key = app === 'partner' ? 'partner' : 'customer';
-  return { ...DEFAULT_APP_VERSIONS[key], ...(all[key] ?? {}) };
+  const block = { ...DEFAULT_APP_VERSIONS[key], ...(all[key] ?? {}) };
+  const { ios, ...base } = block;
+  if (platform === 'ios' && ios) {
+    return { ...base, ...ios };
+  }
+  return base;
 };
 
 /// Pure fee math, exported separately so it's unit-testable without a

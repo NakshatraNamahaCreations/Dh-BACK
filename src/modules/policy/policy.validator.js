@@ -46,10 +46,23 @@ const semver = z
   .trim()
   .regex(/^\d+(\.\d+){0,3}$/, 'Version must be like 1.2.0');
 const appBlock = z.object({
+  /// Android (Play Store) — the historical base fields, kept flat for
+  /// backward compatibility with existing saved blobs.
   latestVersion: semver,
   minVersion: semver,
   storeUrl: z.string().trim().url(),
   message: z.string().trim().max(300).optional().default(''),
+  /// iOS (App Store) — optional overrides. iOS releases version and ship
+  /// on their own cadence, so they carry their own version pair + store
+  /// URL. Absent → iOS falls back to the Android values (pre-iOS-launch
+  /// behaviour).
+  ios: z
+    .object({
+      latestVersion: semver,
+      minVersion: semver,
+      storeUrl: z.string().trim().url(),
+    })
+    .optional(),
 });
 const appVersionsSchema = z.object({
   body: z.object({
