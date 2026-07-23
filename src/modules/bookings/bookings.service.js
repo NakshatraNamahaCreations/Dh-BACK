@@ -239,13 +239,36 @@ const expireBroadcasts = async (now = new Date()) => {
       /// accepted" event would leave the coupon's `usedCount` ticked
       /// up even though the customer never received service.
       couponId: true,
+      /// PAID bookings are never auto-cancelled — they route to the
+      /// admin Manual Dispatch queue instead (mirrors the BullMQ
+      /// dispatcher's handleExpire policy).
+      paymentStatus: true,
     },
     take: 200,
   });
 
-  const expired = pending.filter(
+  const allExpired = pending.filter(
     (b) => now.getTime() - broadcastStartFor(b).getTime() >= dispatchTotalMsFor(b),
   );
+  if (allExpired.length === 0) return;
+
+  /// PAID → park in the admin Manual Dispatch queue (no cancel, no
+  /// refund; the money is committed and an admin must assign or cancel
+  /// explicitly). Only unpaid rows fall through to the auto-cancel below.
+  const paidExpired = allExpired.filter((b) => b.paymentStatus === 'paid');
+  if (paidExpired.length > 0) {
+    await prisma.booking.updateMany({
+      where: { id: { in: paidExpired.map((b) => b.id) }, status: 'PENDING', partnerId: null },
+      data: {
+        dispatchStatus: 'needs_admin_dispatch',
+        dispatchExpiresAt: null,
+        noPartnerReason:
+          'No partner accepted within 3km, 5km, or 7km broadcast and retry windows — awaiting admin dispatch.',
+      },
+    });
+  }
+
+  const expired = allExpired.filter((b) => b.paymentStatus !== 'paid');
   if (expired.length === 0) return;
 
   /// Per-booking transition so the coupon refund is gated on the
@@ -679,6 +702,11 @@ const shape = (b) => {
   bookingRef: b.bookingRef ?? `#${b.id}`,
   customerId: b.customerId,
   status: b.status,
+  /// Dispatch sub-state so the app can distinguish "waiting for a
+  /// partner" from "broadcast failed, awaiting admin assignment"
+  /// (needs_admin_dispatch) — both are status=PENDING, but showing
+  /// "Booking is confirmed" for the failed case was misleading.
+  dispatchStatus: b.dispatchStatus ?? null,
   scheduledAt: b.scheduledAt,
   slotLabel: b.slotLabel,
   isInstant: b.isInstant ?? false,

@@ -1083,13 +1083,19 @@ const handleExpire = async ({ bookingId }) => {
 
   /// Atomic transition — `updateMany` with status='PENDING' guard so a
   /// late race against partnerAccept can't overwrite a CONFIRMED row.
+  ///
+  /// PAID bookings have NO auto-cancel deadline: the customer's money is
+  /// committed, so the row stays in the Manual Dispatch queue until an
+  /// admin assigns a partner or explicitly cancels (which refunds).
+  /// Only unpaid rows keep the auto-cleanup grace window.
+  const isPaid = booking.paymentStatus === 'paid';
   const result = await prisma.booking.updateMany({
     where: { id: booking.id, status: 'PENDING', partnerId: null },
     data: {
       dispatchStatus: 'needs_admin_dispatch',
       dispatchRadiusKm: FINAL_DISPATCH_WAVE.radiusKm,
       dispatchWave: FINAL_DISPATCH_WAVE.wave,
-      dispatchExpiresAt: new Date(Date.now() + ADMIN_DISPATCH_GRACE_MS),
+      dispatchExpiresAt: isPaid ? null : new Date(Date.now() + ADMIN_DISPATCH_GRACE_MS),
       noPartnerReason:
         'No partner accepted within 3km, 5km, or 7km broadcast and retry windows — awaiting admin dispatch.',
     },
@@ -1118,10 +1124,12 @@ const handleExpire = async ({ bookingId }) => {
     void clearJobOfferPush(prisma, offerAudience, bookingId);
   }
 
-  /// Schedule the safety-net auto-cancel. If admin assigns a partner
-  /// (or manually cancels) before this fires, cancelAllForBooking
-  /// removes the job during the partnerAccept / adminCancel path.
-  await queue.enqueueAdminTimeout(bookingId, ADMIN_DISPATCH_GRACE_MS);
+  /// Schedule the safety-net auto-cancel — UNPAID bookings only. Paid
+  /// bookings must never be auto-cancelled: they wait in the Manual
+  /// Dispatch queue until an admin acts, however long that takes.
+  if (!isPaid) {
+    await queue.enqueueAdminTimeout(bookingId, ADMIN_DISPATCH_GRACE_MS);
+  }
 
   if (socketEmitter) {
     /// Tell the customer the broadcast finished without a match — they
@@ -1145,7 +1153,9 @@ const handleExpire = async ({ bookingId }) => {
     void adminNotifs.notifyAllAdmins({
       type: adminNotifs.TYPES.BOOKING_DISPATCH_NEEDED,
       title: `Manual dispatch needed for #${booking.id}`,
-      body: 'No partner accepted in the 3 km / 5 km / 7 km broadcast and retry windows. Assign one before the 2-hour grace elapses.',
+      body: isPaid
+        ? 'PAID booking — no partner accepted in the broadcast windows. It will WAIT in Manual Dispatch until you assign a partner or cancel (with refund).'
+        : 'No partner accepted in the 3 km / 5 km / 7 km broadcast and retry windows. Assign one before the 2-hour grace elapses.',
       href: '/bookings/manual-dispatch',
       bookingId: booking.id,
     });
@@ -1184,6 +1194,18 @@ const handleAdminTimeout = async ({ bookingId }) => {
     booking.partnerId != null ||
     booking.dispatchStatus !== 'needs_admin_dispatch'
   ) {
+    return;
+  }
+
+  /// PAID bookings are NEVER auto-cancelled — they wait in the Manual
+  /// Dispatch queue until an admin assigns a partner or cancels (which
+  /// refunds). handleExpire no longer enqueues this job for paid rows;
+  /// this guard covers timeout jobs enqueued BEFORE that policy change
+  /// and any reconciler re-fires.
+  if (booking.paymentStatus === 'paid') {
+    logger.info(
+      `admin_timeout: booking ${bookingId} is PAID — left in manual dispatch queue (no auto-cancel)`,
+    );
     return;
   }
 
