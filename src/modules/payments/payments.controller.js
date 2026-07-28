@@ -186,6 +186,19 @@ exports.razorpayAddOnVerify = asyncHandler(async (req, res) => {
   success(res, data, 'Add-on payment verified');
 });
 
+/// Active reconcile — the app calls this when the client-side verify never
+/// completed (app closed / no redirect / "Uh! oh!" after capture). The server
+/// fetches the order's real payments from Razorpay and settles the booking if
+/// captured/authorized, returning the resulting paymentStatus. Idempotent and
+/// ownership-checked; returns 'paid' fast if it was already settled — so the
+/// app never re-charges an already-paid booking.
+exports.razorpayReconcile = asyncHandler(async (req, res) => {
+  const paymentStatus = await razorpay.reconcileOrderForBooking(req.body.bookingId, {
+    customerId: req.user.sub,
+  });
+  success(res, { bookingId: Number(req.body.bookingId), paymentStatus }, 'Payment reconciled');
+});
+
 exports.razorpayWebhook = asyncHandler(async (req, res) => {
   const result = await razorpay.handleWebhook({
     rawBody: req.rawBody ?? req.body,

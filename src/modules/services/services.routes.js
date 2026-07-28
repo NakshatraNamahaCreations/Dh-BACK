@@ -8,6 +8,7 @@ const {
   listQuerySchema,
   bulkImportSchema,
   relatedQuerySchema,
+  popularQuerySchema,
 } = require('./services.validator');
 const controller = require('./services.controller');
 
@@ -15,6 +16,8 @@ const router = express.Router();
 
 // Public — customer + partner apps fetch the live catalog.
 router.get('/', validate(listQuerySchema), controller.list);
+// `/popular` MUST precede `/:id` or the param route captures "popular".
+router.get('/popular', validate(popularQuerySchema), controller.listPopular);
 router.get('/:id', validate(idParam), controller.get);
 router.get('/:id/related', validate(relatedQuerySchema), controller.getRelated);
 

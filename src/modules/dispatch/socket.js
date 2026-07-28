@@ -345,17 +345,46 @@ const start = (httpServer) => {
           /// been accepted yet. Scheduled bookings are intentionally
           /// excluded — they're dispatched at a fixed future time, not
           /// in the active "finding partner" window.
+          ///
+          /// CRITICAL: never auto-cancel a booking that has ANY payment
+          /// activity. `paymentStatus:'unpaid'` means the customer hasn't
+          /// even opened checkout. A 'pending' rollup means they minted a
+          /// Razorpay order — and opening Razorpay / the UPI-app hop is
+          /// exactly what disconnected this socket, so the payment may be
+          /// completing RIGHT NOW; 'paid' means the money is already in.
+          /// Cancelling either produced the "paid + cancelled" bug (money
+          /// taken, booking dead). Only truly-untouched searches are safe.
           const booking = await prisma.booking.findFirst({
             where: {
               customerId,
               status: 'PENDING',
               partnerId: null,
               isInstant: true,
+              paymentStatus: 'unpaid',
             },
             select: { id: true },
             orderBy: { createdAt: 'desc' },
           });
           if (!booking) return;
+
+          /// Final safety net against the paid+cancelled race: even an
+          /// 'unpaid' rollup can momentarily lag a capture that just landed
+          /// at the gateway. Ask Razorpay for the truth before cancelling;
+          /// if it reconciles as paid, skip the cancel entirely.
+          try {
+            const razorpay = require('../payments/razorpay.service');
+            const outcome = await razorpay.reconcileOrderForBooking(booking.id);
+            if (outcome === 'paid') {
+              logger.info(
+                `customer ${customerId} disconnect: booking ${booking.id} reconciled PAID at Razorpay — auto-cancel skipped`,
+              );
+              return;
+            }
+          } catch (err) {
+            logger.warn(
+              `customer ${customerId} disconnect: reconcile for booking ${booking.id} failed (${err.message}) — proceeding with cancel`,
+            );
+          }
 
           logger.info(
             `customer ${customerId} disconnect grace expired — auto-cancelling search booking ${booking.id}`,

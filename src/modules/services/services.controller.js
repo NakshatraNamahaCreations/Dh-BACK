@@ -12,6 +12,11 @@ exports.get = asyncHandler(async (req, res) => {
   success(res, item, 'Service fetched');
 });
 
+exports.listPopular = asyncHandler(async (req, res) => {
+  const items = await service.listPopular({ limit: Number(req.query.limit) || 6 });
+  success(res, items, 'Popular services fetched');
+});
+
 exports.create = asyncHandler(async (req, res) => {
   const item = await service.create(req.body);
   created(res, item, 'Service created');

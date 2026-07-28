@@ -15,6 +15,7 @@ const {
   razorpayVerifySchema,
   razorpayAddOnOrderSchema,
   razorpayAddOnVerifySchema,
+  razorpayReconcileSchema,
   weeklyQuerySchema,
   weeklyMarkPaidSchema,
   weeklyRemarkSchema,
@@ -48,6 +49,14 @@ router.post(
   customerOnly,
   validate(razorpayVerifySchema),
   controller.razorpayVerify,
+);
+// Active reconcile — server pulls the true order status from Razorpay and
+// settles it. The app's backstop when the client verify never landed.
+router.post(
+  '/razorpay/reconcile',
+  customerOnly,
+  validate(razorpayReconcileSchema),
+  controller.razorpayReconcile,
 );
 // Add-on side-bill: charges the flat sum of the booking's UNPAID
 // partner-added services. Never touches the main bill's rollup.

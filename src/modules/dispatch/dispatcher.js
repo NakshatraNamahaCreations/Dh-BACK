@@ -846,6 +846,31 @@ const handlePaymentSuccess = async ({ bookingId }) => {
   if (!booking) return;
   if (booking.paymentStatus !== 'paid') return;
 
+  /// Safety net for the "paid + cancelled" race: if money settled onto a
+  /// booking that's ALREADY cancelled (e.g. an auto-cancel fired while the
+  /// payment was in flight), refund it rather than silently keeping the cash.
+  /// The socket disconnect / payment-expire guards should prevent this, but
+  /// if anything slips through, the customer must not be charged for a dead
+  /// booking. Idempotent — refundForBooking no-ops if a refund's already in
+  /// progress. We skip invoicing (returns early) since there's nothing to
+  /// bill for a cancelled job.
+  if (booking.status === 'CANCELLED') {
+    logger.warn(
+      `payment_success: booking ${bookingId} is CANCELLED but paid — issuing auto-refund`,
+    );
+    try {
+      await razorpayService.refundForBooking({
+        bookingId,
+        reason: 'Auto-refund: payment settled on an already-cancelled booking',
+      });
+    } catch (err) {
+      logger.error(
+        `payment_success: auto-refund for cancelled booking ${bookingId} failed: ${err.message}`,
+      );
+    }
+    return;
+  }
+
   /// Edge-case heal: partner accepted (BYOP) before payment landed, so
   /// the booking has a partnerId but status is still PENDING.
   if (booking.status === 'PENDING' && booking.partnerId != null) {

@@ -20,6 +20,8 @@ const baseFields = {
   basePrice: z.number().int().min(0, 'Base price must be non-negative').max(10_000_000),
   originalPrice: z.number().int().min(0).max(10_000_000).nullable().optional(),
   active: z.boolean().default(true),
+  /// Admin-managed display order within the category / sub-category.
+  sortOrder: z.coerce.number().int().min(0).max(100000).optional(),
   includes: z.array(z.string().trim().min(1).max(160)).max(30).default([]),
   excludes: z.array(z.string().trim().min(1).max(160)).max(30).default([]),
   // `coerce` so a string id from a form `<select>` (e.g. "5") is accepted
@@ -55,6 +57,7 @@ const updateSchema = z.object({
       basePrice: baseFields.basePrice.optional(),
       originalPrice: baseFields.originalPrice,
       active: z.boolean().optional(),
+      sortOrder: baseFields.sortOrder,
       includes: baseFields.includes.optional(),
       excludes: baseFields.excludes.optional(),
       categoryId: baseFields.categoryId.optional(),
@@ -101,6 +104,12 @@ const relatedQuerySchema = z.object({
   }),
 });
 
+const popularQuerySchema = z.object({
+  query: z.object({
+    limit: z.coerce.number().int().min(1).max(20).default(6),
+  }),
+});
+
 module.exports = {
   idParam,
   createSchema,
@@ -108,4 +117,5 @@ module.exports = {
   listQuerySchema,
   bulkImportSchema,
   relatedQuerySchema,
+  popularQuerySchema,
 };

@@ -123,6 +123,9 @@ const razorpayVerifySchema = z.object({
 /// Add-on side-bill — same field shapes as the main order/verify pair.
 const razorpayAddOnOrderSchema = razorpayCreateOrderSchema;
 const razorpayAddOnVerifySchema = razorpayVerifySchema;
+/// Active reconcile — asks the server to pull the order's true status from
+/// Razorpay and settle it (webhook/redirect backstop). Body is just the id.
+const razorpayReconcileSchema = razorpayCreateOrderSchema;
 
 /// Weekly settlements — weekStart is any date inside the target week
 /// (server normalises to that week's Monday).
@@ -181,6 +184,7 @@ module.exports = {
   razorpayVerifySchema,
   razorpayAddOnOrderSchema,
   razorpayAddOnVerifySchema,
+  razorpayReconcileSchema,
   weeklyQuerySchema,
   weeklyMarkPaidSchema,
   weeklyRemarkSchema,

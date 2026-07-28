@@ -19,6 +19,7 @@ const listKey = ({ page, pageSize, search, categoryId, subCategoryId, active } =
   `${CACHE_PREFIX}list:p${page}:ps${pageSize}:c${categoryId ?? ''}:s${subCategoryId ?? ''}:a${active === true ? '1' : active === false ? '0' : 'N'}:q${search ?? ''}`;
 const itemKey = (id) => `${CACHE_PREFIX}id:${id}`;
 const relatedKey = (id, limit) => `${CACHE_PREFIX}rel:${id}:l${limit}`;
+const popularKey = (limit) => `${CACHE_PREFIX}popular:l${limit}`;
 
 /// Wipe every cached read for this module AND categories — a service
 /// write changes the `serviceCount` on its category, which is part of
@@ -44,6 +45,8 @@ const shape = (s) => ({
   basePrice: s.basePrice,
   originalPrice: s.originalPrice,
   active: s.active,
+  /// Admin-managed display order within its category / sub-category.
+  sortOrder: s.sortOrder ?? 0,
   includes: s.includes,
   excludes: s.excludes,
   categoryId: s.categoryId,
@@ -120,7 +123,10 @@ exports.list = async ({ page, pageSize, search, categoryId, subCategoryId, activ
       const [items, total] = await prisma.$transaction([
         prisma.service.findMany({
           where,
-          orderBy: [{ createdAt: 'desc' }],
+          /// Admin-managed order first (lower `sortOrder` wins), newest as the
+          /// tie-breaker so freshly-added services with the default 0 keep
+          /// their previous "newest first" behaviour until ordered.
+          orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }],
           skip,
           take: pageSize,
           include: SERVICE_INCLUDE,
@@ -137,6 +143,57 @@ exports.list = async ({ page, pageSize, search, categoryId, subCategoryId, activ
       };
     },
   );
+};
+
+/// Most-booked active services for the home "Popular services" row. Ranks by
+/// total booked quantity across all bookings (BookingItem), most first, then
+/// pads with the admin-ordered newest active services when there aren't enough
+/// bookings yet (fresh installs) so the row is never empty. Cached for
+/// CACHE_TTL, so the ranking refreshes a few minutes after new bookings land.
+exports.listPopular = async ({ limit = 6 } = {}) => {
+  return cache.getOrSet(popularKey(limit), CACHE_TTL, async () => {
+    // Rank serviceIds by how often they've been booked (sum of qty, then the
+    // number of distinct booking lines as a tie-breaker).
+    const grouped = await prisma.bookingItem.groupBy({
+      by: ['serviceId'],
+      where: { serviceId: { not: null } },
+      _sum: { qty: true },
+      _count: { _all: true },
+    });
+    const ranked = grouped
+      .filter((g) => g.serviceId != null)
+      .sort(
+        (a, b) =>
+          (b._sum.qty ?? 0) - (a._sum.qty ?? 0) ||
+          (b._count?._all ?? 0) - (a._count?._all ?? 0),
+      )
+      .map((g) => g.serviceId);
+
+    // Fetch the ranked services that are still active, preserving rank order.
+    const rankedServices = ranked.length
+      ? await prisma.service.findMany({
+          where: { id: { in: ranked }, active: true },
+          include: SERVICE_INCLUDE,
+        })
+      : [];
+    const byId = new Map(rankedServices.map((s) => [s.id, s]));
+    const ordered = ranked.map((id) => byId.get(id)).filter(Boolean);
+
+    // Pad with the admin-ordered newest active services (not already included)
+    // so the row always fills — important before any bookings exist.
+    if (ordered.length < limit) {
+      const have = new Set(ordered.map((s) => s.id));
+      const pad = await prisma.service.findMany({
+        where: { active: true, id: { notIn: [...have] } },
+        orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }],
+        take: limit - ordered.length,
+        include: SERVICE_INCLUDE,
+      });
+      ordered.push(...pad);
+    }
+
+    return ordered.slice(0, limit).map(shape);
+  });
 };
 
 exports.get = async (id) => {

@@ -523,6 +523,10 @@ model Service {
   /// optional MRP / strike-through original price
   originalPrice Int?
   active        Boolean  @default(true)
+  /// Admin-managed display order WITHIN a category / sub-category. Lower
+  /// sorts first; ties fall back to newest. Lets the admin arrange which
+  /// services show at the top of a category / sub-category listing.
+  sortOrder     Int      @default(0)
   /// what this service covers — array of bullet strings
   includes      String[] @default([])
   /// what's chargeable extra
@@ -548,6 +552,9 @@ model Service {
 
   @@index([categoryId, active])
   @@index([subCategoryId])
+  /// Fast ordered reads of a category / sub-category's services.
+  @@index([categoryId, sortOrder])
+  @@index([subCategoryId, sortOrder])
   @@map("services")
 }
 

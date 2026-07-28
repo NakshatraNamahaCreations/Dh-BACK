@@ -610,10 +610,27 @@ exports.verifyAddOnPayment = async ({
 /// capturable) payment exists, walk the same paid-transition the
 /// webhook would have done and report 'paid' so the caller SKIPS the
 /// cancel. Returns 'unpaid' when there's genuinely no money.
-exports.reconcileOrderForBooking = async (bookingId) => {
+exports.reconcileOrderForBooking = async (bookingId, { customerId = null } = {}) => {
+  const id = Number(bookingId);
+
+  /// Ownership guard for the CUSTOMER-facing reconcile endpoint. The internal
+  /// dispatcher / admin callers pass no `customerId` and skip this. Also
+  /// short-circuits when the booking is already paid (webhook/verify beat us
+  /// here) so we report 'paid' without a Razorpay round-trip — this is what
+  /// lets the app detect an already-successful payment and NOT charge again.
+  if (customerId != null) {
+    const owner = await prisma.booking.findUnique({
+      where: { id },
+      select: { customerId: true, paymentStatus: true },
+    });
+    if (!owner) throw ApiError.notFound('Booking not found');
+    if (owner.customerId !== Number(customerId)) throw ApiError.forbidden('Not your booking');
+    if (owner.paymentStatus === 'paid') return 'paid';
+  }
+
   const payment = await prisma.payment.findFirst({
     where: {
-      bookingId: Number(bookingId),
+      bookingId: id,
       provider: 'razorpay',
       purpose: 'booking',
       status: 'pending',
