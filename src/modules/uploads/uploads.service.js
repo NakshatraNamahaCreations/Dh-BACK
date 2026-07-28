@@ -50,11 +50,18 @@ exports.presignUpload = async ({ filename, contentType, size, folder, longCache 
   const key = buildKey(folder, filename);
 
   const cacheControl = longCache ? LONG_CACHE_CONTROL : undefined;
+  /// NOTE: we intentionally do NOT sign `ContentLength`. Signing it forces
+  /// the client's PUT to send a Content-Length that EXACTLY equals `size`, or
+  /// S3 rejects the PUT with 403 (SignatureDoesNotMatch). Clients derive that
+  /// size from the image picker (`asset.fileSize`), which is unreliable on
+  /// Android — the reported size often differs from the actual uploaded
+  /// bytes, which was breaking selfie / photo uploads. `size` is still
+  /// validated at the request layer (max upload size) — we just don't bake it
+  /// into the signature. Content-Type + Cache-Control remain signed.
   const command = new PutObjectCommand({
     Bucket: env.S3_BUCKET,
     Key: key,
     ContentType: contentType,
-    ContentLength: size,
     CacheControl: cacheControl,
   });
 

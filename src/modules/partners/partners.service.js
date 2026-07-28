@@ -178,9 +178,19 @@ const bookingStats = async (partnerIds) => {
   }]));
 };
 
-exports.list = async ({ status, kyc, search, onDuty, dutyState, scope, page = 1, pageSize = 25 } = {}) => {
+exports.list = async ({ status, kyc, search, onDuty, dutyState, categoryId, order, from, to, scope, page = 1, pageSize = 25 } = {}) => {
   const { applyScopeToWhere } = require('../../middlewares/adminScope');
   const where = {};
+  /// Trade/category filter.
+  if (categoryId) where.categoryId = Number(categoryId);
+  /// Created (joined) date range — same convention as bookings adminList:
+  /// `from` is inclusive from 00:00, `to` is inclusive through 23:59:59.
+  if (from) where.createdAt = { ...(where.createdAt ?? {}), gte: new Date(from) };
+  if (to) {
+    const toDate = new Date(to);
+    toDate.setHours(23, 59, 59, 999);
+    where.createdAt = { ...(where.createdAt ?? {}), lte: toDate };
+  }
   /// Duty filters — both AND with status.
   ///   `dutyState` (preferred): exact 3-state filter
   ///     'available' (on duty + free) | 'busy' (on a job) | 'off_duty'.
@@ -221,7 +231,9 @@ exports.list = async ({ status, kyc, search, onDuty, dutyState, scope, page = 1,
     prisma.partner.findMany({
       where,
       include: { document: true, cityRef: { select: { name: true, state: { select: { name: true, code: true } } } } },
-      orderBy: { createdAt: 'desc' },
+      /// Sort by joined/application date — 'asc' = oldest first
+      /// (admin-selectable); defaults to newest first.
+      orderBy: { createdAt: order === 'asc' ? 'asc' : 'desc' },
       skip: (page - 1) * pageSize,
       take: pageSize,
     }),
@@ -586,9 +598,18 @@ exports.updateStatus = async (id, status, reason) => {
   }
 };
 
-exports.listOnboarding = async ({ status, search, scope, page = 1, pageSize = 25 } = {}) => {
+exports.listOnboarding = async ({ status, search, categoryId, order, from, to, scope, page = 1, pageSize = 25 } = {}) => {
   const { applyScopeToWhere } = require('../../middlewares/adminScope');
   const where = { isVerified: false };
+  /// Trade/category filter.
+  if (categoryId) where.categoryId = Number(categoryId);
+  /// Application (created) date range — inclusive of both ends.
+  if (from) where.createdAt = { ...(where.createdAt ?? {}), gte: new Date(from) };
+  if (to) {
+    const toDate = new Date(to);
+    toDate.setHours(23, 59, 59, 999);
+    where.createdAt = { ...(where.createdAt ?? {}), lte: toDate };
+  }
   if (search) {
     where.OR = [
       { name: { contains: search, mode: 'insensitive' } },
@@ -603,7 +624,9 @@ exports.listOnboarding = async ({ status, search, scope, page = 1, pageSize = 25
     prisma.partner.findMany({
       where,
       include: { document: true, cityRef: { select: { name: true, state: { select: { name: true, code: true } } } } },
-      orderBy: { createdAt: 'desc' },
+      /// Sort by joined/application date — 'asc' = oldest first
+      /// (admin-selectable); defaults to newest first.
+      orderBy: { createdAt: order === 'asc' ? 'asc' : 'desc' },
       skip: (page - 1) * pageSize,
       take: pageSize,
     }),

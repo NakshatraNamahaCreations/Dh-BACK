@@ -16,6 +16,13 @@ const listQuerySchema = z.object({
     /// Geography filters — admin's State→City cascade.
     cityId: z.coerce.number().int().positive().optional(),
     stateId: z.coerce.number().int().positive().optional(),
+    /// Filter by trade/category.
+    categoryId: z.coerce.number().int().positive().optional(),
+    /// Sort by creation (joined) date. 'asc' = oldest first.
+    order: z.enum(['asc', 'desc']).optional(),
+    /// Created (joined) date range — YYYY-MM-DD (inclusive both ends).
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     page: z.coerce.number().int().min(1).optional(),
     pageSize: z.coerce.number().int().min(1).max(100).optional(),
   }),
@@ -27,6 +34,13 @@ const onboardingQuerySchema = z.object({
     search: z.string().trim().max(100).optional(),
     cityId: z.coerce.number().int().positive().optional(),
     stateId: z.coerce.number().int().positive().optional(),
+    /// Filter by trade/category.
+    categoryId: z.coerce.number().int().positive().optional(),
+    /// Sort by application (creation) date. 'asc' = oldest first.
+    order: z.enum(['asc', 'desc']).optional(),
+    /// Application (created) date range — YYYY-MM-DD (inclusive both ends).
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     page: z.coerce.number().int().min(1).optional(),
     pageSize: z.coerce.number().int().min(1).max(100).optional(),
   }),

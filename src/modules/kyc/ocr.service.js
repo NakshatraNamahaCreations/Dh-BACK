@@ -171,7 +171,9 @@ const digitsRescuePass = async (buf, numDigits) => {
   return (
     digits.includes(numDigits) ||
     digits.includes(numDigits.slice(-8)) ||
-    fuzzyContains(digits, numDigits, 0.9)
+    /// 0.85 over 12 digits tolerates ~1-2 misread digits — enough for a
+    /// glossy card, still tight enough not to match an unrelated number.
+    fuzzyContains(digits, numDigits, 0.85)
   );
 };
 
@@ -252,8 +254,16 @@ exports.numberExistsInImage = async (imageUrl, number) => {
 const BACK_MARKERS = [
   'uidai',
   'unique identification authority',
+  /// Partial of the header — survives when "unique"/"of india" misreads on
+  /// a busy mixed-script back.
+  'identification authority',
   'help@uidai',
   'uidai.gov.in',
+  'www.uidai',
+  /// UIDAI toll-free helpline printed on every back template. The
+  /// digits-only form is matched separately (see `helplineDigitHit`) so OCR
+  /// spacing variations don't matter.
+  '1800 180 1947',
 ];
 
 /**
@@ -283,18 +293,26 @@ exports.aadhaarBackMarkersInImage = async (imageUrl, number) => {
   /// random photo from 1947 doesn't slip through.
   const helplineHit =
     lower.includes('1947') && (lower.includes('aadhaar') || lower.includes('aadhar'));
+  /// Digits-only view of the OCR text — used for both the helpline and the
+  /// Aadhaar-number matches (digits OCR far more reliably than the tiny
+  /// footer text, and this ignores OCR spacing quirks).
+  const canonDigits = canonicalise(raw).replace(/\D/g, '');
+  /// UIDAI toll-free helpline (1800 180 1947) as a digit run — a strong
+  /// Aadhaar-back signal on its own, regardless of how OCR spaces it.
+  const helplineDigitHit = canonDigits.includes('18001801947');
   /// Number-on-back match — same digit-run / tail8 tolerance the front
-  /// check uses (digits OCR far more reliably than the tiny footer text).
+  /// check uses.
   let numberHit = false;
   const numDigits = number ? canonicalise(number).replace(/\D/g, '') : '';
   if (numDigits) {
-    const canonDigits = canonicalise(raw).replace(/\D/g, '');
     numberHit =
       numDigits.length >= 8 &&
       (canonDigits.includes(numDigits) || canonDigits.includes(numDigits.slice(-8)));
   }
-  let found = Boolean(matched) || helplineHit || numberHit;
-  let via = matched || (helplineHit ? '1947+aadhaar' : numberHit ? 'number' : 'none');
+  let found = Boolean(matched) || helplineHit || helplineDigitHit || numberHit;
+  let via =
+    matched ||
+    (helplineHit ? '1947+aadhaar' : helplineDigitHit ? 'helpline' : numberHit ? 'number' : 'none');
   /// Same digits-only rescue the front check uses — a back photo whose
   /// footer text is blurred can still pass on its big number line.
   if (!found && (await digitsRescuePass(buf, numDigits).catch(() => false))) {

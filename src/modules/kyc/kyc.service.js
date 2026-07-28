@@ -191,16 +191,28 @@ exports.generateAadhaarOtp = async ({ partnerId, aadhaarNumber, imageUrl, backIm
       return { found: true };
     }),
   ]);
-  if (!frontOcr.found) {
-    logger.warn(`[kyc] OCR gate BLOCKED front image for partner ${partnerId} (number not found).`);
+  /// HARD block only when NEITHER side reads as this Aadhaar. If the front
+  /// number OR the back UIDAI markers are readable, proceed — the OTP (to the
+  /// Aadhaar-linked mobile) + admin document review are the real gates, so a
+  /// genuine card isn't rejected just because tesseract misread ONE side of a
+  /// glossy, mixed-script (Kannada/Hindi + English) phone photo. Only a total
+  /// miss (both sides unreadable) signals a wrong / garbage upload worth
+  /// blocking — which the OCR OR the OTP would catch anyway.
+  if (!frontOcr.found && !backOcr.found) {
+    logger.warn(
+      `[kyc] OCR gate BLOCKED partner ${partnerId} — neither front number nor back UIDAI markers found.`,
+    );
     throw ApiError.badRequest(
-      'We could not find the Aadhaar number you entered on the front photo. Upload a clear, well-lit photo of the FRONT of your Aadhaar card and make sure it matches the number you typed.',
+      'We could not recognise these photos as your Aadhaar card. Upload clear, well-lit photos of the FRONT (showing the number you typed) and the BACK of your Aadhaar, then try again.',
     );
   }
-  if (!backOcr.found) {
-    logger.warn(`[kyc] OCR gate BLOCKED back image for partner ${partnerId} (no number / UIDAI markers).`);
-    throw ApiError.badRequest(
-      'The back photo does not look like an Aadhaar card. Upload a clear, well-lit photo of the BACK of your Aadhaar card.',
+  if (!frontOcr.found) {
+    logger.info(
+      `[kyc] partner ${partnerId}: front number not OCR-read, but back UIDAI markers matched — proceeding (OTP + admin review gate).`,
+    );
+  } else if (!backOcr.found) {
+    logger.info(
+      `[kyc] partner ${partnerId}: back markers not OCR-read, but front number matched — proceeding (OTP + admin review gate).`,
     );
   }
 
