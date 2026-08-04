@@ -467,6 +467,77 @@ exports.verifyPayment = async ({
   return result;
 };
 
+/// Settle a FULLY-DISCOUNTED (₹0) booking WITHOUT Razorpay. When a coupon
+/// covers the whole grand total there's nothing to charge, and Razorpay
+/// rejects a zero-amount order — so the old flow left the booking unpaid, it
+/// got auto-cancelled, yet the app (which had already set the active-booking
+/// marker) showed it "confirmed". This marks the booking paid via a 0-amount
+/// 'coupon' Payment row and kicks off the SAME post-payment dispatch + invoice
+/// path `verifyPayment` uses. Server-authoritative: only proceeds when the
+/// booking's OWN grandTotal is <= 0, so a client can't fake a free booking.
+exports.settleFreeBooking = async ({ bookingId, customerId }) => {
+  const customerIdNum = Number(customerId);
+  const booking = await prisma.booking.findUnique({
+    where: { id: Number(bookingId) },
+    select: {
+      id: true,
+      customerId: true,
+      status: true,
+      paymentStatus: true,
+      grandTotal: true,
+      total: true,
+      offeredPrice: true,
+    },
+  });
+  if (!booking) throw ApiError.notFound('Booking not found');
+  if (booking.customerId !== customerIdNum) throw ApiError.forbidden('Not your booking');
+  if (booking.status === 'CANCELLED') throw ApiError.badRequest('Booking is cancelled');
+  /// Idempotent — a double-tap / retry on an already-settled free booking
+  /// just returns the current row instead of erroring.
+  if (booking.paymentStatus === 'paid') {
+    return prisma.booking.findUnique({ where: { id: booking.id } });
+  }
+
+  /// The server decides "free" from the booking's own amount — never trust a
+  /// client-supplied total. Mirrors createOrder's payable resolution.
+  const payable = booking.grandTotal && booking.grandTotal > 0
+    ? booking.grandTotal
+    : (booking.offeredPrice ?? booking.total ?? 0);
+  if (payable > 0) {
+    throw ApiError.badRequest('This booking has an amount due — use the payment flow');
+  }
+
+  const result = await prisma.$transaction(async (tx) => {
+    await tx.payment.create({
+      data: {
+        bookingId: booking.id,
+        amount: 0,
+        currency: 'INR',
+        status: 'paid',
+        method: 'coupon',
+        purpose: 'booking',
+        provider: 'free',
+        paidAt: new Date(),
+      },
+    });
+    await syncBookingRollup(tx, booking.id);
+    return tx.booking.findUnique({ where: { id: booking.id } });
+  });
+
+  /// Same fire-and-forget post-payment steps as verifyPayment: broadcast to
+  /// partners (instant fixed-price) and enqueue the invoice/email.
+  triggerDispatchIfNeeded(booking.id).catch((err) => {
+    logger.warn(
+      `Free-booking dispatch trigger failed for booking ${booking.id}: ${err.message}`,
+    );
+  });
+  dispatchQueue.enqueuePaymentSuccess(booking.id).catch((err) => {
+    logger.warn(`payment_success enqueue failed for free booking ${booking.id}: ${err.message}`);
+  });
+
+  return result;
+};
+
 /// Mark the add-ons covered by a captured "addons" Payment as paid.
 /// Shared by the verify path and the webhook backup path — idempotent
 /// (updateMany on still-unpaid rows only).

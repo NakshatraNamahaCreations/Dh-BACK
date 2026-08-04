@@ -148,13 +148,24 @@ exports.get = async (id) => {
   const customer = await prisma.customer.findUnique({ where: { id } });
   if (!customer) throw ApiError.notFound('Customer not found');
 
-  const [agg, recentRows, addresses] = await Promise.all([
+  const [agg, paidAgg, recentRows, addresses] = await Promise.all([
     prisma.booking.aggregate({
       where: { customerId: id },
       _count: { _all: true },
-      _sum: { total: true },
       _max: { createdAt: true },
       _min: { createdAt: true },
+    }),
+    /// Lifetime spend = money the customer ACTUALLY kept spent, so it sums
+    /// `total` only over PAID and NON-CANCELLED bookings. A booking that was
+    /// paid and later cancelled is (or will be) refunded, so it must not count
+    /// — otherwise the figure over-reports: e.g. a customer with 2 completed
+    /// bookings showed ₹13,214 spend across 6 "paid" rows because 4 of them
+    /// were paid-then-cancelled. Excluding CANCELLED keeps spend aligned with
+    /// bookings the customer actually went through with.
+    prisma.booking.aggregate({
+      where: { customerId: id, paymentStatus: 'paid', status: { not: 'CANCELLED' } },
+      _count: { _all: true },
+      _sum: { total: true },
     }),
     prisma.booking.findMany({
       where: { customerId: id },
@@ -182,7 +193,9 @@ exports.get = async (id) => {
   ]);
 
   const totalBookings = agg._count?._all ?? 0;
-  const totalSpent = agg._sum?.total ?? 0;
+  /// Spend + its order count come from paid bookings only (see paidAgg).
+  const totalSpent = paidAgg._sum?.total ?? 0;
+  const paidCount = paidAgg._count?._all ?? 0;
   const completedCount = await prisma.booking.count({
     where: { customerId: id, status: 'COMPLETED' },
   });
@@ -197,7 +210,7 @@ exports.get = async (id) => {
       totalSpent,
       completedCount,
       cancelledCount,
-      averageOrderValue: totalBookings > 0 ? Math.round(totalSpent / totalBookings) : 0,
+      averageOrderValue: paidCount > 0 ? Math.round(totalSpent / paidCount) : 0,
       firstBookingAt: agg._min?.createdAt ?? null,
       lastBookingAt: agg._max?.createdAt ?? null,
     },

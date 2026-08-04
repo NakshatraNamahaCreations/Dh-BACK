@@ -156,6 +156,16 @@ exports.razorpayCreateOrder = asyncHandler(async (req, res) => {
   success(res, data, 'Razorpay order created');
 });
 
+/// Settle a fully-discounted (₹0) booking with no Razorpay round-trip — the
+/// app calls this instead of /razorpay/order when the payable is 0.
+exports.settleFreeBooking = asyncHandler(async (req, res) => {
+  const booking = await razorpay.settleFreeBooking({
+    bookingId: req.body.bookingId,
+    customerId: req.user.sub,
+  });
+  success(res, { bookingId: booking.id, paymentStatus: booking.paymentStatus }, 'Booking confirmed');
+});
+
 exports.razorpayVerify = asyncHandler(async (req, res) => {
   const booking = await razorpay.verifyPayment({
     bookingId: req.body.bookingId,

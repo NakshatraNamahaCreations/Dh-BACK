@@ -52,6 +52,8 @@ router.post('/disputes/:id/resolve', adminOnly, requirePermission('bookings.edit
 router.post('/disputes/:id/notes', adminOnly, requirePermission('bookings.edit'), validate(disputeNoteSchema), controller.addDisputeNote);
 router.get('/stuck', adminOnly, requirePermission('bookings.view'), controller.listStuckJobs);
 router.get('/admin/:id', adminOnly, requirePermission('bookings.view'), validate(idParam), controller.adminGet);
+router.get('/admin/:id/invoice', adminOnly, requirePermission('bookings.view'), validate(idParam), controller.adminDownloadInvoice);
+router.post('/admin/:id/send-invoice', adminOnly, requirePermission('bookings.edit'), validate(idParam), controller.adminSendInvoiceEmail);
 router.patch('/admin/:id/status', adminOnly, requirePermission('bookings.edit'), validate(adminStatusSchema), controller.adminUpdateStatus);
 router.post('/admin/:id/cancel', adminOnly, requirePermission('bookings.edit'), validate(adminCancelSchema), controller.adminCancel);
 router.post('/admin/:id/mark-paid', adminOnly, requirePermission('bookings.edit'), validate(adminMarkPaidSchema), controller.adminMarkPaid);

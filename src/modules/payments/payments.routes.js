@@ -50,6 +50,14 @@ router.post(
   validate(razorpayVerifySchema),
   controller.razorpayVerify,
 );
+// Free (₹0) settlement — confirms a fully coupon-covered booking without a
+// Razorpay order (which can't be created for a 0 amount). Body is just the id.
+router.post(
+  '/razorpay/settle-free',
+  customerOnly,
+  validate(razorpayCreateOrderSchema),
+  controller.settleFreeBooking,
+);
 // Active reconcile — server pulls the true order status from Razorpay and
 // settles it. The app's backstop when the client verify never landed.
 router.post(

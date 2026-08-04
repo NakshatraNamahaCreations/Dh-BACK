@@ -2254,6 +2254,88 @@ exports.adminGet = async (id) => {
   return adminShape(b);
 };
 
+/// Load a booking with exactly the fields the invoice generator needs, and
+/// enforce that it's paid (nothing to invoice otherwise). Shared by the
+/// download + email-invoice admin actions.
+const loadInvoiceBooking = async (id) => {
+  const booking = await prisma.booking.findUnique({
+    where: { id: Number(id) },
+    select: {
+      id: true,
+      status: true,
+      paymentStatus: true,
+      bookingRef: true,
+      subtotal: true,
+      discount: true,
+      total: true,
+      gstAmount: true,
+      platformFee: true,
+      grandTotal: true,
+      paidAt: true,
+      createdAt: true,
+      scheduledAt: true,
+      addressLine: true,
+      addressLabel: true,
+      customer: { select: { id: true, name: true, email: true } },
+      customerAddress: { select: { addressLine: true } },
+      items: {
+        select: { qty: true, basePrice: true, service: { select: { name: true } } },
+      },
+    },
+  });
+  if (!booking) throw ApiError.notFound('Booking not found');
+  if (booking.paymentStatus !== 'paid') {
+    throw ApiError.badRequest('An invoice is only available once the booking is paid.');
+  }
+  return booking;
+};
+
+/// Build the tax invoice PDF for a booking on demand (admin download). Uses
+/// the same generator + booking shape the post-payment email worker uses.
+exports.adminInvoicePdf = async (id) => {
+  const { generateInvoicePdf, invoiceNumber } = require('../../lib/invoice');
+  const booking = await loadInvoiceBooking(id);
+  const pdf = await generateInvoicePdf(booking);
+  return { pdf, filename: `invoice-${invoiceNumber(booking)}.pdf` };
+};
+
+/// Email the tax invoice (PDF attachment + HTML body) to the customer on
+/// demand. Same content the post-payment worker sends — this is the admin's
+/// manual "resend / send it now" action (e.g. when the auto-email failed or
+/// the customer asks for a copy).
+exports.adminSendInvoiceEmail = async (id) => {
+  const { generateInvoicePdf, buildInvoiceEmailHtml, invoiceNumber } = require('../../lib/invoice');
+  const { sendMail } = require('../../lib/email');
+  const booking = await loadInvoiceBooking(id);
+  const email = booking.customer?.email?.trim();
+  if (!email) {
+    throw ApiError.badRequest(
+      "This customer has no email address on file, so the invoice can't be emailed.",
+    );
+  }
+  const [pdfBuffer, html] = await Promise.all([
+    generateInvoicePdf(booking),
+    Promise.resolve(buildInvoiceEmailHtml(booking)),
+  ]);
+  const invNo = invoiceNumber(booking);
+  const info = await sendMail({
+    to: email,
+    subject: `Your Dhoond Invoice — ${invNo}`,
+    html,
+    attachments: [
+      { filename: `dhoond-invoice-${invNo}.pdf`, content: pdfBuffer, contentType: 'application/pdf' },
+    ],
+  });
+  /// `sendMail` returns null (not throws) when SMTP isn't configured — surface
+  /// that as a clear, actionable error instead of a silent "success".
+  if (!info) {
+    throw ApiError.badRequest(
+      'Email is not configured on the server (SMTP_HOST / SMTP_USER / SMTP_PASS). Set those and try again.',
+    );
+  }
+  return { sent: true, email };
+};
+
 const appendNote = (current, line) => [current, line].filter(Boolean).join('\n').trim();
 
 exports.reassign = async (bookingId, partnerId, reason = 'Manual assignment') => {

@@ -96,6 +96,19 @@ exports.adminGet = asyncHandler(async (req, res) => {
   success(res, item, 'Booking fetched');
 });
 
+exports.adminDownloadInvoice = asyncHandler(async (req, res) => {
+  const { pdf, filename } = await service.adminInvoicePdf(req.params.id);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Content-Length', pdf.length);
+  res.send(pdf);
+});
+
+exports.adminSendInvoiceEmail = asyncHandler(async (req, res) => {
+  const result = await service.adminSendInvoiceEmail(req.params.id);
+  success(res, result, `Invoice emailed to ${result.email}`);
+});
+
 exports.liveJobs = asyncHandler(async (req, res) => {
   const { scopeByAdmin } = require('../../middlewares/adminScope');
   const scope = await scopeByAdmin(req, {

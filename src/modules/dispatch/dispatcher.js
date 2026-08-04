@@ -836,7 +836,7 @@ const handlePaymentSuccess = async ({ bookingId }) => {
       items: {
         select: {
           qty: true,
-          price: true,
+          basePrice: true,
           service: { select: { name: true } },
         },
       },
