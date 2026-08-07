@@ -63,6 +63,16 @@ const assertUsable = (coupon, subtotal, now = new Date()) => {
       `Minimum order ₹${coupon.minOrderValue} required for this coupon`,
     );
   }
+  /// FLAT coupons must never cover (or exceed) the whole order — a flat
+  /// ₹566 coupon on a ₹229 cart would zero the bill (the clamp in
+  /// computeDiscount silently ate the difference). The order total must
+  /// be STRICTLY greater than the flat value for the coupon to apply,
+  /// regardless of what minOrderValue the admin set.
+  if (coupon.discountType !== 'PERCENT' && subtotal <= coupon.discountValue) {
+    throw ApiError.badRequest(
+      `Order total must be above ₹${coupon.discountValue} to use this coupon`,
+    );
+  }
 };
 
 /// ── Customer endpoints ────────────────────────────────────────────────

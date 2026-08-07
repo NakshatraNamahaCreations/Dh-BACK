@@ -201,9 +201,9 @@ const sendFcmDataMessage = async (token, data, notification = null) => {
  *
  * @param {object} prisma
  * @param {number[]} partnerIds  - offline partners only (see dispatcher)
- * @param {{ bookingId: number, serviceName: string, amount: number, dispatchWave?: number }} jobInfo
+ * @param {{ bookingId: number, serviceName: string, amount: number, dispatchWave?: number, address?: string }} jobInfo
  */
-const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, amount, dispatchWave }) => {
+const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, amount, dispatchWave, address }) => {
   if (!partnerIds || partnerIds.length === 0) return;
   try {
     const partners = await prisma.partner.findMany({
@@ -215,7 +215,10 @@ const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, 
         if (p.fcmToken) {
           const sent = await sendFcmDataMessage(
             p.fcmToken,
-            { type: 'job_request', bookingId, serviceName, amount, dispatchWave },
+            /// `address` rides along so the in-app job card renders the
+            /// service address instantly from the push stub instead of
+            /// waiting ~3-5s on the refreshIncoming HTTP fetch.
+            { type: 'job_request', bookingId, serviceName, amount, dispatchWave, address },
             /// Hybrid form — reaches frozen/killed devices. Foreground
             /// app instances ignore job-request FCM echoes and use the
             /// socket-driven in-app popup instead.

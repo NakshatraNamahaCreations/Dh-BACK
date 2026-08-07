@@ -1214,6 +1214,15 @@ exports.listMine = async ({ customerId, status, bucket }) => {
 
   if (bucket === 'upcoming') {
     where.status = { in: ['PENDING', 'CONFIRMED', 'IN_PROGRESS'] };
+    /// PAID-ONLY (product decision, 2026-08-07): Upcoming lists only
+    /// bookings whose payment actually settled. Unpaid rows never
+    /// surface — abandoned pay-first checkouts (cleaned up by
+    /// payment_expire minutes later), in-flight BYOP searches and
+    /// accepted-awaiting-payment BYOP (their payment happens on the
+    /// booking screen the customer is already on, within the 3-minute
+    /// window), failed payments, and cash/unpaid admin rows. Widen the
+    /// filter here if any of those need to come back.
+    where.paymentStatus = 'paid';
   } else if (bucket === 'past') {
     /// Past = completed jobs + cancellations of REAL bookings the
     /// customer actually placed.
@@ -1450,7 +1459,14 @@ exports.cancelOwn = async ({ customerId, id, reason }) => {
   /// Push a dispatch.claimed event to every partner who had this offer
   /// on their screen so the JobAlertModal closes immediately instead of
   /// waiting for the next 30s poll.
-  dispatcher.broadcastClaimed(offerAudience, { bookingId: id, partnerId: null });
+  /// `reason` lets the partner-app toast say WHY the card closed —
+  /// "cancelled by the customer" reads very differently from "taken by
+  /// another partner" (which is what a bare null partnerId used to show).
+  dispatcher.broadcastClaimed(offerAudience, {
+    bookingId: id,
+    partnerId: null,
+    reason: 'customer_cancelled',
+  });
 
   /// If a partner had accepted this booking, tell them it's gone.
   /// Without this they'd find out only when their app polls and the

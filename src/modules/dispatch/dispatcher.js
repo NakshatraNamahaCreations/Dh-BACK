@@ -278,6 +278,13 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       /// (₹1583 / `total`) and the in-app screen another (₹1899 /
       /// `grandTotal`).
       grandTotal: true,
+      /// Address fields for the socket payload's `address` — without
+      /// these in the select, the fallback chain below always resolved
+      /// to '' and the partner app sat on "Loading address…" until its
+      /// HTTP refresh (~3-5s) filled it in.
+      addressLine: true,
+      addressLabel: true,
+      customerAddress: { select: { addressLine: true } },
       items: {
         select: {
           service: { select: { categoryId: true, name: true } },
@@ -521,7 +528,7 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
     void sendJobOfferPushes(
       prisma,
       candidates.map((c) => c.partnerId),
-      { bookingId: booking.id, serviceName, amount, dispatchWave: waveSpec.wave },
+      { bookingId: booking.id, serviceName, amount, dispatchWave: waveSpec.wave, address },
     );
   }
 
@@ -1122,7 +1129,7 @@ const handleExpire = async ({ bookingId }) => {
     if (audience.length > 0) {
       if (socketEmitter) {
         for (const pid of audience) {
-          socketEmitter('dispatch.claimed', pid, { bookingId, partnerId: null });
+          socketEmitter('dispatch.claimed', pid, { bookingId, partnerId: null, reason: 'expired' });
         }
       }
       void clearJobOfferPush(prisma, audience, bookingId);
@@ -1173,7 +1180,7 @@ const handleExpire = async ({ bookingId }) => {
   if (offerAudience.length > 0) {
     if (socketEmitter) {
       for (const pid of offerAudience) {
-        socketEmitter('dispatch.claimed', pid, { bookingId, partnerId: null });
+        socketEmitter('dispatch.claimed', pid, { bookingId, partnerId: null, reason: 'expired' });
       }
     }
     void clearJobOfferPush(prisma, offerAudience, bookingId);
