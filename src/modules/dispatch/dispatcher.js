@@ -935,7 +935,7 @@ const handlePaymentSuccess = async ({ bookingId }) => {
 /// 'paid'). A customer who paid in the last 200ms — webhook race —
 /// flips the row to paid; updateMany returns count 0 here and we
 /// skip the cancel.
-const handlePaymentExpire = async ({ bookingId }) => {
+const handlePaymentExpire = async ({ bookingId, attempt = 0 }) => {
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
     select: {
@@ -988,8 +988,24 @@ const handlePaymentExpire = async ({ bookingId }) => {
       return;
     }
   } catch (err) {
+    /// The reconcile check ERRORING is very different from it answering
+    /// 'unpaid': it only makes a Razorpay round-trip when a pending payment
+    /// row exists — so a throw usually means "there IS a payment attempt
+    /// but we couldn't ask Razorpay about it". Destroying the row now could
+    /// orphan captured money (booking gone → app shows "Booking not found"
+    /// while the customer's account was debited). Leave the row untouched
+    /// and re-check up to 3 times, 10 minutes apart; only after that does
+    /// the guarded expiry below run (which soft-cancels, never deletes,
+    /// when payment rows exist).
+    if (attempt < 3) {
+      logger.warn(
+        `payment_expire: reconciliation for booking ${bookingId} failed (${err.message}) — retry ${attempt + 1}/3 in 10 min`,
+      );
+      await queue.enqueuePaymentExpireRetry(booking.id, 10 * 60 * 1000, attempt + 1);
+      return;
+    }
     logger.warn(
-      `payment_expire: Razorpay reconciliation for booking ${bookingId} failed (${err.message}) — proceeding with expiry`,
+      `payment_expire: reconciliation for booking ${bookingId} still failing after ${attempt} retries (${err.message}) — proceeding with guarded expiry`,
     );
   }
 
@@ -1003,11 +1019,21 @@ const handlePaymentExpire = async ({ bookingId }) => {
       where: { bookingId: booking.id, type: 'cancellation_penalty' },
     })) > 0;
 
+  /// Money-trail guard: if ANY payment row exists for this booking, a
+  /// checkout was at least started — deleting would cascade-delete those
+  /// rows and erase the only server-side link to a possibly-captured
+  /// Razorpay payment. Soft-cancel instead so the booking stays visible
+  /// (customer's Past tab, admin panel) and support can reconcile/refund
+  /// against the provider ids. Only rows with zero payment attempts are
+  /// truly abandoned and safe to delete.
+  const hasPaymentAttempt =
+    (await prisma.payment.count({ where: { bookingId: booking.id } })) > 0;
+
   const result = await prisma.$transaction(async (tx) => {
     if (booking.couponId != null) {
       await couponsService.refundForBooking({ couponId: booking.couponId, tx });
     }
-    if (wasPartnerCancelled) {
+    if (wasPartnerCancelled || hasPaymentAttempt) {
       return tx.booking.updateMany({
         where: {
           id: booking.id,
@@ -1035,7 +1061,11 @@ const handlePaymentExpire = async ({ bookingId }) => {
       bookingId: booking.id,
     });
   }
-  logger.info(`payment_expire: booking ${bookingId} deleted (unpaid attempt expired)`);
+  logger.info(
+    `payment_expire: booking ${bookingId} ${
+      wasPartnerCancelled || hasPaymentAttempt ? 'soft-cancelled (payment trail kept)' : 'deleted'
+    } (unpaid attempt expired)`,
+  );
 };
 
 /// Wave expiry. After the 7km retry broadcast also passes without

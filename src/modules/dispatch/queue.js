@@ -109,6 +109,24 @@ const enqueuePaymentExpire = async (bookingId, delayMs) => {
   );
 };
 
+/// Retry variant of the payment-expire timer, used when the pre-expiry
+/// Razorpay reconciliation check ERRORED (API/network hiccup). Instead of
+/// destroying a row that may have real money captured against it, the
+/// handler re-checks later via this job. Attempt-scoped jobId so the retry
+/// can never collide with the original idempotent `payment_expire__<id>`
+/// job still sitting in the queue's completed set.
+const enqueuePaymentExpireRetry = async (bookingId, delayMs, attempt) => {
+  if (!dispatchQueue) return null;
+  return dispatchQueue.add(
+    'payment_expire',
+    { bookingId, attempt },
+    {
+      delay: delayMs,
+      jobId: `payment_expire__${bookingId}__r${attempt}`,
+    },
+  );
+};
+
 /// Payment-success job — enqueued once payment is confirmed (verify +
 /// webhook). Runs the post-payment flow: confirm booking if needed and
 /// deliver the invoice PDF to the customer's email address.
@@ -288,6 +306,7 @@ module.exports = {
   enqueueExpire,
   enqueueAdminTimeout,
   enqueuePaymentExpire,
+  enqueuePaymentExpireRetry,
   enqueuePaymentSuccess,
   ensureReconcilerScheduled,
   ensureNotificationCleanupScheduled,
