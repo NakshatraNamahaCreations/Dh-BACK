@@ -3350,6 +3350,17 @@ exports.partnerUpdateStatus = async ({ bookingId, partnerId, status, otp }) => {
         arrivedAt: updatedArr.arrivedAt,
       });
     } catch { /* socket optional — poll catches up */ }
+    /// ...and a REAL push notification. The socket above only reaches a
+    /// foregrounded, connected app; a customer whose phone is in their
+    /// pocket (the normal case when a partner turns up at the door) has no
+    /// socket at all, which is why arrival alerts were never received.
+    const { sendCustomerPush } = require('../notifications/push.service');
+    void sendCustomerPush(prisma, b.customerId, {
+      type: 'partner_arrived',
+      bookingId: id,
+      title: 'Your service partner has arrived',
+      body: 'They are at your location — please meet them at the door.',
+    });
     const commissionMap = await loadCommissionMap();
     return partnerShape(updatedArr, null, commissionMap);
   }

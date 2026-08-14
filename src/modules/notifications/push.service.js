@@ -309,6 +309,59 @@ const sendJobAssignedPush = async (prisma, partnerId, { bookingId, serviceName, 
 };
 
 /**
+ * Push a booking-lifecycle alert to a CUSTOMER's device.
+ *
+ * Counterpart to the partner helpers above. Booking events previously
+ * reached the customer app over the socket ONLY, which works while the app
+ * is foregrounded and connected — but a backgrounded/killed app has no
+ * socket, so events like "your partner has arrived" were never seen. This
+ * sends a real system notification so it lands regardless of app state.
+ *
+ * FCM first (survives a swiped-away app), Expo as the fallback for older
+ * installs that only registered an Expo token. The `notification` block is
+ * what makes Android render it while the app is backgrounded; `data`
+ * carries the bookingId so tapping it can deep-link.
+ *
+ * Best-effort: never throws, so a push failure can't break the booking
+ * flow that triggered it.
+ *
+ * @param {object} prisma
+ * @param {number} customerId
+ * @param {{ title: string, body: string, type: string, bookingId: number|string }} msg
+ */
+const sendCustomerPush = async (prisma, customerId, { title, body, type, bookingId }) => {
+  if (customerId == null) return;
+  try {
+    const customer = await prisma.customer.findUnique({
+      where: { id: Number(customerId) },
+      select: { expoPushToken: true, fcmToken: true },
+    });
+    if (!customer) return;
+
+    if (customer.fcmToken) {
+      const sent = await sendFcmDataMessage(
+        customer.fcmToken,
+        { type, bookingId: String(bookingId) },
+        { title, body },
+      );
+      /// Anything other than a dead token means it went out — don't
+      /// double-send over Expo.
+      if (sent && sent !== 'token-dead') return;
+    }
+
+    if (customer.expoPushToken) {
+      await sendPush(customer.expoPushToken, {
+        title,
+        body,
+        data: { bookingId: String(bookingId), type },
+      });
+    }
+  } catch (err) {
+    logger.warn(`[push] sendCustomerPush(${type}) failed: ${err.message}`);
+  }
+};
+
+/**
  * Clear the job-offer notification from a set of partners' notification
  * bars — sent when the booking is TAKEN by someone else or its dispatch
  * window EXPIRES, so a stale "New job" alert doesn't linger. A data-only
@@ -348,6 +401,7 @@ module.exports = {
   sendFcmDataMessage,
   sendJobOfferPushes,
   sendJobAssignedPush,
+  sendCustomerPush,
   clearJobOfferPush,
   JOB_OFFER_NOTIFICATION_TAG,
 };

@@ -1,0 +1,1994 @@
+{
+  "groups": [
+    {
+      "name": "auth",
+      "prefix": "/api/v1/auth",
+      "file": "src/modules/auth/auth.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/auth/customer/send-otp",
+          "access": "Public",
+          "permission": null,
+          "schema": "sendOtpSchema",
+          "description": "Customer app"
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/auth/customer/verify-otp",
+          "access": "Public",
+          "permission": null,
+          "schema": "verifyOtpSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/auth/partner/send-otp",
+          "access": "Public",
+          "permission": null,
+          "schema": "sendOtpSchema",
+          "description": "Partner app"
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/auth/partner/verify-otp",
+          "access": "Public",
+          "permission": null,
+          "schema": "verifyOtpSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/auth/admin/login",
+          "access": "Public",
+          "permission": null,
+          "schema": "adminLoginSchema",
+          "description": "Admin panel"
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/auth/partner/onboarding/order",
+          "access": "Partner",
+          "permission": null,
+          "schema": null,
+          "description": "Partner onboarding payment — Razorpay flow. 1. POST /partner/onboarding/order → mints a Razorpay order with the admin-set fee and returns { orderId, keyId, amount, currency } so the partner app can open Checkout. 2. POST /partner/onboarding/verify → backend verifies the signed payload, persists the payment id, and flips paymentStatus = paid. The legacy /partner/payment-done endpoint is kept for now so older app builds still work, but new clients should call the verify route which enforces signature verification."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/auth/partner/onboarding/verify",
+          "access": "Partner",
+          "permission": null,
+          "schema": "verifyOnboardingPaymentSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/auth/partner/payment-done",
+          "access": "Partner",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/auth/me",
+          "access": "Authenticated",
+          "permission": null,
+          "schema": null,
+          "description": "Current user"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/auth/me",
+          "access": "Authenticated",
+          "permission": null,
+          "schema": "updateMeSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/auth/me/push-token",
+          "access": "Authenticated",
+          "permission": null,
+          "schema": null,
+          "description": "Push token registration — called by customer and partner apps after login"
+        }
+      ]
+    },
+    {
+      "name": "categories",
+      "prefix": "/api/v1/categories",
+      "file": "src/modules/categories/categories.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/categories",
+          "access": "Public",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": "Public list — used by customer + partner apps for the category grid."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/categories/:id",
+          "access": "Public",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/categories",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/categories/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/categories/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/categories/:id/toggle",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/categories/reorder",
+          "access": "Admin",
+          "permission": null,
+          "schema": "reorderSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "sub-categories",
+      "prefix": "/api/v1/sub-categories",
+      "file": "src/modules/sub-categories/sub-categories.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/sub-categories",
+          "access": "Public",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": "Public list — used by customer app for the grouped category view."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/sub-categories/:id",
+          "access": "Public",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/sub-categories",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/sub-categories/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/sub-categories/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/sub-categories/:id/toggle",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/sub-categories/reorder",
+          "access": "Admin",
+          "permission": null,
+          "schema": "reorderSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "services",
+      "prefix": "/api/v1/services",
+      "file": "src/modules/services/services.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/services",
+          "access": "Public",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": "Public — customer + partner apps fetch the live catalog."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/services/popular",
+          "access": "Public",
+          "permission": null,
+          "schema": "popularQuerySchema",
+          "description": "`/popular` MUST precede `/:id` or the param route captures \"popular\"."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/services/:id",
+          "access": "Public",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/services/:id/related",
+          "access": "Public",
+          "permission": null,
+          "schema": "relatedQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/services",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/services/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/services/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/services/:id/toggle",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/services/bulk",
+          "access": "Admin",
+          "permission": null,
+          "schema": "bulkImportSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "uploads",
+      "prefix": "/api/v1/uploads",
+      "file": "src/modules/uploads/uploads.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/uploads/presign",
+          "access": "Authenticated",
+          "permission": null,
+          "schema": "presignSchema",
+          "description": "Admins (banner/category images) and Partners (KYC documents) both need presign."
+        }
+      ]
+    },
+    {
+      "name": "banners",
+      "prefix": "/api/v1/banners",
+      "file": "src/modules/banners/banners.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/banners",
+          "access": "Public",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": "Public list — customer / partner apps fetch live banners. GET /banners?placement=HOME_HERO&liveOnly=true"
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/banners/:id",
+          "access": "Public",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/banners",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/banners/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/banners/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/banners/:id/toggle",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/banners/reorder",
+          "access": "Admin",
+          "permission": null,
+          "schema": "reorderSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "bookings",
+      "prefix": "/api/v1/bookings",
+      "file": "src/modules/bookings/bookings.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/partner/incoming",
+          "access": "Partner",
+          "permission": null,
+          "schema": "partnerIncomingQuerySchema",
+          "description": "Partner routes (before /:id catch-alls)"
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/partner/mine",
+          "access": "Partner",
+          "permission": null,
+          "schema": "partnerMineQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/partner/:id/accept",
+          "access": "Partner",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/partner/:id/cancel",
+          "access": "Partner",
+          "permission": null,
+          "schema": "partnerCancelSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/partner/:id/status",
+          "access": "Partner",
+          "permission": null,
+          "schema": "partnerStatusSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/partner/:id/addons",
+          "access": "Partner",
+          "permission": null,
+          "schema": "partnerAddOnsSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/bookings/partner/:id/addons/:addOnId",
+          "access": "Partner",
+          "permission": null,
+          "schema": "partnerRemoveAddOnSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/admin",
+          "access": "Admin",
+          "permission": "bookings.edit",
+          "schema": "adminCreateSchema",
+          "description": "Admin routes (registered before customer-scoped routes so /admin and /live etc. don't collide with the catch-all /:id)"
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/admin",
+          "access": "Admin",
+          "permission": "bookings.view",
+          "schema": "adminListQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/live",
+          "access": "Admin",
+          "permission": "bookings.view",
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/disputes",
+          "access": "Admin",
+          "permission": "bookings.view",
+          "schema": "disputesListQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/disputes/:id/resolve",
+          "access": "Admin",
+          "permission": "bookings.edit",
+          "schema": "resolveDisputeSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/disputes/:id/notes",
+          "access": "Admin",
+          "permission": "bookings.edit",
+          "schema": "disputeNoteSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/stuck",
+          "access": "Admin",
+          "permission": "bookings.view",
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/admin/:id",
+          "access": "Admin",
+          "permission": "bookings.view",
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/admin/:id/invoice",
+          "access": "Admin",
+          "permission": "bookings.view",
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/admin/:id/send-invoice",
+          "access": "Admin",
+          "permission": "bookings.edit",
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/bookings/admin/:id/status",
+          "access": "Admin",
+          "permission": "bookings.edit",
+          "schema": "adminStatusSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/admin/:id/cancel",
+          "access": "Admin",
+          "permission": "bookings.edit",
+          "schema": "adminCancelSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/admin/:id/mark-paid",
+          "access": "Admin",
+          "permission": "bookings.edit",
+          "schema": "adminMarkPaidSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/admin/:id/retry-refund",
+          "access": "Admin",
+          "permission": "bookings.refund",
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/admin/:id/reschedule",
+          "access": "Admin",
+          "permission": "bookings.edit",
+          "schema": "adminRescheduleSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/:id/nearby-partners",
+          "access": "Admin",
+          "permission": "bookings.view",
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/:id/dispatch",
+          "access": "Admin",
+          "permission": "bookings.dispatch",
+          "schema": "dispatchSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings",
+          "access": "Customer",
+          "permission": null,
+          "schema": "createSchema",
+          "description": "Customer routes"
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/me",
+          "access": "Customer",
+          "permission": null,
+          "schema": "listMineQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/nearby-eta",
+          "access": "Customer",
+          "permission": null,
+          "schema": "nearbyEtaQuerySchema",
+          "description": "Home arrival-promise ETA. MUST be registered before `/:id` so the literal path isn't captured as a booking id. Takes lat/lng query params."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/:id",
+          "access": "Customer",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/:id/availability",
+          "access": "Customer",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/bookings/:id/cancellation-quote",
+          "access": "Customer",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/:id/cancel",
+          "access": "Customer",
+          "permission": null,
+          "schema": "cancelSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/bookings/:id/rate",
+          "access": "Customer",
+          "permission": null,
+          "schema": "rateBookingSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "pricing",
+      "prefix": "/api/v1/pricing",
+      "file": "src/modules/pricing/pricing.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/pricing/ranges",
+          "access": "Public",
+          "permission": null,
+          "schema": null,
+          "description": "Admin reads & writes — one row per category with min/mid/max percentages."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/pricing/ranges/quote",
+          "access": "Public",
+          "permission": null,
+          "schema": "quoteRangeSchema",
+          "description": "Public — customer cart asks for the aggregated slider bounds across its line items."
+        },
+        {
+          "method": "PUT",
+          "path": "/api/v1/pricing/ranges",
+          "access": "Admin",
+          "permission": null,
+          "schema": "saveRangesSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/pricing/surge",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/pricing/surge",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createSurgeSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/pricing/surge/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateSurgeSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/pricing/surge/:id/toggle",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/pricing/surge/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "analytics",
+      "prefix": "/api/v1/analytics",
+      "file": "src/modules/analytics/analytics.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/analytics/summary",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/analytics/revenue/series",
+          "access": "Admin",
+          "permission": null,
+          "schema": "rangeQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/analytics/bookings",
+          "access": "Admin",
+          "permission": null,
+          "schema": "rangeQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/analytics/revenue",
+          "access": "Admin",
+          "permission": null,
+          "schema": "rangeQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/analytics/partners",
+          "access": "Admin",
+          "permission": null,
+          "schema": "rangeQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/analytics/customers",
+          "access": "Admin",
+          "permission": null,
+          "schema": "customerRangeQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/analytics/booking-report",
+          "access": "Admin",
+          "permission": null,
+          "schema": "bookingReportQuerySchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "partners",
+      "prefix": "/api/v1/partners",
+      "file": "src/modules/partners/partners.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/partners/onboarding",
+          "access": "Admin",
+          "permission": null,
+          "schema": "onboardingQuerySchema",
+          "description": "Onboarding queue routes need to come before the generic /:id route."
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/partners/onboarding/:id/stage",
+          "access": "Admin",
+          "permission": null,
+          "schema": "stageSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/partners/onboarding/:id/fee",
+          "access": "Admin",
+          "permission": null,
+          "schema": "onboardingFeeSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/partners/onboarding/:id/training",
+          "access": "Admin",
+          "permission": null,
+          "schema": "trainingStatusSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/partners/onboarding/:id/dl/skip",
+          "access": "Admin",
+          "permission": null,
+          "schema": "skipDlSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/partners/onboarding/:id/approve",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/partners/onboarding/:id/reject",
+          "access": "Admin",
+          "permission": null,
+          "schema": "rejectSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/partners",
+          "access": "Admin",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/partners",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/partners/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/partners/:id/status",
+          "access": "Admin",
+          "permission": null,
+          "schema": "statusSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/partners/:id/documents",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateDocumentsSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/partners/:id/category",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateCategorySchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "payments",
+      "prefix": "/api/v1/payments",
+      "file": "src/modules/payments/payments.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/razorpay/webhook",
+          "access": "Public",
+          "permission": null,
+          "schema": null,
+          "description": "Razorpay (customer-facing) Webhook MUST be registered with express.raw() so the signature can be verified against the exact bytes Razorpay sent. JSON-parsed body would not hash to the same value. The webhook is intentionally unauthenticated — Razorpay only knows the WEBHOOK_SECRET (a shared HMAC key)."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/razorpay/order",
+          "access": "Customer",
+          "permission": null,
+          "schema": "razorpayCreateOrderSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/razorpay/verify",
+          "access": "Customer",
+          "permission": null,
+          "schema": "razorpayVerifySchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/razorpay/settle-free",
+          "access": "Customer",
+          "permission": null,
+          "schema": "razorpayCreateOrderSchema",
+          "description": "Free (₹0) settlement — confirms a fully coupon-covered booking without a Razorpay order (which can't be created for a 0 amount). Body is just the id."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/razorpay/reconcile",
+          "access": "Customer",
+          "permission": null,
+          "schema": "razorpayReconcileSchema",
+          "description": "Active reconcile — server pulls the true order status from Razorpay and settles it. The app's backstop when the client verify never landed."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/razorpay/addon-order",
+          "access": "Customer",
+          "permission": null,
+          "schema": "razorpayAddOnOrderSchema",
+          "description": "Add-on side-bill: charges the flat sum of the booking's UNPAID partner-added services. Never touches the main bill's rollup."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/razorpay/addon-verify",
+          "access": "Customer",
+          "permission": null,
+          "schema": "razorpayAddOnVerifySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/payments/commission",
+          "access": "Admin",
+          "permission": "commission.view",
+          "schema": null,
+          "description": "Admin: Commission rules"
+        },
+        {
+          "method": "PUT",
+          "path": "/api/v1/payments/commission",
+          "access": "Admin",
+          "permission": "commission.edit",
+          "schema": "saveCommissionSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/payments/earnings/partners",
+          "access": "Admin",
+          "permission": "payouts.view",
+          "schema": "partnerSummariesQuerySchema",
+          "description": "Admin: Partner earnings Top-level summary list drives the Payout management table. The two per-partner endpoints power the drill-in / partner detail page."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/payments/earnings/partners/:id/summary",
+          "access": "Admin",
+          "permission": "payouts.view",
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/payments/earnings/partners/:id",
+          "access": "Admin",
+          "permission": "payouts.view",
+          "schema": "partnerEarningsQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/payments/weekly",
+          "access": "Admin",
+          "permission": "payouts.view",
+          "schema": "weeklyQuerySchema",
+          "description": "Admin: Weekly settlements (Mon–Sun) Aggregated per-partner earnings for a week + bulk mark-paid after the admin has run the bank transfers from the exported CSV."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/weekly/mark-paid",
+          "access": "Admin",
+          "permission": "payouts.mark_paid",
+          "schema": "weeklyMarkPaidSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/weekly/remark",
+          "access": "Admin",
+          "permission": "payouts.mark_paid",
+          "schema": "weeklyRemarkSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/payments/report/monthly",
+          "access": "Admin",
+          "permission": "payouts.view",
+          "schema": "monthlyReportQuerySchema",
+          "description": "Calendar-month settlement report with the full GST breakdown (accountant view)."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/payouts",
+          "access": "Admin",
+          "permission": "payouts.view",
+          "schema": "generatePayoutSchema",
+          "description": "Admin: Payouts"
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/payments/payouts",
+          "access": "Admin",
+          "permission": "payouts.view",
+          "schema": "payoutListQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/payments/payouts/:id",
+          "access": "Admin",
+          "permission": "payouts.view",
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/payouts/:id/approve",
+          "access": "Admin",
+          "permission": "payouts.approve",
+          "schema": "approvePayoutSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/payouts/:id/mark-paid",
+          "access": "Admin",
+          "permission": "payouts.mark_paid",
+          "schema": "markPaidSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/payments/payouts/:id/reject",
+          "access": "Admin",
+          "permission": "payouts.reject",
+          "schema": "rejectPayoutSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/payments/ledger",
+          "access": "Admin",
+          "permission": "payments.view",
+          "schema": "ledgerQuerySchema",
+          "description": "Admin: Ledger (legacy view, unchanged)"
+        }
+      ]
+    },
+    {
+      "name": "policy",
+      "prefix": "/api/v1/policy",
+      "file": "src/modules/policy/policy.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/policy/cancellation",
+          "access": "Admin",
+          "permission": "policy.view",
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "PUT",
+          "path": "/api/v1/policy/cancellation",
+          "access": "Admin",
+          "permission": "cancellation.edit",
+          "schema": "cancellationSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/policy/refund",
+          "access": "Admin",
+          "permission": "policy.view",
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "PUT",
+          "path": "/api/v1/policy/refund",
+          "access": "Admin",
+          "permission": "refund.edit",
+          "schema": "refundSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/policy/dispatch",
+          "access": "Admin",
+          "permission": "policy.view",
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "PUT",
+          "path": "/api/v1/policy/dispatch",
+          "access": "Admin",
+          "permission": "policy.edit",
+          "schema": "dispatchSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/policy/app-versions",
+          "access": "Admin",
+          "permission": "policy.view",
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "PUT",
+          "path": "/api/v1/policy/app-versions",
+          "access": "Admin",
+          "permission": "policy.edit",
+          "schema": "appVersionsSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "roles",
+      "prefix": "/api/v1/roles",
+      "file": "src/modules/roles/roles.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/roles",
+          "access": "Admin",
+          "permission": "roles.view",
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/roles",
+          "access": "Admin",
+          "permission": "roles.create",
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/roles/:id",
+          "access": "Admin",
+          "permission": "roles.edit",
+          "schema": "updateSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/roles/:id",
+          "access": "Admin",
+          "permission": "roles.delete",
+          "schema": "idParam",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "service-areas",
+      "prefix": "/api/v1/service-areas",
+      "file": "src/modules/service-areas/service-areas.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/service-areas/cities",
+          "access": "Public",
+          "permission": null,
+          "schema": null,
+          "description": "Public endpoints"
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/service-areas/check",
+          "access": "Public",
+          "permission": null,
+          "schema": "checkQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/service-areas",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/service-areas/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/service-areas",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/service-areas/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/service-areas/:id/toggle",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/service-areas/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "launch-interest",
+      "prefix": "/api/v1/launch-interest",
+      "file": "src/modules/launch-interest/launch-interest.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/launch-interest",
+          "access": "Public",
+          "permission": null,
+          "schema": "captureSchema",
+          "description": "Public — submitted from the customer-app \"Coming soon\" screen."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/launch-interest",
+          "access": "Admin",
+          "permission": null,
+          "schema": "summaryQuerySchema",
+          "description": "Admin demand view."
+        }
+      ]
+    },
+    {
+      "name": "customers",
+      "prefix": "/api/v1/customers",
+      "file": "src/modules/customers/customers.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/customers/me/addresses",
+          "access": "Customer",
+          "permission": null,
+          "schema": null,
+          "description": "Customer-facing saved addresses Registered BEFORE the admin /:id route so Express doesn't attempt to coerce \"me\" into a numeric id (which would 400 in the validator)."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/customers/me/addresses",
+          "access": "Customer",
+          "permission": null,
+          "schema": "createAddressSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/customers/me/addresses/:id",
+          "access": "Customer",
+          "permission": null,
+          "schema": "updateAddressSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/customers/me/addresses/:id",
+          "access": "Customer",
+          "permission": null,
+          "schema": "addressIdParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/customers/me/addresses/:id/default",
+          "access": "Customer",
+          "permission": null,
+          "schema": "addressIdParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/customers",
+          "access": "Admin",
+          "permission": null,
+          "schema": "adminCreateSchema",
+          "description": "Admin"
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/customers",
+          "access": "Admin",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/customers/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/customers/:id/toggle",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "time-slots",
+      "prefix": "/api/v1/time-slots",
+      "file": "src/modules/time-slots/time-slots.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/time-slots",
+          "access": "Public",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": "Public list — used by the customer app to populate the slot picker. `activeOnly=true` filters to live slots only."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/time-slots",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/time-slots/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/time-slots/:id/toggle",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/time-slots/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "audit-logs",
+      "prefix": "/api/v1/audit-logs",
+      "file": "src/modules/audit-logs/audit-logs.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/audit-logs",
+          "access": "Admin",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "coupons",
+      "prefix": "/api/v1/coupons",
+      "file": "src/modules/coupons/coupons.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/coupons/apply",
+          "access": "Customer",
+          "permission": null,
+          "schema": "applySchema",
+          "description": "Customer apply — validates a coupon against the in-flight cart and returns the computed discount. Doesn't burn a redemption (that's done at booking creation)."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/coupons/available",
+          "access": "Customer",
+          "permission": null,
+          "schema": null,
+          "description": "Customer — list all currently-claimable coupons (active + in-window + not used up). Registered BEFORE the admin `/:id` route so the literal path isn't captured as an id."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/coupons",
+          "access": "Admin",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": "Admin CRUD."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/coupons",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/coupons/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/coupons/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/coupons/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/coupons/:id/toggle-active",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "tracking",
+      "prefix": "/api/v1/tracking",
+      "file": "src/modules/tracking/tracking.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/tracking/me/location",
+          "access": "Partner",
+          "permission": null,
+          "schema": "locationBody",
+          "description": "Partner pushes its current GPS while it has an active accepted booking. Service rejects with 400 when the partner has no active booking, so the partner-app can stop posting (saves battery) and use that as a signal the job is done."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/tracking/me/duty",
+          "access": "Partner",
+          "permission": null,
+          "schema": "dutyBody",
+          "description": "Partner toggles On Duty / Off Duty. This is the authoritative duty signal: going off duty sets a Redis guard flag and pulls the partner out of the dispatch pool immediately, so a socket reconnect after a location change can no longer silently re-register them as available."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/tracking/bookings/:id",
+          "access": "Customer",
+          "permission": null,
+          "schema": "bookingIdParam",
+          "description": "Customer reads the assigned partner's last-known location for their booking. Returns nulls when the booking isn't in a live state — the client treats that as \"stop polling\"."
+        }
+      ]
+    },
+    {
+      "name": "geography",
+      "prefix": "/api/v1/geography",
+      "file": "src/modules/geography/geography.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/geography/cities/active",
+          "access": "Public",
+          "permission": null,
+          "schema": null,
+          "description": "Public Customer-app + partner-app dropdown source. Returns active cities inside active states only — no auth required."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/geography/places/search",
+          "access": "Admin",
+          "permission": null,
+          "schema": "placesSearchQuerySchema",
+          "description": "Admin Google Places proxy for the Create-job address search — the browser can't hit Google's REST endpoints directly (CORS), so the key lives server-side and these two endpoints relay."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/geography/places/details",
+          "access": "Admin",
+          "permission": null,
+          "schema": "placeDetailsQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/geography/states",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/geography/states",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createStateSchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/geography/states/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateStateSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/geography/states/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/geography/cities",
+          "access": "Admin",
+          "permission": null,
+          "schema": "listCitiesQuerySchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/geography/cities",
+          "access": "Admin",
+          "permission": null,
+          "schema": "createCitySchema",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/geography/cities/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "updateCitySchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/geography/cities/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "admins",
+      "prefix": "/api/v1/admins",
+      "file": "src/modules/admins/admins.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/admins/me/change-password",
+          "access": "Admin",
+          "permission": null,
+          "schema": "changeOwnPasswordSchema",
+          "description": "Self-service password rotation. The id is read from `req.user.sub` (the JWT subject) inside the controller; the body carries the current password (verified server-side) and the new password."
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/admins/me/notifications",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": "Admin notifications — bell-icon feed in the admin panel Topbar. All routes are self-service (caller's adminId comes from the JWT, never the URL/body), so SUPER and CITY_MANAGER both reach them."
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/admins/me/notifications/read-all",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/admins/me/notifications",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/admins/me/notifications/:id/read",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/admins/me/notifications/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/admins",
+          "access": "Admin",
+          "permission": "admins.view",
+          "schema": "listQuerySchema",
+          "description": "Every endpoint below manages admin accounts — gated by the `admins.*` RBAC permissions. The built-in Super Admin role carries the bypass flag, and a legacy CITY_MANAGER token is denied access-control perms, so this preserves the previous SUPER-only behaviour while letting a custom role be granted these capabilities explicitly."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/admins",
+          "access": "Admin",
+          "permission": "admins.create",
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/admins/:id",
+          "access": "Admin",
+          "permission": "admins.view",
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/admins/:id",
+          "access": "Admin",
+          "permission": "admins.edit",
+          "schema": "updateSchema",
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/admins/:id",
+          "access": "Admin",
+          "permission": "admins.delete",
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "PUT",
+          "path": "/api/v1/admins/:id/cities",
+          "access": "Admin",
+          "permission": "admins.edit",
+          "schema": "setCitiesSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/admins/:id/reset-password",
+          "access": "Admin",
+          "permission": "admins.edit",
+          "schema": "resetPasswordSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "account-deletion-requests",
+      "prefix": "/api/v1/account-deletion-requests",
+      "file": "src/modules/account-deletion/account-deletion.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/account-deletion-requests/me",
+          "access": "Partner",
+          "permission": null,
+          "schema": null,
+          "description": "Customer / partner facing `/me` routes are registered before `/:id` so the admin's numeric detail route doesn't try to coerce the literal \"me\"."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/account-deletion-requests/me",
+          "access": "Partner",
+          "permission": null,
+          "schema": "createSchema",
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/account-deletion-requests",
+          "access": "Admin",
+          "permission": null,
+          "schema": "listQuerySchema",
+          "description": "Admin"
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/account-deletion-requests/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": "idParam",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/account-deletion-requests/:id/approve",
+          "access": "Admin",
+          "permission": null,
+          "schema": "approveSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/account-deletion-requests/:id/reject",
+          "access": "Admin",
+          "permission": null,
+          "schema": "rejectSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "kyc",
+      "prefix": "/api/v1/kyc",
+      "file": "src/modules/kyc/kyc.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/kyc/aadhaar/generate-otp",
+          "access": "Partner",
+          "permission": null,
+          "schema": "generateAadhaarOtpSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/kyc/aadhaar/submit-otp",
+          "access": "Partner",
+          "permission": null,
+          "schema": "submitAadhaarOtpSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/kyc/aadhaar/photos",
+          "access": "Partner",
+          "permission": null,
+          "schema": "saveAadhaarPhotosSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/kyc/pan/verify",
+          "access": "Partner",
+          "permission": null,
+          "schema": "verifyPanSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/kyc/dl/verify",
+          "access": "Partner",
+          "permission": null,
+          "schema": "verifyDlSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/kyc/bank/verify",
+          "access": "Partner",
+          "permission": null,
+          "schema": "verifyBankSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/kyc/pan/skip",
+          "access": "Partner",
+          "permission": null,
+          "schema": "skipSchema",
+          "description": "Partner self-skip of PAN / DL during onboarding (no QuickeKYC call)."
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/kyc/dl/skip",
+          "access": "Partner",
+          "permission": null,
+          "schema": "skipSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "partners/:partnerId/kyc",
+      "prefix": "/api/v1/partners/:partnerId/kyc",
+      "file": "src/modules/kyc/kyc.admin.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/partners/:partnerId/kyc/aadhaar/generate-otp",
+          "access": "Admin",
+          "permission": null,
+          "schema": "generateAadhaarOtpSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/partners/:partnerId/kyc/aadhaar/submit-otp",
+          "access": "Admin",
+          "permission": null,
+          "schema": "submitAadhaarOtpSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/partners/:partnerId/kyc/aadhaar/photos",
+          "access": "Admin",
+          "permission": null,
+          "schema": "saveAadhaarPhotosSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/partners/:partnerId/kyc/pan/verify",
+          "access": "Admin",
+          "permission": null,
+          "schema": "verifyPanSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/partners/:partnerId/kyc/dl/verify",
+          "access": "Admin",
+          "permission": null,
+          "schema": "verifyDlSchema",
+          "description": ""
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/partners/:partnerId/kyc/bank/verify",
+          "access": "Admin",
+          "permission": null,
+          "schema": "verifyBankSchema",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "partners/me/notifications",
+      "prefix": "/api/v1/partners/me/notifications",
+      "file": "src/modules/notifications/notifications.routes.js",
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/partners/me/notifications",
+          "access": "Partner",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/partners/me/notifications/read-all",
+          "access": "Partner",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/partners/me/notifications/all",
+          "access": "Partner",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/partners/me/notifications/:id/read",
+          "access": "Partner",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/partners/me/notifications/:id",
+          "access": "Partner",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        }
+      ]
+    },
+    {
+      "name": "push-broadcasts",
+      "prefix": "/api/v1/push-broadcasts",
+      "file": "src/modules/push-broadcasts/push-broadcasts.routes.js",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/push-broadcasts",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/push-broadcasts",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/push-broadcasts/:id",
+          "access": "Admin",
+          "permission": null,
+          "schema": null,
+          "description": ""
+        }
+      ]
+    }
+  ],
+  "total": 225
+}
