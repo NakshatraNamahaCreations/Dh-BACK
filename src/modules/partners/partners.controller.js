@@ -28,6 +28,14 @@ exports.updateStatus = asyncHandler(async (req, res) => {
   success(res, item, 'Partner status updated');
 });
 
+/// Suspend / pause / re-activate history for the partner-details page —
+/// derived from the admin audit log, so past actions appear without any
+/// new bookkeeping.
+exports.statusHistory = asyncHandler(async (req, res) => {
+  const items = await service.statusHistory(req.params.id);
+  success(res, items, 'Partner status history fetched');
+});
+
 exports.updateDocuments = asyncHandler(async (req, res) => {
   const item = await service.updateDocuments(req.params.id, req.body);
   success(res, item, 'Partner documents updated');

@@ -34,6 +34,7 @@ router.get('/', adminOnly, validate(listQuerySchema), controller.list);
 router.post('/', adminOnly, validate(createSchema), controller.create);
 router.get('/:id', adminOnly, validate(idParam), controller.get);
 router.patch('/:id/status', adminOnly, validate(statusSchema), controller.updateStatus);
+router.get('/:id/status-history', adminOnly, validate(idParam), controller.statusHistory);
 router.patch('/:id/documents', adminOnly, validate(updateDocumentsSchema), controller.updateDocuments);
 router.patch('/:id/category', adminOnly, validate(updateCategorySchema), controller.updateCategory);
 

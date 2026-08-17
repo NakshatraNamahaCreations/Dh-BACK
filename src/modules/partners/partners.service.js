@@ -598,6 +598,42 @@ exports.updateStatus = async (id, status, reason) => {
   }
 };
 
+/// Suspend / pause / re-activate history for a partner, derived from the
+/// admin audit log — the adminAudit middleware already records every
+/// PATCH /partners/:id/status with the request body ({status, reason})
+/// and the acting admin, so the log IS the history. No dedicated table,
+/// and actions taken before this endpoint existed still show up.
+exports.statusHistory = async (id) => {
+  const rows = await prisma.adminAuditLog.findMany({
+    where: {
+      method: 'PATCH',
+      /// Segment-exact: '/partners/1/status' can't match '/partners/12/…'
+      /// because the character after '1' must be '/'.
+      path: { contains: `/partners/${Number(id)}/status` },
+      /// Only actions that actually landed — a 4xx (validation, not
+      /// found) never changed the partner, so it isn't history.
+      statusCode: { gte: 200, lt: 300 },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+    select: { id: true, adminName: true, adminEmail: true, metadata: true, createdAt: true },
+  });
+  return rows
+    .map((r) => {
+      const body = r.metadata?.body ?? {};
+      if (!body.status) return null;
+      return {
+        id: r.id,
+        /// 'active' | 'paused' | 'suspended'
+        status: body.status,
+        reason: body.reason ?? null,
+        by: r.adminName ?? r.adminEmail ?? 'Admin',
+        at: r.createdAt,
+      };
+    })
+    .filter(Boolean);
+};
+
 exports.listOnboarding = async ({ status, search, categoryId, order, from, to, scope, page = 1, pageSize = 25 } = {}) => {
   const { applyScopeToWhere } = require('../../middlewares/adminScope');
   const where = { isVerified: false };
