@@ -153,17 +153,13 @@ const generateInvoicePdf = (booking) =>
     const coGstin = env.COMPANY_GSTIN || 'Applied For';
     const customer = booking.customer ?? {};
 
-    /// Real charge components stored on the booking (see schema.prisma):
-    ///   subtotal − discount = total; gstAmount = 18% GST on total;
-    ///   grandTotal = total + gstAmount + platformFee.
-    const subtotal    = booking.subtotal ?? booking.total ?? 0;
-    const discount    = booking.discount ?? 0;
-    const taxable     = booking.total ?? subtotal - discount;
-    const gst         = booking.gstAmount ?? 0;
-    const cgst        = r2(gst / 2);
-    const sgst        = r2(gst - cgst);
-    const platformFee = booking.platformFee ?? 0;
-    const grand       = booking.grandTotal ?? taxable + gst + platformFee;
+    /// The DISCUSSED business split (client formula sheet), not the raw
+    /// stored charge components: grandTotal divides 20% Dhoond / 80%
+    /// Partner; 18% GST is carved out of the Dhoond slice and 5% out of
+    /// the partner slice, each computed ON the slice. For a 499 booking:
+    /// 99.80 → 17.96 tax + 81.84 net, and 399.20 → 19.96 tax + 379.24
+    /// credited to the partner. The two sections sum back to grandTotal.
+    const bd = breakdown(booking);
 
     // ── Header: logo top-left, TAX INVOICE top-right ──────────────────
     if (fs.existsSync(LOGO_PATH)) {
@@ -224,33 +220,38 @@ const generateInvoicePdf = (booking) =>
       }
     }
 
-    y = amount(doc, y,      'Gross Amount',  fmtRs(subtotal));
-    y = amount(doc, y + 12, 'Discount',      `- Rs. ${Number(discount)}`);
-    y = amount(doc, y + 12, 'Taxable Value', fmtRs(taxable), amountInWords(taxable));
-    y = amount(doc, y + 12, 'CGST @9%',      fmtRs(cgst),    amountInWords(cgst));
-    y = amount(doc, y + 12, 'SGST @9%',      fmtRs(sgst),    amountInWords(sgst));
+    /// Amount-in-words only under the Taxable Value rows — words under
+    /// every tax line pushed the signature past the A4 fold onto a
+    /// second page once both sections carried a full 4-row stack.
+    y = amount(doc, y,      'Gross Amount',  fmtRs(bd.partnerGross));
+    y = amount(doc, y + 12, 'Taxable Value', fmtRs(bd.partnerNet), amountInWords(bd.partnerNet));
+    y = amount(doc, y + 12, 'CGST @2.5%',    fmtRs(bd.partnerCGST));
+    y = amount(doc, y + 12, 'SGST @2.5%',    fmtRs(bd.partnerSGST));
 
     // ── Convenience & platform fee block ──────────────────────────────
-    y += 20;
+    y += 12;
     doc.moveTo(MARGIN, y).lineTo(RIGHT_X, y).strokeColor(RULE).lineWidth(0.75).stroke();
     y += 14;
     doc.font('Helvetica-Bold').fontSize(10.5).fillColor(INK)
        .text('Convenience and Platform Fee', MARGIN, y, { width: 250 });
     doc.font('Helvetica').fontSize(8).fillColor(FAINT)
        .text(`SAC: ${SAC_PLATFORM}`, MARGIN, doc.y + 2);
-    y = amount(doc, y, 'Gross Amount', fmtRs(platformFee), amountInWords(platformFee));
+    y = amount(doc, y,      'Gross Amount',  fmtRs(bd.dhoondGross));
+    y = amount(doc, y + 12, 'Taxable Value', fmtRs(bd.dhoondNet), amountInWords(bd.dhoondNet));
+    y = amount(doc, y + 12, 'CGST @9%',      fmtRs(bd.dhoondCGST));
+    y = amount(doc, y + 12, 'SGST @9%',      fmtRs(bd.dhoondSGST));
 
     // ── TOTAL band ────────────────────────────────────────────────────
-    y += 22;
-    band(doc, y, 'TOTAL AMOUNT', `Rs. ${Number(grand)}`, 11);
+    y += 14;
+    band(doc, y, 'TOTAL AMOUNT', `Rs. ${Number(bd.total)}`, 11);
 
     // ── Signature ─────────────────────────────────────────────────────
-    y += 60;
+    y += 36;
     doc.font('Helvetica-BoldOblique').fontSize(10).fillColor(INK)
        .text(`For ${co}`, RIGHT_X - 260, y, { width: 260, align: 'right' });
     doc.font('Helvetica').fontSize(8.5).fillColor(INK)
        .text('Signature of supplier/authorized representative',
-             RIGHT_X - 260, y + 34, { width: 260, align: 'right' });
+             RIGHT_X - 260, y + 26, { width: 260, align: 'right' });
 
     // ── Footnotes (kept above the bottom margin so they never spill to
     //    a second page — three 7pt lines need ~30pt; printable area ends
