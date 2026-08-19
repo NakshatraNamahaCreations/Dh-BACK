@@ -21,6 +21,7 @@ const CANCELLATION_KEY = 'cancellation_policy';
 const REFUND_KEY = 'refund_policy';
 const DISPATCH_KEY = 'dispatch_config';
 const APP_VERSIONS_KEY = 'app_version_config';
+const COMPANY_KEY = 'company_details';
 
 const DEFAULT_CANCELLATION = {
   freeWindowMins: 5,
@@ -125,6 +126,22 @@ exports.saveDispatch = async (config) => writeSetting(DISPATCH_KEY, config);
 exports.DEFAULT_DISPATCH = DEFAULT_DISPATCH;
 
 /// Full app-version config (both apps) — for the admin editor.
+/// Company / GST details printed on the invoice pair (and anywhere else
+/// the platform identifies itself as a legal entity). Defaults come from
+/// env so a fresh install keeps working before the admin ever saves.
+/// `signatureUrl` is the authorised-signatory image (S3) drawn above the
+/// signature line on the Dhoond tax invoice.
+const env = require('../../config/env');
+const DEFAULT_COMPANY = {
+  name: env.COMPANY_NAME,
+  gstin: env.COMPANY_GSTIN ?? '',
+  address: env.COMPANY_ADDRESS,
+  stateNameCode: 'Karnataka 29',
+  signatureUrl: null,
+};
+exports.getCompanyDetails = async () => readSetting(COMPANY_KEY, DEFAULT_COMPANY);
+exports.saveCompanyDetails = async (config) => writeSetting(COMPANY_KEY, config);
+
 exports.getAppVersions = async () => readSetting(APP_VERSIONS_KEY, DEFAULT_APP_VERSIONS);
 exports.saveAppVersions = async (config) => writeSetting(APP_VERSIONS_KEY, config);
 exports.DEFAULT_APP_VERSIONS = DEFAULT_APP_VERSIONS;

@@ -71,4 +71,15 @@ const appVersionsSchema = z.object({
   }),
 });
 
-module.exports = { cancellationSchema, refundSchema, dispatchSchema, appVersionsSchema };
+const companySchema = z.object({
+  body: z.object({
+    name: z.string().trim().min(2),
+    gstin: z.string().trim().max(20).optional().or(z.literal('')),
+    address: z.string().trim().min(4),
+    stateNameCode: z.string().trim().min(2),
+    signatureUrl: z.string().url().nullable().optional().or(z.literal('')),
+  }),
+});
+
+module.exports = {
+  companySchema, cancellationSchema, refundSchema, dispatchSchema, appVersionsSchema };

@@ -59,3 +59,11 @@ exports.saveAppVersions = asyncHandler(async (req, res) => {
   const data = await service.saveAppVersions(req.body);
   success(res, data, 'App versions saved');
 });
+
+exports.getCompany = asyncHandler(async (_req, res) => {
+  success(res, await service.getCompanyDetails(), 'Company details fetched');
+});
+
+exports.saveCompany = asyncHandler(async (req, res) => {
+  success(res, await service.saveCompanyDetails(req.body), 'Company details saved');
+});

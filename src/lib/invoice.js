@@ -50,17 +50,26 @@ const r2 = (n) => Math.round(n * 100) / 100;
 /**
  * Derive the full breakdown from the booking's grandTotal.
  * All amounts are in whole rupees (Int), matching Prisma storage.
+ *
+ * The partner/Dhoond split comes from the CATEGORY's commission rule
+ * when the caller resolved one onto the booking (`partnerCommissionPct`,
+ * e.g. 80 = partner keeps 80%). Callers that don't resolve it fall back
+ * to the default 80/20. GST rates (5% partner / 18% Dhoond) are fixed
+ * regardless of the split.
  */
 const breakdown = (booking) => {
   const total = booking.grandTotal || booking.total || 0;
+  const pct = Number(booking.partnerCommissionPct);
+  const partnerShare = Number.isFinite(pct) && pct > 0 && pct < 100 ? pct / 100 : PARTNER_SHARE;
+  const dhoondShare = 1 - partnerShare;
 
-  const partnerGross   = r2(total * PARTNER_SHARE);
+  const partnerGross   = r2(total * partnerShare);
   const partnerCGST    = r2(partnerGross * (PARTNER_GST_RATE / 2));  // 2.5%
   const partnerSGST    = partnerCGST;
   const partnerGST     = r2(partnerCGST + partnerSGST);              // 5%
   const partnerNet     = r2(partnerGross - partnerGST);              // credited to partner
 
-  const dhoondGross    = r2(total * DHOOND_SHARE);
+  const dhoondGross    = r2(total * dhoondShare);
   const dhoondCGST     = r2(dhoondGross * (DHOOND_GST_RATE / 2));   // 9%
   const dhoondSGST     = dhoondCGST;
   const dhoondGST      = r2(dhoondCGST + dhoondSGST);               // 18%
@@ -140,7 +149,14 @@ const FAINT  = '#a5a5a5';
 const RULE   = '#dedede';
 const BAND   = '#f4f4f4';
 
-const generateInvoicePdf = (booking) =>
+/**
+ * Shared renderer for both documents — the Urban-Company "To (Recipient) /
+ * From (Supplier)" layout the client signed off on (see the 26INU / 26INP
+ * samples): logo top-left, badge top-right, two underlined info columns,
+ * an "Items | Amount" band, one item block with an amount stack, and a
+ * Subtotal band. `spec` carries everything that differs between the two.
+ */
+const renderDoc = (booking, spec) =>
   new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: 'A4', margin: MARGIN });
     const chunks = [];
@@ -148,121 +164,217 @@ const generateInvoicePdf = (booking) =>
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
 
-    const co      = env.COMPANY_NAME;
-    const coAddr  = env.COMPANY_ADDRESS;
-    const coGstin = env.COMPANY_GSTIN || 'Applied For';
-    const customer = booking.customer ?? {};
-
-    /// The DISCUSSED business split (client formula sheet), not the raw
-    /// stored charge components: grandTotal divides 20% Dhoond / 80%
-    /// Partner; 18% GST is carved out of the Dhoond slice and 5% out of
-    /// the partner slice, each computed ON the slice. For a 499 booking:
-    /// 99.80 → 17.96 tax + 81.84 net, and 399.20 → 19.96 tax + 379.24
-    /// credited to the partner. The two sections sum back to grandTotal.
-    const bd = breakdown(booking);
-
-    // ── Header: logo top-left, TAX INVOICE top-right ──────────────────
+    // ── Header: logo + badge ──────────────────────────────────────────
     if (fs.existsSync(LOGO_PATH)) {
       doc.image(LOGO_PATH, MARGIN, MARGIN, { height: 26 });
     } else {
       doc.font('Helvetica-Bold').fontSize(21).fillColor('#1E99FE').text('Dhoond', MARGIN, MARGIN);
     }
-    doc.font('Helvetica-Bold').fontSize(18).fillColor(INK)
-       .text('TAX INVOICE', RIGHT_X - 200, MARGIN + 2, { width: 200, align: 'right' });
+    /// Badge — bordered pill, right-aligned (UC style).
+    doc.font('Helvetica-Bold').fontSize(11).fillColor(INK);
+    const bw = doc.widthOfString(spec.badge) + 24;
+    doc.roundedRect(RIGHT_X - bw, MARGIN - 2, bw, 26, 4).strokeColor(RULE).lineWidth(1).stroke();
+    doc.text(spec.badge, RIGHT_X - bw + 12, MARGIN + 6);
 
-    doc.font('Helvetica').fontSize(7.5).fillColor(SOFT).text(co, MARGIN, MARGIN + 36);
-    for (const line of [
-      'Registered Office',
-      coAddr,
-      'Email: support@dhoond.co',
-      'www.dhoond.co',
-    ]) doc.text(line, MARGIN, doc.y + 1.5, { width: 240 });
-
-    // ── Two-column underlined info block ──────────────────────────────
-    const infoTop = Math.max(doc.y + 26, 168);
-
-    let yL = infoTop;
-    yL = field(doc, COL_L_X, COL_L_W, 'Customer Name',     customer.name ?? 'Customer', yL);
-    yL = field(doc, COL_L_X, COL_L_W, 'Invoice no.',        invoiceNumber(booking), yL);
-    yL = field(doc, COL_L_X, COL_L_W, 'Delivery Address',  deliveryAddress(booking), yL);
-    yL = field(doc, COL_L_X, COL_L_W, 'Invoice Date',      invoiceDate(booking), yL);
-    yL = field(doc, COL_L_X, COL_L_W, 'State Name & Code', 'Karnataka 29', yL);
-    yL = field(doc, COL_L_X, COL_L_W, 'Place of Supply',   'Karnataka 29', yL);
-
-    let yR = infoTop;
-    doc.font('Helvetica-Bold').fontSize(9.5).fillColor(INK)
-       .text('SERVICE PROVIDER', COL_R_X, yR);
-    yR = doc.y + 12;
-    yR = field(doc, COL_R_X, COL_R_W, 'Business GSTIN',    coGstin, yR);
-    yR = field(doc, COL_R_X, COL_R_W, 'Business Name',     co, yR);
-    yR = field(doc, COL_R_X, COL_R_W, 'Address',           coAddr, yR);
-    yR = field(doc, COL_R_X, COL_R_W, 'State Name & Code', 'Karnataka 29', yR);
-
-    // ── "Items | Taxable Value" band ──────────────────────────────────
-    let y = Math.max(yL, yR) + 16;
-    y = band(doc, y, 'Items', 'Taxable Value');
-    y += 16;
-
-    // ── Service charges block ─────────────────────────────────────────
-    const firstService = booking.items?.[0]?.service?.name;
-    doc.font('Helvetica-Bold').fontSize(10.5).fillColor(INK)
-       .text(`Service Charges${firstService ? ` - ${firstService}` : ''}`, MARGIN, y, { width: 250 });
-    doc.font('Helvetica').fontSize(8).fillColor(FAINT)
-       .text(`SAC: ${SAC_SERVICE}`, MARGIN, doc.y + 2);
-
-    /// Extra item lines only when the booking has more than one service.
-    if ((booking.items?.length ?? 0) > 1) {
-      let iy = doc.y + 6;
-      for (const item of booking.items) {
-        doc.font('Helvetica').fontSize(8).fillColor(SOFT)
-           .text(`${item.service?.name ?? 'Service'}  ×${item.qty ?? 1}`, MARGIN, iy, { width: 240 });
-        iy = doc.y + 2;
-      }
+    // ── To / From columns ─────────────────────────────────────────────
+    const infoTop = MARGIN + 56;
+    doc.font('Helvetica-Bold').fontSize(12.5).fillColor(INK).text('To (Recipient)', COL_L_X, infoTop);
+    doc.text('From (Supplier)', COL_R_X, infoTop);
+    let yL = infoTop + 24;
+    for (const [label, value] of spec.recipient) {
+      yL = field(doc, COL_L_X, COL_L_W, label, value, yL);
+    }
+    let yR = infoTop + 24;
+    for (const [label, value] of spec.supplier) {
+      yR = field(doc, COL_R_X, COL_R_W, label, value, yR);
     }
 
-    /// Amount-in-words only under the Taxable Value rows — words under
-    /// every tax line pushed the signature past the A4 fold onto a
-    /// second page once both sections carried a full 4-row stack.
-    y = amount(doc, y,      'Gross Amount',  fmtRs(bd.partnerGross));
-    y = amount(doc, y + 12, 'Taxable Value', fmtRs(bd.partnerNet), amountInWords(bd.partnerNet));
-    y = amount(doc, y + 12, 'CGST @2.5%',    fmtRs(bd.partnerCGST));
-    y = amount(doc, y + 12, 'SGST @2.5%',    fmtRs(bd.partnerSGST));
+    // ── Items band ────────────────────────────────────────────────────
+    let y = Math.max(yL, yR) + 16;
+    y = band(doc, y, 'Items', 'Amount');
+    y += 16;
 
-    // ── Convenience & platform fee block ──────────────────────────────
-    y += 12;
-    doc.moveTo(MARGIN, y).lineTo(RIGHT_X, y).strokeColor(RULE).lineWidth(0.75).stroke();
-    y += 14;
     doc.font('Helvetica-Bold').fontSize(10.5).fillColor(INK)
-       .text('Convenience and Platform Fee', MARGIN, y, { width: 250 });
+       .text(spec.itemTitle, MARGIN, y, { width: 250 });
     doc.font('Helvetica').fontSize(8).fillColor(FAINT)
-       .text(`SAC: ${SAC_PLATFORM}`, MARGIN, doc.y + 2);
-    y = amount(doc, y,      'Gross Amount',  fmtRs(bd.dhoondGross));
-    y = amount(doc, y + 12, 'Taxable Value', fmtRs(bd.dhoondNet), amountInWords(bd.dhoondNet));
-    y = amount(doc, y + 12, 'CGST @9%',      fmtRs(bd.dhoondCGST));
-    y = amount(doc, y + 12, 'SGST @9%',      fmtRs(bd.dhoondSGST));
+       .text(`SAC: ${spec.sac}`, MARGIN, doc.y + 2);
 
-    // ── TOTAL band ────────────────────────────────────────────────────
+    for (const [i, [label, value, words]] of spec.rows.entries()) {
+      y = amount(doc, i === 0 ? y : y + 12, label, value, words);
+    }
+
+    // ── Subtotal band ─────────────────────────────────────────────────
     y += 14;
-    band(doc, y, 'TOTAL AMOUNT', `Rs. ${Number(bd.total)}`, 11);
+    band(doc, y, 'Subtotal', spec.subtotal, 11);
 
-    // ── Signature ─────────────────────────────────────────────────────
-    y += 36;
-    doc.font('Helvetica-BoldOblique').fontSize(10).fillColor(INK)
-       .text(`For ${co}`, RIGHT_X - 260, y, { width: 260, align: 'right' });
-    doc.font('Helvetica').fontSize(8.5).fillColor(INK)
-       .text('Signature of supplier/authorized representative',
-             RIGHT_X - 260, y + 26, { width: 260, align: 'right' });
+    // ── Signature (documents issued by Dhoond carry one) ──────────────
+    if (spec.signature) {
+      y += 40;
+      /// Signatory image (admin-uploaded) sits above the caption, right-
+      /// aligned like the UC sample's handwritten scrawl. Height-capped;
+      /// pdfkit keeps the aspect ratio. Absent → just the text block.
+      if (spec.signatureImage) {
+        try {
+          doc.image(spec.signatureImage, RIGHT_X - 160, y, { fit: [160, 44], align: 'right' });
+          y += 50;
+        } catch {
+          /* corrupt/unsupported image — fall through to text-only */
+        }
+      }
+      doc.font('Helvetica-BoldOblique').fontSize(10).fillColor(INK)
+         .text(`For ${spec.signature}`, RIGHT_X - 260, y, { width: 260, align: 'right' });
+      doc.font('Helvetica').fontSize(8.5).fillColor(INK)
+         .text('Signature of supplier/authorized representative',
+               RIGHT_X - 260, y + 26, { width: 260, align: 'right' });
+    }
 
-    // ── Footnotes (kept above the bottom margin so they never spill to
-    //    a second page — three 7pt lines need ~30pt; printable area ends
-    //    at 802pt on A4 with a 40pt margin) ──────────────────────────────
     doc.fontSize(7).font('Helvetica').fillColor(SOFT)
        .text('*Reverse Charge mechanism not applicable', MARGIN, 764)
-       .text('*This is a computer-generated invoice and does not require a physical signature.')
+       .text('*This is a computer-generated document and does not require a physical signature.')
        .text('*For support write to support@dhoond.co');
 
     doc.end();
   });
+
+const fmtInr = (n) => `INR ${Number(n ?? 0).toFixed(2).replace(/\.00$/, '')}`;
+
+/// Admin-configurable company / GST details (admin → Policy → Company),
+/// falling back to env when nothing was ever saved or the DB is down —
+/// invoice generation must never crash on identity data.
+const loadCompany = async () => {
+  try {
+    const policy = require('../modules/policy/policy.service');
+    const c = await policy.getCompanyDetails();
+    return {
+      name: c?.name || env.COMPANY_NAME,
+      gstin: c?.gstin || env.COMPANY_GSTIN || 'Applied For',
+      address: c?.address || env.COMPANY_ADDRESS,
+      stateNameCode: c?.stateNameCode || 'Karnataka 29',
+      signatureUrl: c?.signatureUrl || null,
+    };
+  } catch {
+    return {
+      name: env.COMPANY_NAME,
+      gstin: env.COMPANY_GSTIN || 'Applied For',
+      address: env.COMPANY_ADDRESS,
+      stateNameCode: 'Karnataka 29',
+      signatureUrl: null,
+    };
+  }
+};
+
+/// Fetch the signatory image for embedding. Best-effort with a short
+/// timeout — a slow/broken S3 URL degrades to the plain signature line,
+/// never a failed invoice.
+const fetchSignatureImage = async (url) => {
+  if (!url) return null;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000);
+    const res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    /// pdfkit can only embed PNG/JPEG — but the admin upload pipeline
+    /// compresses images to AVIF/WebP, so normalise EVERYTHING to PNG
+    /// (sharp keeps the transparency). Without this the .avif signature
+    /// threw inside doc.image and the invoice silently fell back to the
+    /// text-only block.
+    try {
+      const sharp = require('sharp');
+      return await sharp(buf).png().toBuffer();
+    } catch {
+      /// sharp unavailable/decode failed — pass through and hope the
+      /// buffer is already PNG/JPEG; renderDoc guards the draw anyway.
+      return buf;
+    }
+  } catch {
+    return null;
+  }
+};
+
+const recipientFields = (booking, noLabel, noValue) => {
+  const customer = booking.customer ?? {};
+  return [
+    ['Name', customer.name ?? 'Customer'],
+    [noLabel, noValue],
+    ['Delivery Address', deliveryAddress(booking)],
+    ['Date', invoiceDate(booking)],
+    ['State Name & Code', 'Karnataka 29'],
+    ['Place of Supply', 'Karnataka 29'],
+  ];
+};
+
+/**
+ * Document 1 — Dhoond TAX INVOICE (customer-facing): the 20% convenience
+ * & platform fee slice with 18% GST carved out of it, per the agreed
+ * formula (499 → 99.80 = 81.84 taxable + 8.98 CGST + 8.98 SGST).
+ */
+const generateCustomerInvoicePdf = async (booking) => {
+  const bd = breakdown(booking);
+  const firstService = booking.items?.[0]?.service?.name;
+  const company = await loadCompany();
+  const signatureImage = await fetchSignatureImage(company.signatureUrl);
+  return renderDoc(booking, {
+    badge: 'TAX INVOICE',
+    recipient: recipientFields(booking, 'Invoice No.', `${invoiceNumber(booking)}-F`),
+    supplier: [
+      ['Name', company.name],
+      ['Business GST', company.gstin],
+      ['Address', company.address],
+      ['State Name & Code', company.stateNameCode],
+    ],
+    itemTitle: `Convenience Fee & Platform Fee${firstService ? ` - ${firstService}` : ''}`,
+    sac: SAC_PLATFORM,
+    rows: [
+      ['Gross Amount', fmtInr(bd.dhoondNet)],
+      ['Discount', `- ${fmtInr(0)}`],
+      ['Taxable Amount', fmtInr(bd.dhoondNet), amountInWords(bd.dhoondNet)],
+      ['CGST @9%', fmtInr(bd.dhoondCGST)],
+      ['SGST @9%', fmtInr(bd.dhoondSGST)],
+      ['Total Tax', fmtInr(bd.dhoondGST), amountInWords(bd.dhoondGST)],
+    ],
+    subtotal: fmtInr(bd.dhoondGross),
+    signature: company.name,
+    signatureImage,
+  });
+};
+
+/**
+ * Document 2 — PARTNER RECEIPT (customer-facing, issued on behalf of the
+ * service partner): the 80% service-charge slice. Like the UC sample, a
+ * plain receipt — gross / discount / subtotal, no tax lines (the 5%
+ * carve-out is payout bookkeeping between Dhoond and the partner, not a
+ * tax the customer is charged on this document).
+ */
+const generatePartnerReceiptPdf = (booking) => {
+  const bd = breakdown(booking);
+  const firstService = booking.items?.[0]?.service?.name;
+  const partner = booking.partner ?? {};
+  const partnerAddress =
+    partner.document?.aadharAddress ?? [partner.city, 'Karnataka'].filter(Boolean).join(', ');
+  return renderDoc(booking, {
+    badge: 'RECEIPT (PARTNER RECEIPT)',
+    recipient: recipientFields(booking, 'Receipt No.', `${invoiceNumber(booking)}-S`),
+    supplier: [
+      ['Name', partner.name ?? partner.businessName ?? 'Service Partner'],
+      ['Business GST', ''],
+      ['Address', partnerAddress || '—'],
+      ['State Name & Code', 'Karnataka 29'],
+    ],
+    itemTitle: `Service Charge${firstService ? ` - ${firstService}` : ''}`,
+    sac: SAC_SERVICE,
+    rows: [
+      ['Gross Amount', fmtInr(bd.partnerGross)],
+      ['Discount', `- ${fmtInr(0)}`],
+    ],
+    subtotal: fmtInr(bd.partnerGross),
+    signature: null,
+  });
+};
+
+/// Back-compat alias — older call sites get the Dhoond tax invoice.
+const generateInvoicePdf = generateCustomerInvoicePdf;
 
 // ── PDF draw helpers ──────────────────────────────────────────────────────
 
@@ -478,4 +590,11 @@ const buildInvoiceEmailHtml = (booking) => {
 </body></html>`;
 };
 
-module.exports = { generateInvoicePdf, buildInvoiceEmailHtml, invoiceNumber, breakdown };
+module.exports = {
+  generateInvoicePdf,
+  generateCustomerInvoicePdf,
+  generatePartnerReceiptPdf,
+  buildInvoiceEmailHtml,
+  invoiceNumber,
+  breakdown,
+};

@@ -840,11 +840,20 @@ const handlePaymentSuccess = async ({ bookingId }) => {
       addressLabel: true,
       customer: { select: { id: true, name: true, email: true } },
       customerAddress: { select: { addressLine: true } },
+      /// Needed by the partner receipt's "From (Supplier)" column.
+      partner: {
+        select: {
+          name: true,
+          businessName: true,
+          city: true,
+          document: { select: { aadharAddress: true } },
+        },
+      },
       items: {
         select: {
           qty: true,
           basePrice: true,
-          service: { select: { name: true } },
+          service: { select: { name: true, categoryId: true } },
         },
       },
     },
@@ -902,11 +911,29 @@ const handlePaymentSuccess = async ({ bookingId }) => {
   }
 
   try {
-    const { generateInvoicePdf, buildInvoiceEmailHtml, invoiceNumber } = require('../../lib/invoice');
+    const {
+      generateCustomerInvoicePdf,
+      generatePartnerReceiptPdf,
+      buildInvoiceEmailHtml,
+      invoiceNumber,
+    } = require('../../lib/invoice');
+    /// Category-level commission split for the invoice math — same rule
+    /// source the payout side uses (default 80/20 when no rule).
+    try {
+      const rules = await prisma.commissionRule.findMany({
+        select: { categoryId: true, partnerPct: true },
+      });
+      const catId = booking.items?.[0]?.service?.categoryId ?? null;
+      const rule = catId != null ? rules.find((r) => r.categoryId === catId) : null;
+      booking.partnerCommissionPct = rule?.partnerPct;
+    } catch {
+      /* fall back to the default split inside breakdown() */
+    }
     const { sendMail } = require('../../lib/email');
 
-    const [pdfBuffer, html] = await Promise.all([
-      generateInvoicePdf(booking),
+    const [feePdf, receiptPdf, html] = await Promise.all([
+      generateCustomerInvoicePdf(booking),
+      generatePartnerReceiptPdf(booking),
       Promise.resolve(buildInvoiceEmailHtml(booking)),
     ]);
 
@@ -915,10 +942,17 @@ const handlePaymentSuccess = async ({ bookingId }) => {
       to: email,
       subject: `Your Dhoond Invoice — ${invNo}`,
       html,
+      /// TWO documents, UC-style: Dhoond tax invoice (platform fee + GST)
+      /// and the partner receipt (service charge).
       attachments: [
         {
-          filename: `dhoond-invoice-${invNo}.pdf`,
-          content: pdfBuffer,
+          filename: `dhoond-invoice-${invNo}-F.pdf`,
+          content: feePdf,
+          contentType: 'application/pdf',
+        },
+        {
+          filename: `partner-receipt-${invNo}-S.pdf`,
+          content: receiptPdf,
           contentType: 'application/pdf',
         },
       ],

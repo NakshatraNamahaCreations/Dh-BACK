@@ -1560,13 +1560,39 @@ const ADMIN_INCLUDE = {
   },
 };
 
+/// Human-meaningful locality for the admin "Area" column. Address lines
+/// look like "868, 25th Main Rd, 1st Sector, HSR Layout, Bengaluru,
+/// Karnataka 560102, India" — the FIRST segment is the house number, so
+/// the column used to read "868" / "No 867" / "403". Instead: take the
+/// segment closest to (just before) the city, skipping pure house-number
+/// patterns and pincode/state/country noise; fall back to the city.
+const areaFromAddress = (line, city) => {
+  if (!line) return city ?? '';
+  const segs = line.split(',').map((x) => x.trim()).filter(Boolean);
+  const isNoise = (x) =>
+    /^india$/i.test(x) ||
+    /\d{6}/.test(x) ||
+    (city && x.toLowerCase() === String(city).toLowerCase());
+  const isHouseish = (x) =>
+    /^#?\s*(no\.?\s*)?\d+[\w\/-]*$/i.test(x) ||
+    /^(flat|house|door|plot|site|apt|apartment)\b/i.test(x);
+  let cityIdx = city
+    ? segs.findIndex((x) => x.toLowerCase() === String(city).toLowerCase())
+    : -1;
+  if (cityIdx === -1) cityIdx = segs.findIndex((x) => isNoise(x));
+  const candidates = (cityIdx > 0 ? segs.slice(0, cityIdx) : segs).filter(
+    (x) => !isNoise(x) && !isHouseish(x),
+  );
+  return candidates[candidates.length - 1] ?? city ?? segs[0] ?? '';
+};
+
 const adminShape = (b) => {
   const firstItem = b.items?.[0];
   const serviceName = firstItem?.serviceName ?? 'Service';
   const categoryId = firstItem?.service?.categoryId ?? '';
   const categoryName = firstItem?.service?.category?.name ?? '';
   const addr = resolveBookingAddress(b);
-  const area = addr.line?.split(',')[0]?.trim() ?? addr.city;
+  const area = areaFromAddress(addr.line, addr.city);
   const partnerName = b.partner?.name ?? b.partner?.businessName ?? null;
 
   // Booking → admin status mapping. The DB enum is uppercase, the admin UI
@@ -2294,8 +2320,22 @@ const loadInvoiceBooking = async (id) => {
       addressLabel: true,
       customer: { select: { id: true, name: true, email: true } },
       customerAddress: { select: { addressLine: true } },
+      /// The partner receipt's "From (Supplier)" column — name + KYC
+      /// address of whoever performed the job.
+      partner: {
+        select: {
+          name: true,
+          businessName: true,
+          city: true,
+          document: { select: { aadharAddress: true } },
+        },
+      },
       items: {
-        select: { qty: true, basePrice: true, service: { select: { name: true } } },
+        select: {
+          qty: true,
+          basePrice: true,
+          service: { select: { name: true, categoryId: true } },
+        },
       },
     },
   });
@@ -2303,16 +2343,35 @@ const loadInvoiceBooking = async (id) => {
   if (booking.paymentStatus !== 'paid') {
     throw ApiError.badRequest('An invoice is only available once the booking is paid.');
   }
+  /// Resolve the CATEGORY-level commission split for the invoice math —
+  /// same rule source the earnings/payout side uses, so the customer's
+  /// documents and the partner's payout never disagree. Falls back to
+  /// the default 80/20 inside breakdown() when no rule exists.
+  const commissionMap = await loadCommissionMap();
+  const primaryCategoryId = booking.items?.[0]?.service?.categoryId ?? null;
+  booking.partnerCommissionPct =
+    primaryCategoryId != null ? commissionMap.get(primaryCategoryId) : undefined;
   return booking;
 };
 
 /// Build the tax invoice PDF for a booking on demand (admin download). Uses
 /// the same generator + booking shape the post-payment email worker uses.
-exports.adminInvoicePdf = async (id) => {
-  const { generateInvoicePdf, invoiceNumber } = require('../../lib/invoice');
+/// `docType`: 'customer' (default) = the Dhoond TAX INVOICE (platform
+/// fee + GST); 'partner' = the PARTNER RECEIPT (service charge, issued
+/// on behalf of the partner). Two documents per booking, UC-style.
+exports.adminInvoicePdf = async (id, docType = 'customer') => {
+  const {
+    generateCustomerInvoicePdf,
+    generatePartnerReceiptPdf,
+    invoiceNumber,
+  } = require('../../lib/invoice');
   const booking = await loadInvoiceBooking(id);
-  const pdf = await generateInvoicePdf(booking);
-  return { pdf, filename: `invoice-${invoiceNumber(booking)}.pdf` };
+  if (docType === 'partner') {
+    const pdf = await generatePartnerReceiptPdf(booking);
+    return { pdf, filename: `receipt-${invoiceNumber(booking)}-S.pdf` };
+  }
+  const pdf = await generateCustomerInvoicePdf(booking);
+  return { pdf, filename: `invoice-${invoiceNumber(booking)}-F.pdf` };
 };
 
 /// Email the tax invoice (PDF attachment + HTML body) to the customer on
@@ -2320,7 +2379,12 @@ exports.adminInvoicePdf = async (id) => {
 /// manual "resend / send it now" action (e.g. when the auto-email failed or
 /// the customer asks for a copy).
 exports.adminSendInvoiceEmail = async (id) => {
-  const { generateInvoicePdf, buildInvoiceEmailHtml, invoiceNumber } = require('../../lib/invoice');
+  const {
+    generateCustomerInvoicePdf,
+    generatePartnerReceiptPdf,
+    buildInvoiceEmailHtml,
+    invoiceNumber,
+  } = require('../../lib/invoice');
   const { sendMail } = require('../../lib/email');
   const booking = await loadInvoiceBooking(id);
   const email = booking.customer?.email?.trim();
@@ -2329,8 +2393,9 @@ exports.adminSendInvoiceEmail = async (id) => {
       "This customer has no email address on file, so the invoice can't be emailed.",
     );
   }
-  const [pdfBuffer, html] = await Promise.all([
-    generateInvoicePdf(booking),
+  const [feePdf, receiptPdf, html] = await Promise.all([
+    generateCustomerInvoicePdf(booking),
+    generatePartnerReceiptPdf(booking),
     Promise.resolve(buildInvoiceEmailHtml(booking)),
   ]);
   const invNo = invoiceNumber(booking);
@@ -2338,8 +2403,11 @@ exports.adminSendInvoiceEmail = async (id) => {
     to: email,
     subject: `Your Dhoond Invoice — ${invNo}`,
     html,
+    /// TWO documents, UC-style: the Dhoond tax invoice (platform fee +
+    /// GST) and the partner receipt (service charge).
     attachments: [
-      { filename: `dhoond-invoice-${invNo}.pdf`, content: pdfBuffer, contentType: 'application/pdf' },
+      { filename: `dhoond-invoice-${invNo}-F.pdf`, content: feePdf, contentType: 'application/pdf' },
+      { filename: `partner-receipt-${invNo}-S.pdf`, content: receiptPdf, contentType: 'application/pdf' },
     ],
   });
   /// `sendMail` returns null (not throws) when SMTP isn't configured — surface

@@ -97,7 +97,10 @@ exports.adminGet = asyncHandler(async (req, res) => {
 });
 
 exports.adminDownloadInvoice = asyncHandler(async (req, res) => {
-  const { pdf, filename } = await service.adminInvoicePdf(req.params.id);
+  /// ?doc=partner downloads the partner receipt; default is the Dhoond
+  /// tax invoice. Anything else falls back to the invoice.
+  const docType = req.query.doc === 'partner' ? 'partner' : 'customer';
+  const { pdf, filename } = await service.adminInvoicePdf(req.params.id, docType);
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.setHeader('Content-Length', pdf.length);
