@@ -11,6 +11,9 @@ const pincodesField = z.array(z.string().trim().regex(/^\d{3,8}$/, 'Pincode must
 ///   'whitelist' — only those pincodes are served (default / legacy)
 ///   'extra'     — the whole city PLUS those pincodes
 const pincodeModeField = z.enum(['whitelist', 'extra']);
+/// Alternate locality names ("Bommasandra", "Anekal Taluk") that resolve
+/// to this area. Normalised to lowercase server-side.
+const cityAliasesField = z.array(z.string().trim().min(2).max(80)).max(200);
 const categoryIdsField = z.array(z.number().int().positive()).max(50);
 
 const createSchema = z.object({
@@ -19,6 +22,7 @@ const createSchema = z.object({
     state: stateField,
     pincodes: pincodesField.optional(),
     pincodeMode: pincodeModeField.optional(),
+    cityAliases: cityAliasesField.optional(),
     categoryIds: categoryIdsField.optional(),
     active: z.boolean().optional(),
   }),
@@ -32,7 +36,10 @@ const updateSchema = z.object({
       state: stateField,
       pincodes: pincodesField.optional(),
       pincodeMode: pincodeModeField.optional(),
+      cityAliases: cityAliasesField.optional(),
+    cityAliases: cityAliasesField.optional(),
     pincodeMode: pincodeModeField.optional(),
+    cityAliases: cityAliasesField.optional(),
       categoryIds: categoryIdsField.optional(),
       active: z.boolean().optional(),
     })

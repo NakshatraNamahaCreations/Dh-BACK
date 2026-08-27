@@ -8,6 +8,8 @@ const shape = (a) => ({
   pincodes: a.pincodes,
   /// 'whitelist' = only these pincodes; 'extra' = whole city + these.
   pincodeMode: a.pincodeMode ?? 'whitelist',
+  /// Extra locality names that resolve to this area (lowercased).
+  cityAliases: a.cityAliases ?? [],
   categoryIds: a.categoryIds,
   active: a.active,
   surgeRuleCount: a._count?.surgeRules,
@@ -23,6 +25,16 @@ const normalizePincodes = (raw) => {
   return raw
     .map((p) => String(p).trim())
     .filter((p) => p && /^\d{3,8}$/.test(p) && !seen.has(p) && seen.add(p));
+};
+
+/// Aliases are matched with an exact lowercase compare, so normalise on
+/// write: trim, lowercase, drop blanks, dedupe.
+const normalizeAliases = (raw) => {
+  const seen = new Set();
+  return (Array.isArray(raw) ? raw : [])
+    .map((a) => String(a ?? '').trim().toLowerCase())
+    .filter((a) => a && !seen.has(a) && (seen.add(a), true))
+    .slice(0, 200);
 };
 
 exports.list = async () => {
@@ -56,6 +68,7 @@ exports.create = async (data) => {
       state: data.state ?? null,
       pincodes: normalizePincodes(data.pincodes),
       pincodeMode: data.pincodeMode === 'extra' ? 'extra' : 'whitelist',
+      cityAliases: normalizeAliases(data.cityAliases),
       categoryIds: data.categoryIds ?? [],
       active: data.active ?? true,
     },
@@ -72,6 +85,7 @@ exports.update = async (id, data) => {
   if (data.pincodeMode !== undefined) {
     patch.pincodeMode = data.pincodeMode === 'extra' ? 'extra' : 'whitelist';
   }
+  if (data.cityAliases !== undefined) patch.cityAliases = normalizeAliases(data.cityAliases);
   if (data.categoryIds !== undefined) patch.categoryIds = data.categoryIds;
   if (data.active !== undefined) patch.active = data.active;
   try {
@@ -148,7 +162,7 @@ exports.check = async ({ city, pincode }) => {
   if (pin) {
     const pinMatch = await prisma.serviceArea.findFirst({
       where: { pincodes: { has: pin }, active: true },
-      select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
+      select: { id: true, city: true, pincodes: true, pincodeMode: true, cityAliases: true, categoryIds: true },
     });
     if (pinMatch) {
       return {
@@ -172,22 +186,36 @@ exports.check = async ({ city, pincode }) => {
   const cityResolver = require('../geography/city-resolver');
   const cityId = await cityResolver.resolve(cityKey);
 
-  const area = cityId
+  let area = cityId
     ? await prisma.serviceArea.findFirst({
         where: { cityId, active: true },
-        select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
+        select: { id: true, city: true, pincodes: true, pincodeMode: true, cityAliases: true, categoryIds: true },
       }) ??
       /// Legacy ServiceArea rows whose cityId hasn't been backfilled
       /// yet — try the free-text path so we don't tell the customer
       /// "not serviced" while admin still hasn't run the backfill.
       (await prisma.serviceArea.findFirst({
         where: { city: { equals: cityKey, mode: 'insensitive' }, active: true },
-        select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
+        select: { id: true, city: true, pincodes: true, pincodeMode: true, cityAliases: true, categoryIds: true },
       }))
     : await prisma.serviceArea.findFirst({
         where: { city: { equals: cityKey, mode: 'insensitive' }, active: true },
-        select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
+        select: { id: true, city: true, pincodes: true, pincodeMode: true, cityAliases: true, categoryIds: true },
       });
+
+  /// Alias fallback — the geocoder often reports a fringe locality
+  /// ("Bommasandra", "Anekal Taluk") rather than the parent city, and at
+  /// some coordinates Google returns NO postal code, so the pincode path
+  /// can't rescue those. Admin maps those names onto the parent area.
+  if (!area) {
+    const aliasMatch = await prisma.serviceArea.findFirst({
+      where: { cityAliases: { has: cityKey.toLowerCase() }, active: true },
+      select: { id: true, city: true, pincodes: true, pincodeMode: true, cityAliases: true, categoryIds: true },
+    });
+    if (aliasMatch) {
+      area = aliasMatch;
+    }
+  }
 
   if (!area) {
     return {

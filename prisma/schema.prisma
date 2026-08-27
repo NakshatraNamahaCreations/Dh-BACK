@@ -1309,6 +1309,12 @@ model ServiceArea {
   ///                                   boundary but served as Bengaluru).
   /// Ignored while `pincodes` is empty — that always means whole-city.
   pincodeMode String   @default("whitelist")
+  /// Extra locality names that should resolve to THIS area, stored
+  /// lowercased. Reverse-geocoders return fringe names ("Bommasandra",
+  /// "Anekal Taluk") instead of the parent city, and Google omits the
+  /// postal code at some coordinates — so a pincode rule alone can't
+  /// rescue those. Empty = match on the city name only (default).
+  cityAliases String[] @default([])
   /// empty = all categories available here; populated = restricted set
   categoryIds Int[]    @default([])
   active      Boolean  @default(true)

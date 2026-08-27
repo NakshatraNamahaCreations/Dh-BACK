@@ -84,8 +84,17 @@ const findServiceAreaForAddress = async ({ city, pincode, cityId }) => {
 
   const cityKey = String(city ?? '').trim();
   if (!cityKey) return null;
-  return prisma.serviceArea.findFirst({
+  const byName = await prisma.serviceArea.findFirst({
     where: { city: { equals: cityKey, mode: 'insensitive' }, active: true },
+    select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
+  });
+  if (byName) return byName;
+  /// Same alias fallback the public coverage check uses — keeps "can I
+  /// book here?" consistent with "are you live here?". Without it a
+  /// customer could pass the coverage screen and then be refused at
+  /// checkout.
+  return prisma.serviceArea.findFirst({
+    where: { cityAliases: { has: cityKey.toLowerCase() }, active: true },
     select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
   });
 };
