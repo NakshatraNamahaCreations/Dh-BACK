@@ -1297,8 +1297,18 @@ model ServiceArea {
   /// canonical city name; matched case-insensitively against geocoded city
   city        String   @unique
   state       String?
-  /// empty = whole city is serviceable; populated = whitelist of pincodes
+  /// empty = whole city is serviceable; populated = see `pincodeMode`
   pincodes    String[] @default([])
+  /// How to read `pincodes` when it is NOT empty:
+  ///   'whitelist' (default, legacy) — ONLY these pincodes are served.
+  ///   'extra'                       — the whole city is served AND these
+  ///                                   extra pincodes on top, for fringe
+  ///                                   areas a geocoder labels as a
+  ///                                   different city (e.g. Bommasandra
+  ///                                   sitting outside the Bengaluru
+  ///                                   boundary but served as Bengaluru).
+  /// Ignored while `pincodes` is empty — that always means whole-city.
+  pincodeMode String   @default("whitelist")
   /// empty = all categories available here; populated = restricted set
   categoryIds Int[]    @default([])
   active      Boolean  @default(true)

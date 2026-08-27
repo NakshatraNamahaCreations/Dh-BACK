@@ -69,7 +69,7 @@ const findServiceAreaForAddress = async ({ city, pincode, cityId }) => {
   if (pin) {
     const pinMatch = await prisma.serviceArea.findFirst({
       where: { pincodes: { has: pin }, active: true },
-      select: { id: true, city: true, pincodes: true, categoryIds: true },
+      select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
     });
     if (pinMatch) return pinMatch;
   }
@@ -77,7 +77,7 @@ const findServiceAreaForAddress = async ({ city, pincode, cityId }) => {
   if (cityId) {
     const cityMatch = await prisma.serviceArea.findFirst({
       where: { cityId, active: true },
-      select: { id: true, city: true, pincodes: true, categoryIds: true },
+      select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
     });
     if (cityMatch) return cityMatch;
   }
@@ -86,7 +86,7 @@ const findServiceAreaForAddress = async ({ city, pincode, cityId }) => {
   if (!cityKey) return null;
   return prisma.serviceArea.findFirst({
     where: { city: { equals: cityKey, mode: 'insensitive' }, active: true },
-    select: { id: true, city: true, pincodes: true, categoryIds: true },
+    select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
   });
 };
 
@@ -97,7 +97,13 @@ const assertServicesAllowedInArea = async ({ services, city, pincode, cityId }) 
   }
 
   const pin = String(pincode ?? '').trim();
-  if (area.pincodes.length > 0 && (!pin || !area.pincodes.includes(pin))) {
+  /// `pincodeMode === 'extra'` means the list EXTENDS city coverage rather
+  /// than restricting it (fringe pincodes a geocoder files under another
+  /// city). In that mode the city itself is served, so a pincode outside
+  /// the list is fine — matching already proved the address belongs here.
+  /// 'whitelist' (the default) keeps the original strict behaviour.
+  const restrictsByPincode = area.pincodeMode !== 'extra' && area.pincodes.length > 0;
+  if (restrictsByPincode && (!pin || !area.pincodes.includes(pin))) {
     throw ApiError.badRequest(`We're live in ${area.city} but not at this pincode yet.`);
   }
 

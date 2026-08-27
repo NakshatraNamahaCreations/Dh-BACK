@@ -6,6 +6,8 @@ const shape = (a) => ({
   city: a.city,
   state: a.state,
   pincodes: a.pincodes,
+  /// 'whitelist' = only these pincodes; 'extra' = whole city + these.
+  pincodeMode: a.pincodeMode ?? 'whitelist',
   categoryIds: a.categoryIds,
   active: a.active,
   surgeRuleCount: a._count?.surgeRules,
@@ -53,6 +55,7 @@ exports.create = async (data) => {
       city: data.city,
       state: data.state ?? null,
       pincodes: normalizePincodes(data.pincodes),
+      pincodeMode: data.pincodeMode === 'extra' ? 'extra' : 'whitelist',
       categoryIds: data.categoryIds ?? [],
       active: data.active ?? true,
     },
@@ -66,6 +69,9 @@ exports.update = async (id, data) => {
   if (data.city !== undefined) patch.city = data.city;
   if (data.state !== undefined) patch.state = data.state;
   if (data.pincodes !== undefined) patch.pincodes = normalizePincodes(data.pincodes);
+  if (data.pincodeMode !== undefined) {
+    patch.pincodeMode = data.pincodeMode === 'extra' ? 'extra' : 'whitelist';
+  }
   if (data.categoryIds !== undefined) patch.categoryIds = data.categoryIds;
   if (data.active !== undefined) patch.active = data.active;
   try {
@@ -142,7 +148,7 @@ exports.check = async ({ city, pincode }) => {
   if (pin) {
     const pinMatch = await prisma.serviceArea.findFirst({
       where: { pincodes: { has: pin }, active: true },
-      select: { id: true, city: true, pincodes: true, categoryIds: true },
+      select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
     });
     if (pinMatch) {
       return {
@@ -169,18 +175,18 @@ exports.check = async ({ city, pincode }) => {
   const area = cityId
     ? await prisma.serviceArea.findFirst({
         where: { cityId, active: true },
-        select: { id: true, city: true, pincodes: true, categoryIds: true },
+        select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
       }) ??
       /// Legacy ServiceArea rows whose cityId hasn't been backfilled
       /// yet — try the free-text path so we don't tell the customer
       /// "not serviced" while admin still hasn't run the backfill.
       (await prisma.serviceArea.findFirst({
         where: { city: { equals: cityKey, mode: 'insensitive' }, active: true },
-        select: { id: true, city: true, pincodes: true, categoryIds: true },
+        select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
       }))
     : await prisma.serviceArea.findFirst({
         where: { city: { equals: cityKey, mode: 'insensitive' }, active: true },
-        select: { id: true, city: true, pincodes: true, categoryIds: true },
+        select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
       });
 
   if (!area) {
@@ -191,8 +197,10 @@ exports.check = async ({ city, pincode }) => {
     };
   }
 
-  // Whole-city mode → always serviceable here.
-  if (area.pincodes.length === 0) {
+  // Whole-city mode → always serviceable here. `pincodeMode === 'extra'`
+  // counts as whole-city too: there the list ADDS fringe pincodes on top
+  // of the city rather than narrowing it down.
+  if (area.pincodes.length === 0 || area.pincodeMode === 'extra') {
     return {
       serviceable: true,
       city: area.city,
