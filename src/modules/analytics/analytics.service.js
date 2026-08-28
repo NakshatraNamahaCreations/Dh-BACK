@@ -426,27 +426,46 @@ exports.bookingReport = async (query = {}, scope) => {
     },
   });
 
+  /// Two-decimal money for DISPLAY. The PartnerEarning row stores whole
+  /// rupees (Int columns — the actual credited amounts, floored so we
+  /// never credit more than authorised), which reads as ₹0 everywhere on
+  /// a small booking: 80% of ₹1 floors to ₹0. The REPORT recomputes the
+  /// exact split (2dp) from the SAME snapshotted inputs the earning row
+  /// froze (bookingAmount × commissionPct), so ₹1 shows as ₹0.80/₹0.20
+  /// here while the persisted ledger stays untouched.
+  const money2 = (v) => Math.round(v * 100) / 100;
+
   const rows = bookings.map((b) => {
     const isCancelled = b.status === 'CANCELLED';
-    const partnerEarn = b.earning?.earnedAmount ?? 0;
-    // Commission only makes sense once a partner share exists (completed).
-    // For non-completed/non-cancelled rows we still show the job amount but
-    // leave the split at 0 so totals aren't inflated by unrealised revenue.
-    const commission = b.earning ? Math.max(0, b.total - partnerEarn) : 0;
-    const platformFee = b.platformFee ?? 0;
-    const gst = b.gstAmount ?? 0;
-    const dhoondEarn = commission + platformFee;
     /// Client settlement sheet, per booking. Base is the POST-DISCOUNT
     /// amount the customer actually paid — splitting the sticker price
     /// would credit a partner more than was collected.
     const e = b.earning;
     const discount = b.discount ?? 0;
-    const partnerGross = e?.earnedAmount ?? 0;
-    const partnerGst = e?.partnerGst ?? 0;
-    const partnerNet = e?.netAmount ?? 0;
-    const dhoondGross = e?.dhoondCommission ?? 0;
-    const dhoondGstAmt = e?.dhoondGst ?? 0;
-    const dhoondNet = e?.dhoondNet ?? 0;
+    let partnerGross = 0;
+    let partnerGst = 0;
+    let partnerNet = 0;
+    let dhoondGross = 0;
+    let dhoondGstAmt = 0;
+    let dhoondNet = 0;
+    if (e) {
+      const base = e.bookingAmount ?? 0;
+      const pct = e.commissionPct ?? 80;
+      partnerGross = money2((base * pct) / 100);
+      dhoondGross = money2(base - partnerGross);
+      partnerGst = money2((partnerGross * 5) / 100);
+      dhoondGstAmt = money2((dhoondGross * 18) / 100);
+      partnerNet = money2(partnerGross - partnerGst);
+      dhoondNet = money2(dhoondGross - dhoondGstAmt);
+    }
+    const partnerEarn = partnerGross;
+    // Commission only makes sense once a partner share exists (completed).
+    // For non-completed/non-cancelled rows we still show the job amount but
+    // leave the split at 0 so totals aren't inflated by unrealised revenue.
+    const commission = e ? money2(Math.max(0, b.total - partnerEarn)) : 0;
+    const platformFee = b.platformFee ?? 0;
+    const gst = b.gstAmount ?? 0;
+    const dhoondEarn = money2(commission + platformFee);
     const services = b.items.map((it) => it.service?.name).filter(Boolean).join(', ');
     const category = b.items[0]?.service?.category?.name ?? '—';
 
@@ -529,6 +548,16 @@ exports.bookingReport = async (query = {}, scope) => {
       dhoondGross: 0, dhoondGstAmt: 0, dhoondNet: 0,
     },
   );
+  /// Kill float noise from summing 2dp row values (0.8 + 0.1 → 0.9000…01)
+  /// so the frontend renders clean paise.
+  for (const k of [
+    'jobAmount', 'partnerEarning', 'commission', 'platformFee', 'gst',
+    'dhoondEarning', 'grandTotal', 'refund', 'subtotal', 'discount',
+    'partnerGross', 'partnerGstAmt', 'partnerNet',
+    'dhoondGross', 'dhoondGstAmt', 'dhoondNet',
+  ]) {
+    totals[k] = Math.round(totals[k] * 100) / 100;
+  }
   /// Take rate against CUSTOMER-PAID (grand total), not the pre-GST base.
   /// The card now leads with customer-paid, so dividing by the GST-stripped
   /// base made the percentage look unrelated to the numbers on screen
