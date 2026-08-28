@@ -247,6 +247,42 @@ exports.list = async ({ status, kyc, search, onDuty, dutyState, categoryId, orde
   });
   if (kyc === 'rejected') data = data.filter((p) => p.kyc === 'rejected');
 
+  /// LIVE duty overlay. The DB `dutyState` column is a best-effort
+  /// mirror and has desynced in the field — admin showed "Off Duty"
+  /// for a partner who was on duty and actively receiving job alerts.
+  /// Redis is what dispatch ACTUALLY matches from, so for this page of
+  /// rows read the same three signals the dispatcher uses and let them
+  /// override the mirror: active-job flag → 'busy'; explicit off-duty
+  /// flag → 'off_duty'; live lastseen → 'available'; none of the
+  /// three → off duty (dispatch can't find them either). Falls back to
+  /// the DB mirror untouched when Redis is unavailable. (The dutyState
+  /// FILTER above still matches on the DB column — a desynced row can
+  /// therefore land in the "wrong" filter bucket until the mirror
+  /// heals, but what admin SEES is always dispatch reality.)
+  try {
+    const registry = require('../dispatch/registry');
+    if (registry.enabled() && data.length > 0) {
+      const ids = data.map((p) => p.id);
+      const [live, busy, off] = await Promise.all([
+        registry.filterOnlinePartnerIds(ids),
+        registry.filterActivePartnerIds(ids),
+        registry.filterOffDutyPartnerIds(ids),
+      ]);
+      data = data.map((p) => {
+        const dutyState = busy.has(p.id)
+          ? 'busy'
+          : off.has(p.id)
+            ? 'off_duty'
+            : live.has(p.id)
+              ? 'available'
+              : 'off_duty';
+        return { ...p, dutyState, onDuty: dutyState !== 'off_duty' };
+      });
+    }
+  } catch {
+    /* Redis hiccup — the DB-mirror values already in `data` stand. */
+  }
+
   return {
     data,
     meta: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },

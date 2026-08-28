@@ -365,6 +365,22 @@ const filterOnlinePartnerIds = async (partnerIds) => {
   }, new Set());
 };
 
+/// Given partner ids, return the SUBSET carrying the explicit off-duty
+/// flag. Bulk companion to `isOffDuty` — used by the admin partner list
+/// to compute LIVE duty state from the same signals dispatch uses.
+/// Empty Set when Redis is down (callers fall back to the DB mirror).
+const filterOffDutyPartnerIds = async (partnerIds) => {
+  if (!Array.isArray(partnerIds) || partnerIds.length === 0) return new Set();
+  return safe(async () => {
+    const values = await redis.mget(...partnerIds.map((id) => offDutyKey(id)));
+    const off = new Set();
+    partnerIds.forEach((id, i) => {
+      if (values[i] != null) off.add(Number(id));
+    });
+    return off;
+  }, new Set());
+};
+
 // ── Live socket presence (cross-instance, for FCM gating) ───────────
 //
 // A per-partner counter of currently-open sockets ACROSS every API
@@ -725,6 +741,7 @@ module.exports = {
   clearDutyMirror,
   countOnlineInCategory,
   filterOnlinePartnerIds,
+  filterOffDutyPartnerIds,
   incrSocketConn,
   decrSocketConn,
   touchSocketConn,
