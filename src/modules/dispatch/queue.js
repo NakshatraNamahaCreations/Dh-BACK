@@ -222,6 +222,40 @@ const ensureNotificationCleanupScheduled = async () => {
   );
 };
 
+/// Recurring abandoned-booking purge — every 5 minutes, hard-DELETE
+/// bookings that are CANCELLED and were never paid for, once they've been
+/// cancelled for at least 5 minutes. These are BYOP/checkout attempts that
+/// nobody accepted or the customer walked away from: no money moved, no
+/// partner touched them, and they were burying the real rows in the admin
+/// Booking history (a dozen "Cancelled · Unpaid" attempts per real job).
+/// Payments/items/ratings cascade with the row (schema onDelete: Cascade).
+/// PAID cancellations are never touched — they carry the refund trail.
+const ABANDONED_PURGE_EVERY_MS = 5 * 60 * 1000;
+const ensureAbandonedPurgeScheduled = async () => {
+  if (!dispatchQueue) return;
+  try {
+    const existing = await dispatchQueue.getRepeatableJobs();
+    for (const job of existing) {
+      if (job.name === 'purge_abandoned') {
+        await dispatchQueue.removeRepeatableByKey(job.key).catch(() => {});
+      }
+    }
+  } catch (err) {
+    logger.warn(`Failed to clean up old abandoned-purge schedules: ${err.message}`);
+  }
+
+  await dispatchQueue.add(
+    'purge_abandoned',
+    {},
+    {
+      repeat: { every: ABANDONED_PURGE_EVERY_MS },
+      jobId: 'purge_abandoned__repeat',
+      removeOnComplete: { count: 1 },
+      removeOnFail: { count: 10 },
+    },
+  );
+};
+
 /// Recurring dispatch sweep — DURABLE safety net for scheduled
 /// bookings. The per-booking wave jobs are enqueued ONCE at create
 /// time; if that enqueue is lost (Redis/DB blip), or the worker is
@@ -270,7 +304,10 @@ const ensureDispatchSweepScheduled = async () => {
 const cancelJobsForBooking = async (bookingId) => {
   if (!dispatchQueue) return;
   const ids = [
-    ...Array.from({ length: 6 }, (_, index) => `wave__${bookingId}__${index + 1}`),
+    /// 8 covers the standard 6-wave ladder PLUS the instant +5/+10 min
+    /// second-chance rounds (waves 7-8). Removing a wave id that was
+    /// never enqueued is a harmless no-op.
+    ...Array.from({ length: 8 }, (_, index) => `wave__${bookingId}__${index + 1}`),
     `expire__${bookingId}`,
     `admin_timeout__${bookingId}`,
   ];
@@ -310,6 +347,7 @@ module.exports = {
   enqueuePaymentSuccess,
   ensureReconcilerScheduled,
   ensureNotificationCleanupScheduled,
+  ensureAbandonedPurgeScheduled,
   ensureDispatchSweepScheduled,
   cancelJobsForBooking,
   close,

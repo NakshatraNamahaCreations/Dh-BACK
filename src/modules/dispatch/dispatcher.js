@@ -68,6 +68,13 @@ const { sendJobOfferPushes, clearJobOfferPush } = require('../notifications/push
 ///   Wave 6 (2:40)   — 7km retry attempt, 30s active
 ///   Expiry (3:10)   — booking flips to `needs_admin_dispatch`,
 ///                     ops takes over from here.
+///
+/// INSTANT fixed-price bookings extend the ladder instead of expiring
+/// at 3:10 (see INSTANT_RETRY_WAVES):
+///   Wave 7 (5:00)   — widest-ring second chance, 30s active
+///   Wave 8 (10:00)  — widest-ring final chance, 30s active
+///   Expiry (10:30)  — auto-cancel + automatic refund; instant
+///                     bookings never park in manual dispatch.
 const DISPATCH_WINDOW_MS = 30 * 1000;
 const DISPATCH_RETRY_GAP_MS = 2 * 1000;
 const DISPATCH_STEP_MS = DISPATCH_WINDOW_MS + DISPATCH_RETRY_GAP_MS;
@@ -100,12 +107,39 @@ const BYOP_DISPATCH_WAVES = [
 const BYOP_FINAL_WAVE = BYOP_DISPATCH_WAVES[BYOP_DISPATCH_WAVES.length - 1];
 const BYOP_DISPATCH_TOTAL_MS = BYOP_FINAL_WAVE.offsetMs + DISPATCH_WINDOW_MS;
 
+/// INSTANT second-chance rounds. When the 6-wave ladder ends with no
+/// acceptance, an instant (fixed-price) booking is NOT parked in the
+/// admin manual-dispatch queue — the customer is waiting at the door
+/// right now, and a 2-hour admin grace (the scheduled-booking
+/// treatment) just strands them. Instead it gets two more broadcast
+/// rounds at the widest ring — at +5 min and +10 min from dispatch
+/// start — and if those also pass untaken, handleExpire auto-cancels
+/// WITH an automatic refund. Scheduled + BYOP flows are unchanged.
+/// Mirror of the same plan in bookings.service.js — keep in sync.
+const INSTANT_RETRY_WAVES = [
+  { wave: 7, radiusKm: 7, stage: 2, offsetMs: 5 * 60 * 1000, retry: true },
+  { wave: 8, radiusKm: 7, stage: 2, offsetMs: 10 * 60 * 1000, retry: true },
+];
+const INSTANT_FINAL_WAVE = INSTANT_RETRY_WAVES[INSTANT_RETRY_WAVES.length - 1];
+const INSTANT_DISPATCH_TOTAL_MS = INSTANT_FINAL_WAVE.offsetMs + DISPATCH_WINDOW_MS;
+
 /// Wave plan + total window for a booking. BYOP (offeredPrice set)
-/// gets the two-attempt plan; everything else keeps the 6-wave ladder.
+/// gets the two-attempt plan; instant fixed-price bookings extend the
+/// 6-wave ladder with the +5/+10 min second-chance rounds; scheduled
+/// bookings keep the plain ladder (their misses go to admin dispatch).
 const isByopBooking = (booking) => booking.offeredPrice != null;
-const wavePlanFor = (booking) => (isByopBooking(booking) ? BYOP_DISPATCH_WAVES : DISPATCH_WAVES);
-const dispatchTotalMsFor = (booking) =>
-  isByopBooking(booking) ? BYOP_DISPATCH_TOTAL_MS : DISPATCH_TOTAL_MS;
+const isInstantFixedBooking = (booking) =>
+  booking.isInstant === true && booking.offeredPrice == null;
+const wavePlanFor = (booking) => {
+  if (isByopBooking(booking)) return BYOP_DISPATCH_WAVES;
+  if (isInstantFixedBooking(booking)) return [...DISPATCH_WAVES, ...INSTANT_RETRY_WAVES];
+  return DISPATCH_WAVES;
+};
+const dispatchTotalMsFor = (booking) => {
+  if (isByopBooking(booking)) return BYOP_DISPATCH_TOTAL_MS;
+  if (isInstantFixedBooking(booking)) return INSTANT_DISPATCH_TOTAL_MS;
+  return DISPATCH_TOTAL_MS;
+};
 
 /// The 6 waves widen in 3 STAGES (initial + retry per radius). This maps a
 /// wave number to its stage index (0,1,2) so we can look up the admin-
@@ -551,10 +585,15 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
 const RECONCILE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const RECONCILE_GRACE_MS = 10 * 1000;
 const handleReconcile = async () => {
-  /// Anything created more than (DISPATCH_TOTAL_MS + grace) ago AND
-  /// still PENDING + unassigned is orphaned. The grace buffer keeps
-  /// fresh-but-still-broadcasting rows out of scope.
+  /// Anything created more than (its window + grace) ago AND still
+  /// PENDING + unassigned is orphaned. The grace buffer keeps
+  /// fresh-but-still-broadcasting rows out of scope. Instant
+  /// fixed-price rows use the LONGER instant window (the +5/+10 min
+  /// retry rounds) — with the shared cutoff they'd be flagged as
+  /// orphans mid-retry, and a lost-expire re-queue would auto-cancel
+  /// them seven minutes early.
   const cutoff = new Date(Date.now() - DISPATCH_TOTAL_MS - RECONCILE_GRACE_MS);
+  const instantCutoff = new Date(Date.now() - INSTANT_DISPATCH_TOTAL_MS - RECONCILE_GRACE_MS);
   const lookback = new Date(Date.now() - RECONCILE_LOOKBACK_MS);
   /// Wrapped in withDbRetry — this fires on a timer against a mostly-idle
   /// worker connection, the prime victim of RDS/NAT idle-timeout drops.
@@ -564,7 +603,22 @@ const handleReconcile = async () => {
         where: {
           status: 'PENDING',
           partnerId: null,
-          createdAt: { gte: lookback, lte: cutoff },
+          OR: [
+            /// Instant fixed-price → the extended retry window applies.
+            {
+              isInstant: true,
+              offeredPrice: null,
+              createdAt: { gte: lookback, lte: instantCutoff },
+            },
+            /// Scheduled bookings → plain ladder window.
+            { isInstant: false, createdAt: { gte: lookback, lte: cutoff } },
+            /// BYOP (any isInstant) → two-attempt window, which the
+            /// plain cutoff already comfortably covers.
+            {
+              offeredPrice: { not: null },
+              createdAt: { gte: lookback, lte: cutoff },
+            },
+          ],
         },
         select: { id: true },
         take: 200,
@@ -820,6 +874,30 @@ const handleDispatchSweep = async () => {
 const handleNotificationCleanup = async () => {
   const { pruneExpired } = require('../notifications/notifications.cleanup');
   return pruneExpired();
+};
+
+/// Repeatable job — hard-delete abandoned booking attempts: CANCELLED,
+/// never paid (`paidAt` null), and last touched more than 5 minutes ago
+/// (the buffer keeps a just-cancelled row visible long enough for a
+/// customer-support glance, and safely clear of any in-flight payment
+/// webhook — a webhook that lands later flips paidAt first and the row
+/// stops matching). Dependent rows (pending payment intents, items,
+/// add-ons, rating) cascade via the schema. PAID cancellations are kept
+/// forever: they carry the refund/settlement trail.
+const ABANDONED_MIN_AGE_MS = 5 * 60 * 1000;
+const handleAbandonedPurge = async () => {
+  const cutoff = new Date(Date.now() - ABANDONED_MIN_AGE_MS);
+  const res = await prisma.booking.deleteMany({
+    where: {
+      status: 'CANCELLED',
+      paidAt: null,
+      updatedAt: { lt: cutoff },
+    },
+  });
+  if (res.count > 0) {
+    logger.info(`[purge] removed ${res.count} abandoned unpaid booking(s)`);
+  }
+  return res.count;
 };
 
 /// Payment-success handler — runs once per booking after payment is
@@ -1139,7 +1217,7 @@ const handleExpire = async ({ bookingId }) => {
     where: { id: bookingId },
     select: {
       id: true, status: true, partnerId: true, customerId: true,
-      offeredPrice: true, paymentStatus: true,
+      offeredPrice: true, paymentStatus: true, isInstant: true, couponId: true,
     },
   });
   if (!booking) return;
@@ -1189,6 +1267,102 @@ const handleExpire = async ({ bookingId }) => {
       socketEmitter('booking.expired', `customer:${booking.customerId}`, { bookingId: booking.id });
     }
     logger.info(`dispatch expire: BYOP booking ${bookingId} cancelled (unpaid, no partner accepted)`);
+    return;
+  }
+
+  /// INSTANT auto-cancel. This expire only fires AFTER the instant
+  /// plan's +5 min and +10 min second-chance rounds also went untaken
+  /// (see INSTANT_RETRY_WAVES) — so the search is genuinely over. End
+  /// it definitively: cancel, refund automatically (payment + coupon),
+  /// and tell the customer, instead of parking the row in the admin
+  /// manual-dispatch queue. An instant customer has been watching a
+  /// spinner for ~10 minutes; "no partner found, money back" beats an
+  /// open-ended wait on ops.
+  if (isInstantFixedBooking(booking)) {
+    const isPaid = booking.paymentStatus === 'paid';
+    /// A partner-cancelled row must survive (partner's Past tab), and a
+    /// row with ANY payment attempt must survive (it carries the only
+    /// server-side link to possibly-captured money). Only truly
+    /// untouched rows are hard-deleted — same policy as admin_timeout.
+    const wasPartnerCancelled =
+      (await prisma.partnerAdjustment.count({
+        where: { bookingId: booking.id, type: 'cancellation_penalty' },
+      })) > 0;
+    const hasPaymentAttempt =
+      (await prisma.payment.count({ where: { bookingId: booking.id } })) > 0;
+
+    let didCancel = false;
+    let didDelete = false;
+    await prisma.$transaction(async (tx) => {
+      /// Release the coupon in every outcome — the customer received no
+      /// service, so the redemption must not stay consumed.
+      if (booking.couponId != null) {
+        await couponsService.refundForBooking({ couponId: booking.couponId, tx });
+      }
+      if (isPaid || wasPartnerCancelled || hasPaymentAttempt) {
+        const result = await tx.booking.updateMany({
+          where: { id: booking.id, status: 'PENDING', partnerId: null },
+          data: {
+            status: 'CANCELLED',
+            dispatchStatus: 'no_partner_found',
+            dispatchExpiresAt: null,
+            /// Keep noPartnerReason null for partner-cancelled rows so
+            /// the partner-history filter reads them as real cancels.
+            noPartnerReason: wasPartnerCancelled
+              ? null
+              : 'No partner accepted within the broadcast window or the 5/10-minute retry rounds — instant booking auto-cancelled' +
+                (isPaid ? ' and refunded automatically.' : '.'),
+          },
+        });
+        didCancel = result.count > 0;
+      } else {
+        const result = await tx.booking.deleteMany({
+          where: {
+            id: booking.id,
+            status: 'PENDING',
+            partnerId: null,
+            paymentStatus: { not: 'paid' },
+          },
+        });
+        didDelete = result.count > 0;
+      }
+    });
+    if (!didCancel && !didDelete) return;
+
+    /// Snapshot the audience BEFORE clearBooking wipes visibleTo, then
+    /// tear the broadcast down everywhere (socket close + FCM clear).
+    const audience = await registry.listPartnersForBooking(bookingId).catch(() => []);
+    await registry.clearBooking(bookingId);
+    if (audience.length > 0) {
+      if (socketEmitter) {
+        for (const pid of audience) {
+          socketEmitter('dispatch.claimed', pid, { bookingId, partnerId: null, reason: 'expired' });
+        }
+      }
+      void clearJobOfferPush(prisma, audience, bookingId);
+    }
+
+    if (didCancel && isPaid) {
+      try {
+        await razorpayService.refundForBooking({
+          bookingId,
+          reason: 'No partner accepted the instant booking — automatic refund',
+        });
+      } catch (err) {
+        /// Refund failure must not kill the job (the cancel already
+        /// committed); payment_success's paid+cancelled safety net and
+        /// support tooling can still reconcile it from the kept row.
+        logger.error(`Instant auto-refund failed for booking ${bookingId}: ${err.message}`);
+      }
+    }
+
+    if (socketEmitter) {
+      socketEmitter('booking.expired', `customer:${booking.customerId}`, { bookingId: booking.id });
+    }
+    logger.info(
+      `dispatch expire: instant booking ${bookingId} ${didDelete ? 'deleted' : 'cancelled'} after retry rounds` +
+        (didCancel && isPaid ? ' (auto-refund issued)' : ' (unpaid)'),
+    );
     return;
   }
 
@@ -1433,6 +1607,8 @@ const start = () => {
           return handleDispatchSweep();
         case 'notification_cleanup':
           return handleNotificationCleanup();
+        case 'purge_abandoned':
+          return handleAbandonedPurge();
         default:
           logger.warn(`dispatch worker: unknown job name "${job.name}"`);
       }
@@ -1480,6 +1656,16 @@ const start = () => {
     logger.warn(`Initial notification cleanup failed: ${err.message}`);
   });
 
+  /// Recurring abandoned-booking purge (5 min cadence) + one pass on boot
+  /// so the backlog clears immediately after a deploy instead of waiting
+  /// for the first tick.
+  queue.ensureAbandonedPurgeScheduled().catch((err) => {
+    logger.warn(`Failed to schedule abandoned purge: ${err.message}`);
+  });
+  handleAbandonedPurge().catch((err) => {
+    logger.warn(`Initial abandoned purge failed: ${err.message}`);
+  });
+
   logger.info('Dispatch worker started (push mode enabled)');
   return worker;
 };
@@ -1495,6 +1681,8 @@ const stop = async () => {
 module.exports = {
   DISPATCH_WAVES,
   DISPATCH_TOTAL_MS,
+  INSTANT_RETRY_WAVES,
+  INSTANT_DISPATCH_TOTAL_MS,
   SCHEDULE_DISPATCH_LEAD_MS,
   ADMIN_DISPATCH_GRACE_MS,
   dispatchStartAt,

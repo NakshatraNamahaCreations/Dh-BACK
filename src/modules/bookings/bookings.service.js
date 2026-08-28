@@ -310,12 +310,39 @@ const BYOP_DISPATCH_WAVES = [
 ];
 const BYOP_DISPATCH_TOTAL_MS = BYOP_DISPATCH_WAVES[BYOP_DISPATCH_WAVES.length - 1].endsAtMs;
 
+/// Mirror of `dispatcher.INSTANT_RETRY_WAVES` — instant fixed-price
+/// bookings get two extra widest-ring rounds at +5 min and +10 min
+/// before the expire path auto-cancels + refunds. Keep in sync.
+const INSTANT_RETRY_WAVES = [
+  {
+    wave: 7,
+    radiusKm: 7,
+    startsAtMs: 5 * 60 * 1000,
+    endsAtMs: 5 * 60 * 1000 + DISPATCH_WINDOW_MS,
+  },
+  {
+    wave: 8,
+    radiusKm: 7,
+    startsAtMs: 10 * 60 * 1000,
+    endsAtMs: 10 * 60 * 1000 + DISPATCH_WINDOW_MS,
+  },
+];
+const INSTANT_DISPATCH_TOTAL_MS = INSTANT_RETRY_WAVES[INSTANT_RETRY_WAVES.length - 1].endsAtMs;
+
 /// Wave plan + total window for a booking — BYOP (offeredPrice set)
-/// runs the two-attempt plan, everything else the 6-wave ladder.
-const wavePlanFor = (booking) =>
-  booking.offeredPrice != null ? BYOP_DISPATCH_WAVES : DISPATCH_WAVES;
-const dispatchTotalMsFor = (booking) =>
-  booking.offeredPrice != null ? BYOP_DISPATCH_TOTAL_MS : DISPATCH_TOTAL_MS;
+/// runs the two-attempt plan, instant fixed-price extends the ladder
+/// with the +5/+10 min second-chance rounds, everything else the
+/// plain 6-wave ladder.
+const wavePlanFor = (booking) => {
+  if (booking.offeredPrice != null) return BYOP_DISPATCH_WAVES;
+  if (booking.isInstant) return [...DISPATCH_WAVES, ...INSTANT_RETRY_WAVES];
+  return DISPATCH_WAVES;
+};
+const dispatchTotalMsFor = (booking) => {
+  if (booking.offeredPrice != null) return BYOP_DISPATCH_TOTAL_MS;
+  if (booking.isInstant) return INSTANT_DISPATCH_TOTAL_MS;
+  return DISPATCH_TOTAL_MS;
+};
 
 // Lead time before a scheduled slot at which dispatch begins. MUST stay
 // in sync with the same constant in dispatch/dispatcher.js.
@@ -1481,21 +1508,33 @@ exports.rateBooking = async ({ customerId, id, stars, comment }) => {
 };
 
 /// Compute the cancellation fee for a booking the customer is about to
-/// cancel. The fee only applies to a captured payment (paymentStatus
-/// `paid`) — an unpaid booking has nothing to charge against, so the
-/// fee is zero and the refund is a no-op. Shared by `cancelOwn` and the
-/// customer-app preview endpoint (`cancellationQuote`) so the quote the
-/// customer sees and the amount actually withheld can never diverge.
+/// cancel. The fee applies ONLY when:
+///   1. a payment was captured (paymentStatus `paid` — an unpaid booking
+///      has nothing to charge against), AND
+///   2. a partner has ACCEPTED the booking (`partnerId` set). Until
+///      someone commits to the job, nobody is inconvenienced by the
+///      cancel — charging for backing out of an unaccepted search would
+///      punish the customer for our supply gap. Same rule as ride apps:
+///      fees start when a driver is assigned.
+/// The tier clock runs from the ACCEPTANCE moment (`assignedAt`), not
+/// booking creation — a partner who accepts 20 minutes into a search must
+/// not land the customer straight into the 50% tier. Shared by `cancelOwn`
+/// and the customer-app preview endpoint (`cancellationQuote`) so the
+/// quote the customer sees and the amount actually withheld can never
+/// diverge.
 const quoteCancellation = async (b) => {
   const amountPaid = b.grandTotal && b.grandTotal > 0 ? b.grandTotal : b.total;
-  const chargeable = b.paymentStatus === 'paid' && amountPaid > 0;
+  const chargeable =
+    b.paymentStatus === 'paid' && amountPaid > 0 && b.partnerId != null;
   if (!chargeable) {
     return {
       chargeable: false,
-      amountPaid: chargeable ? amountPaid : 0,
+      amountPaid: 0,
       feePercent: 0,
       feeAmount: 0,
-      refundAmount: 0,
+      /// Full refund of whatever was paid — a paid booking that no
+      /// partner accepted cancels free.
+      refundAmount: b.paymentStatus === 'paid' ? amountPaid : 0,
       withinFreeWindow: true,
       freeWindowMins: 0,
       elapsedMins: 0,
@@ -1505,7 +1544,7 @@ const quoteCancellation = async (b) => {
   const fee = policyService.computeCustomerCancelFee({
     policy,
     amountPaid,
-    bookedAt: b.createdAt,
+    bookedAt: b.assignedAt ?? b.createdAt,
   });
   return { chargeable: true, amountPaid, ...fee };
 };
@@ -1518,7 +1557,7 @@ exports.cancellationQuote = async ({ customerId, id }) => {
     where: { id: Number(id) },
     select: {
       customerId: true, status: true, grandTotal: true, total: true,
-      createdAt: true, paymentStatus: true,
+      createdAt: true, paymentStatus: true, partnerId: true, assignedAt: true,
     },
   });
   if (!b || b.customerId !== customerId) throw ApiError.notFound('Booking not found');
@@ -1534,6 +1573,7 @@ exports.cancelOwn = async ({ customerId, id, reason }) => {
     select: {
       customerId: true, status: true, couponId: true, partnerId: true,
       grandTotal: true, total: true, createdAt: true, paymentStatus: true,
+      assignedAt: true,
     },
   });
   if (!b || b.customerId !== customerId) throw ApiError.notFound('Booking not found');
@@ -1565,8 +1605,11 @@ exports.cancelOwn = async ({ customerId, id, reason }) => {
 
   /// Outside the transaction so a Razorpay outage doesn't undo the
   /// cancel itself. `refundAmount` keeps the cancellation fee (refund =
-  /// paid − fee); when the booking is unpaid `chargeable` is false and
-  /// we pass null so refundForBooking takes its safe no-op path.
+  /// paid − fee). When `chargeable` is false we pass null, which is
+  /// refundForBooking's FULL-REFUND path — exactly right for a paid
+  /// booking no partner ever accepted (free cancel, all money back).
+  /// For an unpaid booking the same call is a safe no-op: there is no
+  /// captured payment row to refund against.
   await tryRefund(id, reason ?? 'Customer cancelled', quote.chargeable ? quote.refundAmount : null);
 
   /// Snapshot who was watching this offer BEFORE clearing Redis —
@@ -3340,8 +3383,18 @@ exports.partnerCancel = async ({ partnerId, id, reason }) => {
   /// scheduleAllForBooking no-ops when the dispatch queue is disabled —
   /// the booking then waits in `needs_admin_dispatch`-style limbo for
   /// manual assignment, which is the same fallback the create path has.
+  ///
+  /// RESTART THE DISPATCH CLOCK: wave/expire delays are relative to
+  /// dispatchStartAt (createdAt for instant/BYOP), and this cancel
+  /// usually lands well past the original window — with the stale
+  /// anchor every wave AND the expire job would fire immediately,
+  /// which for an instant booking means the new expire path would
+  /// auto-cancel + refund the job the moment the partner walked away
+  /// instead of re-offering it to others. A fresh createdAt gives the
+  /// re-broadcast its full ladder again. (Scheduled bookings anchor on
+  /// scheduledAt, so the synthetic createdAt is inert for them.)
   await dispatcher.cancelAllForBooking(bookingId).catch(() => {});
-  await dispatcher.scheduleAllForBooking(b).catch((err) => {
+  await dispatcher.scheduleAllForBooking({ ...b, createdAt: new Date() }).catch((err) => {
     console.warn(`Re-dispatch after partner cancel failed for booking ${bookingId}: ${err.message}`);
   });
 
