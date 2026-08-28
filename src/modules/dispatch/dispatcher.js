@@ -710,8 +710,14 @@ const reconcileStaleOnDuty = async () => {
   }
 
   /// Ghost: marked on duty in DB but no live presence → off_duty.
+  /// NEVER ghost-flip a BUSY row here: a partner mid-job legitimately
+  /// has gaps in presence (accept deletes lastseen; older app builds
+  /// stop pinging while backgrounded on the job), and flipping them
+  /// off_duty mid-job is exactly the "working partner shows Off Duty
+  /// in admin" bug. Stale-busy rows (busy with NO active booking) are
+  /// already handled by the staleBusyIds sweep above.
   const toOff = partners
-    .filter((p) => p.onDuty && !live.has(Number(p.id)))
+    .filter((p) => p.onDuty && p.dutyState !== 'busy' && !live.has(Number(p.id)))
     .map((p) => p.id);
   /// Missed on-write: live presence but DB says off_duty → available.
   /// Also includes STALE-busy rows that ARE still live → back to available.

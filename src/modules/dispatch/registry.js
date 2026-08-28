@@ -144,11 +144,24 @@ const upsertOnline = async ({ partnerId, categoryId, lat, lng }) => {
     /// job offers (push + socket) while they're still finishing the job
     /// they accepted — their app keeps pinging presence as they drive,
     /// and without this they'd be re-added to the pool ~15s after accept.
-    /// One EXISTS over both keys keeps this a single round-trip.
-    const blocked = await redis.exists(offDutyKey(partnerId), activeJobKey(partnerId));
-    if (blocked > 0) {
+    const [offDuty, activeJob] = await redis.mget(
+      offDutyKey(partnerId),
+      activeJobKey(partnerId),
+    );
+    if (offDuty != null) {
       /// TEMP DIAGNOSTIC — remove once "no job alert" is resolved.
-      logger.info(`[presence-debug] upsertOnline BLOCKED partner ${partnerId}: offduty/active flag set (exists=${blocked})`);
+      logger.info(`[presence-debug] upsertOnline BLOCKED partner ${partnerId}: off-duty flag set`);
+      return;
+    }
+    if (activeJob != null) {
+      /// BUSY partner: keep them OUT of the geo pool (no new offers while
+      /// mid-job) but keep the lastseen HEARTBEAT alive. Dropping their
+      /// pings entirely made a working partner look like a ghost — accept
+      /// deletes lastseen (removeOnline) and nothing refreshed it, so the
+      /// duty reconciler's "on duty but no live presence" sweep flipped
+      /// partners to off_duty WHILE THEY WERE ON A JOB (the bulk
+      /// onDutyChangedAt flips seen in the partners table).
+      await redis.set(lastSeenKey(partnerId), Date.now(), 'EX', STICKY_ONLINE_TTL_S);
       return;
     }
     await redis
