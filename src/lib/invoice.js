@@ -25,6 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const PDFDocument = require('pdfkit');
 const env = require('../config/env');
+const { splitByPct } = require('../utils/split');
 
 /// Blue Dhoond wordmark for the invoice header (760px wide, ~52 KB).
 /// Regenerate from dhoond-customer/src/assets/Images/Blue-Logo.png if the
@@ -43,10 +44,6 @@ const PARTNER_GST_RATE = 0.05;   // 5%  on service charges
 const SAC_SERVICE  = '998539';   // Home / cleaning services
 const SAC_PLATFORM = '999799';   // Convenience & platform fee
 
-// ── Math helpers ──────────────────────────────────────────────────────────
-
-const r2 = (n) => Math.round(n * 100) / 100;
-
 /**
  * Derive the full breakdown from the booking's grandTotal.
  * All amounts are in whole rupees (Int), matching Prisma storage.
@@ -58,22 +55,30 @@ const r2 = (n) => Math.round(n * 100) / 100;
  * regardless of the split.
  */
 const breakdown = (booking) => {
+  /// Deliberately the SAME integer
+  /// math as payments/earnings.service.js `computeBreakdown`. These two used
+  /// to differ — the invoice multiplied floats and rounded to 2 decimals
+  /// while the ledger split integers — so a printed invoice could disagree
+  /// with the amount actually credited. The client raised exactly that.
   const total = booking.grandTotal || booking.total || 0;
   const pct = Number(booking.partnerCommissionPct);
-  const partnerShare = Number.isFinite(pct) && pct > 0 && pct < 100 ? pct / 100 : PARTNER_SHARE;
-  const dhoondShare = 1 - partnerShare;
+  const partnerPct = Number.isFinite(pct) && pct > 0 && pct < 100 ? pct : PARTNER_SHARE * 100;
 
-  const partnerGross   = r2(total * partnerShare);
-  const partnerCGST    = r2(partnerGross * (PARTNER_GST_RATE / 2));  // 2.5%
-  const partnerSGST    = partnerCGST;
-  const partnerGST     = r2(partnerCGST + partnerSGST);              // 5%
-  const partnerNet     = r2(partnerGross - partnerGST);              // credited to partner
+  /// [share, remainder] — always sums back to `total`, so the two halves of
+  /// the invoice pair can never leave a stray paisa unaccounted for.
+  const [partnerGross, dhoondGross] = splitByPct(total, partnerPct);
 
-  const dhoondGross    = r2(total * dhoondShare);
-  const dhoondCGST     = r2(dhoondGross * (DHOOND_GST_RATE / 2));   // 9%
-  const dhoondSGST     = dhoondCGST;
-  const dhoondGST      = r2(dhoondCGST + dhoondSGST);               // 18%
-  const dhoondNet      = r2(dhoondGross - dhoondGST);               // Dhoond after tax
+  const partnerGST     = Math.round(partnerGross * PARTNER_GST_RATE);  // 5%
+  /// CGST/SGST are the halves the tax invoice prints separately; derive SGST
+  /// as the remainder so CGST + SGST === the 5% total on odd amounts.
+  const partnerCGST    = Math.floor(partnerGST / 2);
+  const partnerSGST    = partnerGST - partnerCGST;
+  const partnerNet     = partnerGross - partnerGST;                    // credited
+
+  const dhoondGST      = Math.round(dhoondGross * DHOOND_GST_RATE);    // 18%
+  const dhoondCGST     = Math.floor(dhoondGST / 2);
+  const dhoondSGST     = dhoondGST - dhoondCGST;
+  const dhoondNet      = dhoondGross - dhoondGST;                      // after tax
 
   return {
     total,
@@ -84,8 +89,8 @@ const breakdown = (booking) => {
 
 // ── Misc helpers ──────────────────────────────────────────────────────────
 
-const fmtRs = (n) => `Rs. ${Number(n ?? 0).toFixed(2)}`;
-const fmtRsInt = (n) => `Rs. ${Number(n ?? 0)}`;
+const fmtRs = (n) => `Rs. ${Number(n).toFixed(2)}`;
+const fmtRsInt = (n) => `Rs. ${n}`;
 
 const invoiceNumber = (booking) => booking.bookingRef ?? `DHND-${booking.id}`;
 
@@ -127,7 +132,7 @@ const intToWords = (n) => {
 };
 
 const amountInWords = (n) => {
-  const [int, dec] = Number(n ?? 0).toFixed(2).replace(/\.?0+$/, '').split('.');
+  const [int, dec] = Number(n).toFixed(2).replace(/\.?0+$/, '').split('.');
   let words = intToWords(Number(int));
   if (dec) words += ` point ${[...dec].map((d) => ONES[Number(d)] || 'zero').join(' ')}`;
   return `(${words} only)`;
@@ -236,7 +241,7 @@ const renderDoc = (booking, spec) =>
     doc.end();
   });
 
-const fmtInr = (n) => `INR ${Number(n ?? 0).toFixed(2).replace(/\.00$/, '')}`;
+const fmtInr = (n) => `INR ${Number(n).toFixed(2).replace(/\.00$/, '')}`;
 
 /// Admin-configurable company / GST details (admin → Policy → Company),
 /// falling back to env when nothing was ever saved or the DB is down —

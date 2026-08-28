@@ -119,6 +119,10 @@ const adminListQuerySchema = z.object({
     excludeStatus: z.string().trim().max(80).optional(),
     /// Booking-type filter — Instant / Scheduled / Book-at-price (BYOP).
     bookingType: z.enum(['instant', 'scheduled', 'byop']).optional(),
+    /// Payment filter. The dashboard's "Recent bookings" uses
+    /// `paymentStatus=paid` so it shows real, money-backed activity
+    /// instead of abandoned checkout attempts.
+    paymentStatus: z.enum(['unpaid', 'pending', 'paid', 'failed', 'refunded']).optional(),
     page: z.coerce.number().int().min(1).optional(),
     pageSize: z.coerce.number().int().min(1).max(100).optional(),
   }),
@@ -238,6 +242,16 @@ const nearbyEtaQuerySchema = z.object({
   }),
 });
 
+/// Pre-checkout instant availability probe. `serviceIds` is a CSV so the
+/// cart can pass its line items in a plain GET.
+const instantAvailabilityQuerySchema = z.object({
+  query: z.object({
+    lat: z.coerce.number().min(-90).max(90),
+    lng: z.coerce.number().min(-180).max(180),
+    serviceIds: z.string().trim().min(1),
+  }),
+});
+
 const partnerStatusSchema = z.object({
   params: z.object({ id: z.coerce.number().int().positive() }),
   body: z.object({
@@ -318,4 +332,5 @@ module.exports = {
   partnerRemoveAddOnSchema,
   rateBookingSchema,
   nearbyEtaQuerySchema,
+  instantAvailabilityQuerySchema,
 };

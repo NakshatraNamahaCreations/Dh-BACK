@@ -6,18 +6,25 @@ const { z } = require('zod');
 /// validation error.
 const codeRegex = /^[a-zA-Z0-9_-]{3,30}$/;
 
-const couponBodySchema = z.object({
-  code: z.string().regex(codeRegex, 'Code must be 3-30 letters/digits'),
-  description: z.string().max(200).optional().nullable(),
-  discountType: z.enum(['PERCENT', 'FLAT']),
-  discountValue: z.coerce.number().int().min(1, 'Discount must be at least 1'),
-  minOrderValue: z.coerce.number().int().min(0).optional(),
-  maxDiscount: z.coerce.number().int().min(1).optional().nullable(),
-  validFrom: z.string().datetime().optional().nullable(),
-  validUntil: z.string().datetime().optional().nullable(),
-  usageLimit: z.coerce.number().int().min(1).optional().nullable(),
-  active: z.boolean().optional(),
-});
+const couponBodySchema = z
+  .object({
+    code: z.string().regex(codeRegex, 'Code must be 3-30 letters/digits'),
+    description: z.string().max(200).optional().nullable(),
+    discountType: z.enum(['PERCENT', 'FLAT']),
+    /// Dual-meaning field: a PERCENT coupon stores a percentage (1-100),
+    /// a FLAT coupon stores rupees.
+    discountValue: z.coerce.number().int().min(1, 'Discount must be at least 1'),
+    minOrderValue: z.coerce.number().int().min(0).optional(),
+    maxDiscount: z.coerce.number().int().min(1).optional().nullable(),
+    validFrom: z.string().datetime().optional().nullable(),
+    validUntil: z.string().datetime().optional().nullable(),
+    usageLimit: z.coerce.number().int().min(1).optional().nullable(),
+    active: z.boolean().optional(),
+  })
+  .refine((v) => v.discountType !== 'PERCENT' || v.discountValue <= 100, {
+    message: 'Percentage discount cannot exceed 100',
+    path: ['discountValue'],
+  });
 
 const idParam = z.object({
   params: z.object({ id: z.coerce.number().int().positive() }),

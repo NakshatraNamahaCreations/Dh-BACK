@@ -5,6 +5,7 @@ const couponsService = require('../coupons/coupons.service');
 const dispatcher = require('../dispatch/dispatcher');
 const dispatchQueue = require('../dispatch/queue');
 const dispatchRegistry = require('../dispatch/registry');
+const { areaFromAddress } = require('../../utils/area');
 const earningsService = require('../payments/earnings.service');
 const razorpayService = require('../payments/razorpay.service');
 const policyService = require('../policy/policy.service');
@@ -97,6 +98,109 @@ const findServiceAreaForAddress = async ({ city, pincode, cityId }) => {
     where: { cityAliases: { has: cityKey.toLowerCase() }, active: true },
     select: { id: true, city: true, pincodes: true, pincodeMode: true, categoryIds: true },
   });
+};
+
+/**
+ * INSTANT bookings only: refuse to create one when no partner who can
+ * actually do the job is online, nearby and free.
+ *
+ * Previously the booking was created regardless; the dispatcher then
+ * found nobody and parked it in `needs_admin_dispatch`, so the customer
+ * had accepted an "instant" job that nothing was going to pick up.
+ *
+ * Availability means all three of:
+ *   - ONLINE in the booking's own category (a free plumber is no use to
+ *     an AC job — this is why we use the category-aware pool rather than
+ *     the any-category ETA probe),
+ *   - within the WIDEST configured dispatch radius (the dispatcher
+ *     widens 3km → 5km → 7km, so anything it could eventually reach
+ *     counts as available),
+ *   - not already on an active job.
+ *
+ * FAILS OPEN, deliberately, in three cases: no coordinates on the
+ * address, Redis/registry unavailable, or any unexpected error. A
+ * presence-infrastructure blip must never take instant bookings offline
+ * platform-wide — the dispatcher's admin-dispatch fallback still catches
+ * those. We only block when we can positively confirm nobody is there.
+ */
+const checkInstantAvailability = async ({ services, lat, lng }) => {
+  const allow = { available: true };
+  if (lat == null || lng == null) return allow;
+  /// Registry down → we cannot distinguish "nobody online" from "cannot
+  /// tell", so we must not block.
+  if (!dispatchRegistry.enabled || !dispatchRegistry.enabled()) return allow;
+
+  let radiusKm = 7;
+  try {
+    const policy = require('../policy/policy.service');
+    const cfg = await policy.getDispatch();
+    const radii = (cfg?.radii ?? []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+    if (radii.length) radiusKm = Math.max(...radii);
+  } catch {
+    /// Fall back to the default widest radius.
+  }
+
+  const categoryIds = [...new Set(services.map((s) => s.categoryId).filter((c) => c != null))];
+  if (categoryIds.length === 0) return allow;
+
+  let freeTotal = 0;
+  for (const categoryId of categoryIds) {
+    let free = [];
+    try {
+      const nearby = await dispatchRegistry.findOnlineNearby({
+        categoryId,
+        lat: Number(lat),
+        lng: Number(lng),
+        radiusKm,
+      });
+      const ids = (nearby ?? []).map((c) => c.partnerId);
+      if (ids.length > 0) {
+        const busy = await dispatchRegistry.filterActivePartnerIds(ids);
+        free = ids.filter((id) => !busy.has(Number(id)));
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[instant-availability] probe failed, allowing: ${err.message}`);
+      return allow;
+    }
+    if (free.length === 0) {
+      return {
+        available: false,
+        categoryId,
+        serviceName: services.find((sv) => sv.categoryId === categoryId)?.name ?? null,
+        radiusKm,
+      };
+    }
+    freeTotal += free.length;
+  }
+  return { available: true, count: freeTotal, radiusKm };
+};
+
+/// Throwing wrapper used at booking-create time. Shares its decision with
+/// the pre-checkout probe below so the cart and the create call can never
+/// disagree about whether a job is takeable.
+const assertInstantPartnerAvailable = async ({ services, lat, lng }) => {
+  const r = await checkInstantAvailability({ services, lat, lng });
+  if (r.available) return;
+  throw ApiError.badRequest(
+    `No professional is available near you right now${r.serviceName ? ` for ${r.serviceName}` : ''}. ` +
+      'Please try a scheduled booking instead.',
+  );
+};
+
+/// Pre-checkout probe for the cart: same rule as the create-time guard,
+/// but returns a result instead of throwing so the UI can warn BEFORE the
+/// customer pays rather than failing them at the last step.
+exports.instantAvailability = async ({ serviceIds, lat, lng }) => {
+  const ids = (Array.isArray(serviceIds) ? serviceIds : [])
+    .map(Number)
+    .filter(Number.isFinite);
+  if (ids.length === 0) return { available: true };
+  const services = await prisma.service.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, name: true, categoryId: true },
+  });
+  return checkInstantAvailability({ services, lat, lng });
 };
 
 const assertServicesAllowedInArea = async ({ services, city, pincode, cityId }) => {
@@ -964,6 +1068,13 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
     cityId: bookingCityId,
   });
 
+  /// Instant = "someone comes now", so it's only honest to accept it when
+  /// someone actually can. Scheduled bookings skip this: a partner being
+  /// busy at checkout says nothing about a slot next Tuesday.
+  if (payload.isInstant) {
+    await assertInstantPartnerAvailable({ services, lat: bookingLat, lng: bookingLng });
+  }
+
   /// Surge pricing — the same rule engine the cart's price quote uses,
   /// applied at CREATE time so the surged price is what actually gets
   /// snapshotted and charged (previously surge only affected the BYOP
@@ -1575,32 +1686,6 @@ const ADMIN_INCLUDE = {
   },
 };
 
-/// Human-meaningful locality for the admin "Area" column. Address lines
-/// look like "868, 25th Main Rd, 1st Sector, HSR Layout, Bengaluru,
-/// Karnataka 560102, India" — the FIRST segment is the house number, so
-/// the column used to read "868" / "No 867" / "403". Instead: take the
-/// segment closest to (just before) the city, skipping pure house-number
-/// patterns and pincode/state/country noise; fall back to the city.
-const areaFromAddress = (line, city) => {
-  if (!line) return city ?? '';
-  const segs = line.split(',').map((x) => x.trim()).filter(Boolean);
-  const isNoise = (x) =>
-    /^india$/i.test(x) ||
-    /\d{6}/.test(x) ||
-    (city && x.toLowerCase() === String(city).toLowerCase());
-  const isHouseish = (x) =>
-    /^#?\s*(no\.?\s*)?\d+[\w\/-]*$/i.test(x) ||
-    /^(flat|house|door|plot|site|apt|apartment)\b/i.test(x);
-  let cityIdx = city
-    ? segs.findIndex((x) => x.toLowerCase() === String(city).toLowerCase())
-    : -1;
-  if (cityIdx === -1) cityIdx = segs.findIndex((x) => isNoise(x));
-  const candidates = (cityIdx > 0 ? segs.slice(0, cityIdx) : segs).filter(
-    (x) => !isNoise(x) && !isHouseish(x),
-  );
-  return candidates[candidates.length - 1] ?? city ?? segs[0] ?? '';
-};
-
 const adminShape = (b) => {
   const firstItem = b.items?.[0];
   const serviceName = firstItem?.serviceName ?? 'Service';
@@ -1749,6 +1834,7 @@ exports.adminList = async ({
   dispatchStatus,
   excludeStatus,
   bookingType,
+  paymentStatus,
   scope,
   page = 1,
   pageSize = 25,
@@ -1757,6 +1843,12 @@ exports.adminList = async ({
   const where = {};
   if (dispatchStatus) {
     where.dispatchStatus = String(dispatchStatus);
+  }
+  /// Payment filter — `paid` gives the money-backed rows only, which is
+  /// what the dashboard's "Recent bookings" wants: an abandoned checkout
+  /// that never took payment isn't "activity" worth surfacing there.
+  if (paymentStatus) {
+    where.paymentStatus = String(paymentStatus);
   }
   if (status && status !== 'all') {
     const statusUpper = String(status).toUpperCase();

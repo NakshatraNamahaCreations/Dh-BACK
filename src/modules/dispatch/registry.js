@@ -22,7 +22,10 @@ const logger = require('../../config/logger');
  *   2. Last-seen timestamp per partner
  *      Key: `partner:lastseen:{partnerId}`
  *      Type: string (epoch ms)
- *      TTL: 90s (PRESENCE_TTL_S) — auto-expires the partner if their
+ *      TTL: STICKY_ONLINE_TTL_S (4h). NOTE: PRESENCE_TTL_S (90s) is no
+ *           longer applied to this key — both write paths use the sticky
+ *           TTL so a backgrounded app doesn't drop out of dispatch. It
+ *           auto-expires the partner if their
  *      app stops pinging. We also use this to defensively skip stale
  *      partners during dispatch (in case the GEO entry outlived the
  *      lastseen TTL by a fraction of a second).

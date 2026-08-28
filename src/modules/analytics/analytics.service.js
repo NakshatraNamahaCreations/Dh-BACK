@@ -1,4 +1,5 @@
 const prisma = require('../../config/prisma');
+const { areaFromAddress } = require('../../utils/area');
 const { applyScopeToWhere, applyScopeToRelation } = require('../../middlewares/adminScope');
 
 // ── Scope helpers ────────────────────────────────────────────────────────────
@@ -35,6 +36,21 @@ const dateFromRange = (range = '7d') => {
 const fmtDay = (d) =>
   d.toLocaleDateString('en-IN', { weekday: 'short' });
 
+/// LOCAL calendar-date key (YYYY-MM-DD).
+///
+/// `toISOString().slice(0,10)` cannot be used here: it converts to UTC
+/// first, so IST local-midnight (00:00 +05:30) becomes 18:30 the PREVIOUS
+/// day and every bucket key landed one day early. Bookings were then keyed
+/// off raw UTC while buckets were keyed off shifted-local, so today's rows
+/// matched no bucket at all and the revenue trend sat flat at ₹0 on days
+/// that clearly had revenue.
+const localDayKey = (d) => {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
 // ── Dashboard summary ──────────────────────────────────────────────────────
 
 exports.summary = async (scope) => {
@@ -44,19 +60,26 @@ exports.summary = async (scope) => {
   const [todayBookings, yesterdayBookings, activePartners] = await Promise.all([
     prisma.booking.findMany({
       where: withCityScope({ createdAt: { gte: todayStart } }, scope),
-      select: { total: true, status: true },
+      select: { total: true, grandTotal: true, status: true },
     }),
     prisma.booking.findMany({
       where: withCityScope({ createdAt: { gte: yesterdayStart, lt: todayStart } }, scope),
-      select: { total: true },
+      select: { total: true, grandTotal: true },
     }),
     prisma.partner.count({ where: withCityScope({ isActive: true }, scope) }),
   ]);
 
+  /// Revenue = what the CUSTOMER PAID (`grandTotal`, GST included) so the
+  /// dashboard reconciles with the amounts on Booking history / Booking
+  /// report. It previously summed `total` (pre-GST), which made the card
+  /// read ₹60 against ₹71 of bookings for the same day with no explanation.
+  /// `grandTotal` falls back to `total` for legacy rows written before the
+  /// column existed.
+  const paid = (b) => b.grandTotal || b.total || 0;
   const todayRevenue = todayBookings
     .filter((b) => b.status !== 'CANCELLED')
-    .reduce((s, b) => s + b.total, 0);
-  const yesterdayRevenue = yesterdayBookings.reduce((s, b) => s + b.total, 0);
+    .reduce((s, b) => s + paid(b), 0);
+  const yesterdayRevenue = yesterdayBookings.reduce((s, b) => s + paid(b), 0);
   const todayJobs = todayBookings.filter((b) => b.status !== 'CANCELLED').length;
   const yesterdayJobs = yesterdayBookings.length;
 
@@ -89,25 +112,62 @@ exports.revenueSeries = async ({ range = '7d' } = {}, scope) => {
 
   const bookings = await prisma.booking.findMany({
     where: withCityScope({ createdAt: { gte: from }, status: { not: 'CANCELLED' } }, scope),
-    select: { total: true, createdAt: true },
+    select: { total: true, grandTotal: true, createdAt: true },
   });
 
-  // Group by ISO date.
+  /// Group by ISO date, over a window that ENDS TODAY.
+  /// `dateFromRange` starts at (today − days), so building `days` buckets
+  /// from it ended at YESTERDAY — today's bookings hashed to a key with no
+  /// bucket and were silently dropped, leaving the trend flat at ₹0 even on
+  /// a day with revenue. Anchor on today and walk backwards instead.
   const buckets = new Map();
+  const seriesStart = new Date();
+  seriesStart.setHours(0, 0, 0, 0);
+  seriesStart.setDate(seriesStart.getDate() - (days - 1));
   for (let i = 0; i < days; i++) {
-    const d = new Date(from); d.setDate(d.getDate() + i);
-    const key = d.toISOString().slice(0, 10);
+    const d = new Date(seriesStart); d.setDate(d.getDate() + i);
+    const key = localDayKey(d);
     buckets.set(key, { day: fmtDay(d), revenue: 0, jobs: 0 });
   }
   for (const b of bookings) {
-    const key = b.createdAt.toISOString().slice(0, 10);
+    const key = localDayKey(b.createdAt);
     const bucket = buckets.get(key);
     if (bucket) {
-      bucket.revenue += b.total;
+      /// Same basis as the summary card — customer-paid, GST included.
+      bucket.revenue += b.grandTotal || b.total || 0;
       bucket.jobs += 1;
     }
   }
   return Array.from(buckets.values());
+};
+
+/**
+ * Split what a booking ACTUALLY earned across its line items.
+ *
+ * Category revenue used to sum `basePrice * qty` — the sticker value. That
+ * ignores discounts and coupons entirely, so a ₹569 job bought with a ₹566
+ * coupon reported ₹569 of revenue when ₹3 was collected.
+ *
+ * Each line gets a share of the real amount in proportion to its sticker
+ * value, and the LAST line takes the remainder, so the per-category numbers
+ * always add back up to the booking total instead of drifting by a rupee.
+ *
+ * `amount` is whatever the caller counts as earned — the paid grand total
+ * for revenue, zero for a booking nobody has paid for yet.
+ */
+const allocateAcrossItems = (items, amount) => {
+  const sticker = items.reduce((sum, it) => sum + it.basePrice * it.qty, 0);
+  let allocated = 0;
+  return items.map((it, idx) => {
+    const share =
+      idx === items.length - 1
+        ? amount - allocated
+        : sticker > 0
+          ? Math.round((amount * it.basePrice * it.qty) / sticker)
+          : 0;
+    allocated += share;
+    return share;
+  });
 };
 
 // ── Booking analytics ──────────────────────────────────────────────────────
@@ -116,7 +176,15 @@ exports.bookingAnalytics = async ({ range = '7d' } = {}, scope) => {
   const { from } = dateFromRange(range);
 
   const bookings = await prisma.booking.findMany({
-    where: withCityScope({ createdAt: { gte: from } }, scope),
+    /// Exclude abandoned attempts — CANCELLED and never paid (`paidAt`
+    /// null): checkout bailed, payment failed, or dispatch found nobody.
+    /// No money moved and no work happened, so counting them skewed the
+    /// funnel (8 of 11 "requested"), the peak-hour curve, and category
+    /// revenue. A PAID-then-cancelled booking is real and stays.
+    where: withCityScope(
+      { createdAt: { gte: from }, NOT: { status: 'CANCELLED', paidAt: null } },
+      scope,
+    ),
     include: {
       items: {
         include: { service: { include: { category: { select: { id: true, name: true } } } } },
@@ -141,7 +209,10 @@ exports.bookingAnalytics = async ({ range = '7d' } = {}, scope) => {
     /// back to the legacy snapshot columns for pre-refactor rows.
     const line = b.customerAddress?.addressLine ?? b.addressLine ?? '';
     const city = b.customerAddress?.city ?? b.city ?? '';
-    const area = line.split(',')[0]?.trim() || city || 'Unknown';
+    /// Shared with the admin Booking History column. `split(',')[0]` here
+    /// returned the HOUSE NUMBER, so this chart plotted areas like "1002"
+    /// and "393" instead of localities.
+    const area = areaFromAddress(line, city) || city || 'Unknown';
     byAreaMap.set(area, (byAreaMap.get(area) ?? 0) + 1);
   }
   const maxAreaJobs = Math.max(...byAreaMap.values(), 1);
@@ -153,13 +224,16 @@ exports.bookingAnalytics = async ({ range = '7d' } = {}, scope) => {
   // By category.
   const byCatMap = new Map();
   for (const b of bookings) {
-    for (const it of b.items) {
+    /// Revenue is money COLLECTED, not the price on the label. A booking
+    /// that hasn't been paid for contributes jobs but no revenue.
+    const shares = allocateAcrossItems(b.items, b.paidAt ? b.grandTotal : 0);
+    b.items.forEach((it, idx) => {
       const cat = it.service?.category?.name ?? 'Other';
       const e = byCatMap.get(cat) ?? { jobs: 0, revenue: 0 };
       e.jobs += 1;
-      e.revenue += it.basePrice * it.qty;
+      e.revenue += shares[idx];
       byCatMap.set(cat, e);
-    }
+    });
   }
   const byCategory = Array.from(byCatMap.entries())
     .map(([category, v]) => ({ category, jobs: v.jobs, revenue: v.revenue }))
@@ -205,24 +279,30 @@ exports.revenueReport = async ({ range = '30d' } = {}, scope) => {
   const completed = bookings.filter((b) => b.status === 'COMPLETED');
   const cancelled = bookings.filter((b) => b.status === 'CANCELLED');
 
-  const gmv = completed.reduce((s, b) => s + b.total, 0);
+  /// `grandTotal` is what the customer paid; `total` is the pre-tax base,
+  /// which reads lower than every figure on the booking.
+  const gmv = completed.reduce((s, b) => s + b.grandTotal, 0);
   // Default 20% commission across the board until Setting-driven.
   const commission = Math.round(gmv * 0.2);
   const payout = gmv - commission;
-  const refunds = cancelled.reduce((s, b) => s + b.total, 0);
+  const refunds = cancelled.reduce((s, b) => s + b.grandTotal, 0);
 
   // By category.
   const byCatMap = new Map();
   for (const b of completed) {
-    for (const it of b.items) {
+    /// Same rule as the booking analytics: split what the customer actually
+    /// paid, not the sticker price, so a discounted job doesn't inflate its
+    /// category.
+    const shares = allocateAcrossItems(b.items, b.grandTotal);
+    b.items.forEach((it, idx) => {
       const cat = it.service?.category?.name ?? 'Other';
       const e = byCatMap.get(cat) ?? { gmv: 0, commission: 0, payout: 0 };
-      const lineGmv = it.basePrice * it.qty;
+      const lineGmv = shares[idx];
       e.gmv += lineGmv;
       e.commission += Math.round(lineGmv * 0.2);
       e.payout += lineGmv - Math.round(lineGmv * 0.2);
       byCatMap.set(cat, e);
-    }
+    });
   }
   const byCategory = Array.from(byCatMap.entries())
     .map(([category, v]) => ({ category, ...v }))
@@ -271,6 +351,15 @@ const parseDate = (v) => {
 
 exports.bookingReport = async (query = {}, scope) => {
   const { stateId, cityId, customerId, partnerId, status } = query;
+  /// Abandoned attempts = CANCELLED and never paid (`paidAt` null): the
+  /// customer bailed at checkout, payment failed, or dispatch found no
+  /// partner and the row auto-cancelled. No money ever moved, so counting
+  /// them as bookings — and worse, as REFUNDS — overstates both volume and
+  /// money returned. Hidden by default; `includeAbandoned=true` brings them
+  /// back for anyone auditing failed attempts.
+  /// A cancelled booking that WAS paid is real business (a genuine refund)
+  /// and always stays in the report.
+  const includeAbandoned = String(query.includeAbandoned ?? '') === 'true';
 
   // Date window — explicit from/to wins; otherwise fall back to `range`.
   const from = parseDate(query.from);
@@ -291,6 +380,11 @@ exports.bookingReport = async (query = {}, scope) => {
   if (customerId) where.customerId = Number(customerId);
   if (partnerId) where.partnerId = Number(partnerId);
   if (status) where.status = status;
+  if (!includeAbandoned) {
+    /// NOT(status = CANCELLED AND paidAt = null) — keeps every non-cancelled
+    /// row and every paid-then-cancelled (refunded) row.
+    where.NOT = [...(where.NOT ?? []), { status: 'CANCELLED', paidAt: null }];
+  }
 
   if (cityId) {
     where.cityId = Number(cityId);
@@ -313,7 +407,21 @@ exports.bookingReport = async (query = {}, scope) => {
       /// `cityRef` is the City relation (cityId FK). The scalar `city`
       /// column is the legacy free-text snapshot, used as fallback.
       cityRef: { select: { id: true, name: true, state: { select: { id: true, name: true } } } },
-      earning: { select: { earnedAmount: true, commissionPct: true } },
+      /// The FULL settlement split as persisted at completion time —
+      /// the same numbers the invoice prints and the payout credits, so the
+      /// report can never drift from what the partner was actually paid.
+      earning: {
+        select: {
+          bookingAmount: true,
+          commissionPct: true,
+          earnedAmount: true,   // partner GROSS (e.g. 399.20 of ₹499)
+          partnerGst: true,     // 5% inside the partner slice (19.96)
+          netAmount: true,      // credited to partner (379.24)
+          dhoondCommission: true, // Dhoond GROSS (99.80)
+          dhoondGst: true,      // 18% inside Dhoond's slice (17.96)
+          dhoondNet: true,      // Dhoond after tax (81.84)
+        },
+      },
       items: { include: { service: { select: { name: true, category: { select: { name: true } } } } } },
     },
   });
@@ -328,6 +436,17 @@ exports.bookingReport = async (query = {}, scope) => {
     const platformFee = b.platformFee ?? 0;
     const gst = b.gstAmount ?? 0;
     const dhoondEarn = commission + platformFee;
+    /// Client settlement sheet, per booking. Base is the POST-DISCOUNT
+    /// amount the customer actually paid — splitting the sticker price
+    /// would credit a partner more than was collected.
+    const e = b.earning;
+    const discount = b.discount ?? 0;
+    const partnerGross = e?.earnedAmount ?? 0;
+    const partnerGst = e?.partnerGst ?? 0;
+    const partnerNet = e?.netAmount ?? 0;
+    const dhoondGross = e?.dhoondCommission ?? 0;
+    const dhoondGstAmt = e?.dhoondGst ?? 0;
+    const dhoondNet = e?.dhoondNet ?? 0;
     const services = b.items.map((it) => it.service?.name).filter(Boolean).join(', ');
     const category = b.items[0]?.service?.category?.name ?? '—';
 
@@ -352,7 +471,21 @@ exports.bookingReport = async (query = {}, scope) => {
       category,
       services,
       // Money (whole rupees)
+      /// Sticker minus what the coupon took off — shown so a discounted
+      /// booking's smaller split is explainable rather than looking wrong.
+      subtotal: b.subtotal ?? 0,
+      discount,
       jobAmount: b.total,
+      /// Settlement split, exactly as persisted (client formula):
+      ///   base × partnerPct  → gross, less 5% GST  → credited to partner
+      ///   base × dhoondPct   → gross, less 18% GST → Dhoond after tax
+      partnerGross: isCancelled ? 0 : partnerGross,
+      partnerGst: isCancelled ? 0 : partnerGst,
+      partnerNet: isCancelled ? 0 : partnerNet,
+      dhoondGross: isCancelled ? 0 : dhoondGross,
+      dhoondGst: isCancelled ? 0 : dhoondGstAmt,
+      dhoondNet: isCancelled ? 0 : dhoondNet,
+      commissionPct: b.earning?.commissionPct ?? null,
       partnerEarning: isCancelled ? 0 : partnerEarn,
       commission: isCancelled ? 0 : commission,
       platformFee: isCancelled ? 0 : platformFee,
@@ -376,6 +509,14 @@ exports.bookingReport = async (query = {}, scope) => {
       t.gst += r.gst;
       t.dhoondEarning += r.dhoondEarning;
       t.grandTotal += r.grandTotal;
+      t.subtotal += r.subtotal;
+      t.discount += r.discount;
+      t.partnerGross += r.partnerGross;
+      t.partnerGstAmt += r.partnerGst;
+      t.partnerNet += r.partnerNet;
+      t.dhoondGross += r.dhoondGross;
+      t.dhoondGstAmt += r.dhoondGst;
+      t.dhoondNet += r.dhoondNet;
       t.refund += r.refund;
       return t;
     },
@@ -383,9 +524,16 @@ exports.bookingReport = async (query = {}, scope) => {
       bookings: 0, completed: 0, cancelled: 0,
       jobAmount: 0, partnerEarning: 0, commission: 0,
       platformFee: 0, gst: 0, dhoondEarning: 0, grandTotal: 0, refund: 0,
+      subtotal: 0, discount: 0,
+      partnerGross: 0, partnerGstAmt: 0, partnerNet: 0,
+      dhoondGross: 0, dhoondGstAmt: 0, dhoondNet: 0,
     },
   );
-  totals.takeRate = totals.jobAmount > 0 ? totals.dhoondEarning / totals.jobAmount : 0;
+  /// Take rate against CUSTOMER-PAID (grand total), not the pre-GST base.
+  /// The card now leads with customer-paid, so dividing by the GST-stripped
+  /// base made the percentage look unrelated to the numbers on screen
+  /// (₹4 ÷ ₹63 = 6.3% while the card showed ₹74).
+  totals.takeRate = totals.grandTotal > 0 ? totals.dhoondEarning / totals.grandTotal : 0;
 
   return { rows, totals };
 };

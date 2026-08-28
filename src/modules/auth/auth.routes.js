@@ -16,6 +16,12 @@ const router = express.Router();
 const otpSendLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  /// The Play-review / internal test account must never be rate-limited:
+  /// app reviewers (and our own device testing) log in with it repeatedly
+  /// in short bursts, and a 429 here reads as "login is broken". It's a
+  /// non-routable test number whose OTP is the fixed dev code, so the
+  /// limiter adds no protection for it anyway.
+  skip: (req) => req.body?.phone === '+919999900000',
   keyGenerator: (req) => req.body?.phone || req.ip,
   standardHeaders: true,
   legacyHeaders: false,

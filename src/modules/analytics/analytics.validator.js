@@ -27,6 +27,9 @@ const bookingReportQuerySchema = z.object({
     status: z
       .enum(['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'])
       .optional(),
+    /// 'true' re-includes never-paid cancelled bookings (abandoned
+    /// checkout attempts), which the report hides by default.
+    includeAbandoned: z.enum(['true', 'false']).optional(),
   }),
 });
 

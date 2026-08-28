@@ -336,9 +336,24 @@ exports.setDuty = async ({ partnerId, onDuty, lat, lng }) => {
     });
   }
 
-  /// Mirror the explicit toggle to the queryable DB column. This is the
-  /// authoritative duty action, so reflect it right away (change-gated
-  /// inside mirrorOnDuty). Fire-and-forget — never block the toggle.
+  /// Mirror the explicit toggle to the queryable DB column.
+  ///
+  /// Bust the change-cache FIRST. `mirrorOnDuty` is gated by
+  /// `shouldMirrorDuty`, which skips the DB write when the cached value
+  /// already matches — right for a 15s presence ping, WRONG for an explicit
+  /// toggle. If the DB and the cache ever disagree (the reconciler flipped
+  /// the row off while its `clearDutyMirror` failed, Redis blipped during
+  /// the flip, or the key outlived the row's value), the gate reads "no
+  /// change" and silently drops the write on EVERY subsequent toggle. The
+  /// partner then sees "On Duty" in the app and a 200 from this endpoint
+  /// while the row stays `off_duty` forever — invisible to dispatch and to
+  /// the admin Available list, with no error anywhere.
+  ///
+  /// Clearing first makes the next `shouldMirrorDuty` a guaranteed
+  /// transition, so the explicit action always writes through. When Redis
+  /// is down both calls fail open and the write happens anyway.
+  await registry.clearDutyMirror(Number(partnerId)).catch(() => {});
+  /// Fire-and-forget — never block the toggle on the mirror write.
   void exports.mirrorOnDuty({ partnerId: Number(partnerId), onDuty: Boolean(onDuty) });
 
   return { partnerId: Number(partnerId), onDuty: Boolean(onDuty) };

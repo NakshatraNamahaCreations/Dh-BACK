@@ -1,4 +1,5 @@
 const prisma = require('../../config/prisma');
+const { splitByPct } = require('../../utils/split');
 const ApiError = require('../../utils/ApiError');
 const commissionsService = require('./commissions.service');
 
@@ -50,12 +51,11 @@ const resolveCategoryId = (booking) => {
 ///   dhoond 18% GST = dhoond gross × 18%               (e.g. 18% of ₹99 = ₹17.96)
 ///   dhoond net     = dhoond gross − dhoond GST        (e.g. ₹99 − ₹18 = ₹81)
 const computeBreakdown = (bookingAmount, partnerPct) => {
-  const amt  = Number(bookingAmount);  // must be grandTotal (customer-facing)
-  const pPct = Number(partnerPct);
-  const dPct = 100 - pPct;
-
-  const earnedAmount     = Math.floor(amt * pPct / 100);
-  const dhoondCommission = Math.floor(amt * dPct / 100);
+  /// `splitByPct` returns [share, remainder] so the two ALWAYS sum back to
+  /// the input. Flooring both sides independently dropped the odd unit —
+  /// that bug paid neither party on a ₹1 booking, and lost a rupee even on
+  /// the ₹499 example (399 + 99 = 498).
+  const [earnedAmount, dhoondCommission] = splitByPct(bookingAmount, partnerPct);
 
   // Math.round so 19.95 → 20 (matches the 5% of 399.2 = 19.96 design)
   const partnerGst = Math.round(earnedAmount * 5  / 100);
@@ -109,7 +109,11 @@ exports.creditForBooking = async (bookingId) => {
     create: {
       partnerId:        booking.partnerId,
       bookingId:        booking.id,
-      bookingAmount:    booking.total,
+      /// The amount the split was actually computed on (grandTotal +
+      /// paid add-ons). Previously stored `booking.total` — the pre-GST
+      /// figure — so a ₹50 booking recorded a ₹42 base while its 80/20
+      /// split was taken on ₹50. Same value now, so the row is auditable.
+      bookingAmount:    base,
       commissionPct:    partnerPct,
       earnedAmount:     bd.earnedAmount,     // partner gross (before 5% GST)
       dhoondCommission: bd.dhoondCommission,

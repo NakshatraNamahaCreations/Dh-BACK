@@ -809,7 +809,7 @@ exports.setOnboardingFee = async (id, { amount, note }) => {
     partnerId,
     type: 'onboarding',
     title: 'Onboarding fee set',
-    body: `Admin has set your onboarding fee at ₹${Math.round(amount)}. Open the app to pay and proceed.`,
+    body: `Admin has set your onboarding fee at ₹${amount}. Open the app to pay and proceed.`,
   });
   return exports.get(partnerId);
 };

@@ -39,6 +39,21 @@ exports.availability = asyncHandler(async (req, res) => {
   success(res, result, 'Partner availability fetched');
 });
 
+/// Can an INSTANT booking be taken right now for these services at this
+/// address? Same rule the create-time guard enforces, so the cart can warn
+/// before the customer pays instead of failing at the last step.
+exports.instantAvailability = asyncHandler(async (req, res) => {
+  const result = await service.instantAvailability({
+    serviceIds: String(req.query.serviceIds ?? '')
+      .split(',')
+      .map((x) => x.trim())
+      .filter(Boolean),
+    lat: req.query.lat,
+    lng: req.query.lng,
+  });
+  success(res, result, 'Instant availability checked');
+});
+
 exports.nearbyEta = asyncHandler(async (req, res) => {
   const result = await service.nearbyEta({
     lat: req.query.lat,

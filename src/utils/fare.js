@@ -41,7 +41,22 @@ exports.computeFare = ({ subtotal, discount = 0, offeredPrice = null } = {}) => 
 
   /// Reverse-derive the partner-facing taxable base from `grandTotal`.
   const total = Math.round(grandTotal / TAX_DIVISOR);
-  const gstAmount = Math.round((total * GST_PCT) / 100);
+  /// GST is 18% of the base, EXCEPT where rounding would make the parts
+  /// exceed the whole. On small amounts `Math.round` nudges the base up:
+  /// ₹3 gave total=round(2.54)=3 and gst=1, i.e. 3+1=4 against a ₹3
+  /// grandTotal. The platform-fee balancer below is clamped at 0, so it
+  /// could not absorb that negative and the invariant
+  /// `total + gst + fee === grandTotal` broke silently — reports then
+  /// showed GMV ₹63 + GST ₹12 against ₹74 actually collected.
+  ///
+  /// Clamping GST to the remaining amount fixes exactly that case and
+  /// leaves every already-correct split untouched (₹50 stays 42/8/0,
+  /// ₹20 stays 17/3/0) — unlike flooring the base, which would shift
+  /// those and under-report GST.
+  const gstAmount = Math.min(
+    Math.round((total * GST_PCT) / 100),
+    Math.max(0, grandTotal - total),
+  );
   /// Balance the rounding remainder onto platform fee so the three
   /// rupee values reconcile back to `grandTotal` exactly. Without
   /// this you can show "₹417 + ₹75 + ₹8 = ₹500" or off by a rupee

@@ -24,6 +24,7 @@ const {
   partnerCancelSchema,
   rateBookingSchema,
   nearbyEtaQuerySchema,
+  instantAvailabilityQuerySchema,
 } = require('./bookings.validator');
 const controller = require('./bookings.controller');
 
@@ -68,6 +69,7 @@ router.get('/me', customerOnly, validate(listMineQuerySchema), controller.listMi
 /// Home arrival-promise ETA. MUST be registered before `/:id` so the
 /// literal path isn't captured as a booking id. Takes lat/lng query params.
 router.get('/nearby-eta', customerOnly, validate(nearbyEtaQuerySchema), controller.nearbyEta);
+router.get('/instant-availability', customerOnly, validate(instantAvailabilityQuerySchema), controller.instantAvailability);
 router.get('/:id', customerOnly, validate(idParam), controller.getOwn);
 router.get('/:id/availability', customerOnly, validate(idParam), controller.availability);
 router.get('/:id/cancellation-quote', customerOnly, validate(idParam), controller.cancellationQuote);

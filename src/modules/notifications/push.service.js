@@ -200,10 +200,13 @@ const sendFcmDataMessage = async (token, data, notification = null) => {
  * and falls back to the legacy Expo push when only `expoPushToken` is set.
  *
  * @param {object} prisma
- * @param {number[]} partnerIds  - offline partners only (see dispatcher)
+ * @param {number[]} partnerIds  - EVERY eligible candidate, not just the
+ *   ones without a socket: a mobile socket can read as "connected" on the
+ *   server after Android has already suspended the app, so socket-only
+ *   delivery looks successful while producing no alert on the phone.
  * @param {{ bookingId: number, serviceName: string, amount: number, dispatchWave?: number, address?: string }} jobInfo
  */
-const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, amount, dispatchWave, address }) => {
+const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, amount, dispatchWave, address }, distanceByPartner = {}) => {
   if (!partnerIds || partnerIds.length === 0) return;
   try {
     const partners = await prisma.partner.findMany({
@@ -218,11 +221,26 @@ const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, 
             /// `address` rides along so the in-app job card renders the
             /// service address instantly from the push stub instead of
             /// waiting ~3-5s on the refreshIncoming HTTP fetch.
-            { type: 'job_request', bookingId, serviceName, amount, dispatchWave, address },
-            /// Hybrid form — reaches frozen/killed devices. Foreground
-            /// app instances ignore job-request FCM echoes and use the
-            /// socket-driven in-app popup instead.
-            { title: 'New job request!', body: `${serviceName} · ₹${amount} near you` },
+            ///
+            /// DATA-ONLY, deliberately no notification block: the OS used
+            /// to render its own banner the instant the push arrived,
+            /// BEFORE the app could pick its surface — so partners saw a
+            /// banner flash AND the overlay card / full-screen alert for
+            /// the same job. The app now owns the choice entirely: the
+            /// Rapido-style overlay card (screen on + unlocked), or the
+            /// notifee full-screen takeover (locked / no overlay grant),
+            /// each with its own sound + vibration. Any state where the
+            /// data handler can't run (force-stopped app) also blocks
+            /// notification-payload rendering, so the hybrid form added
+            /// no real reach — only the double alert.
+            {
+              type: 'job_request', bookingId, serviceName, amount, dispatchWave, address,
+              /// This partner's own distance to the job, when the dispatcher
+              /// computed one — drives the "6 min (2.0 km)" line on the card.
+              ...(Number.isFinite(Number(distanceByPartner[p.id]))
+                ? { distanceKm: Number(distanceByPartner[p.id]).toFixed(2) }
+                : {}),
+            },
           );
           /// Device is GONE (uninstalled / token dead) — force this partner
           /// off duty so dispatch stops wasting a broadcast slot on them and

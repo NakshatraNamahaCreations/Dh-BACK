@@ -529,6 +529,10 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       prisma,
       candidates.map((c) => c.partnerId),
       { bookingId: booking.id, serviceName, amount, dispatchWave: waveSpec.wave, address },
+      /// Per-partner distance (km) so the offer card can show "6 min
+      /// (2.0 km)" like a ride-hailing card — each partner gets their OWN
+      /// number, not a shared one.
+      Object.fromEntries(candidates.map((c) => [c.partnerId, c.distanceKm])),
     );
   }
 
@@ -610,6 +614,17 @@ const reconcileStaleOnDuty = async () => {
   ).catch(() => []);
   if (partners.length === 0) return;
 
+  /// Redis IS the only source of presence truth here. When it's
+  /// unavailable `filterOnlinePartnerIds` returns an EMPTY set, which this
+  /// reconciler would read as "nobody is live" and use to flip EVERY on-duty
+  /// partner to off_duty — knocking the whole fleet out of dispatch over a
+  /// blip, with no way back until each partner re-toggles duty by hand.
+  /// A destructive sweep must not run on absent data: skip the pass and let
+  /// the next one (60s later) do the work once Redis is back.
+  if (!registry.enabled()) {
+    logger.warn('[reconcile] registry unavailable — skipping duty reconcile this pass');
+    return;
+  }
   const live = await registry.filterOnlinePartnerIds(partners.map((p) => p.id));
 
   /// STALE-BUSY reconcile. A partner stuck at dutyState='busy' whose job

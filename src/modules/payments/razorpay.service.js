@@ -243,6 +243,7 @@ exports.createOrder = async ({ bookingId, customerId }) => {
   const payable = booking.grandTotal && booking.grandTotal > 0
     ? booking.grandTotal
     : (booking.offeredPrice ?? booking.total);
+  /// Money columns are whole RUPEES; Razorpay wants paise.
   const amountPaise = payable * 100;
 
   /// Reuse the most recent pending Razorpay payment if any — the
@@ -581,6 +582,7 @@ exports.createAddOnOrder = async ({ bookingId, customerId }) => {
   });
   if (!due.length) throw ApiError.badRequest('No unpaid add-ons on this booking');
   const payable = due.reduce((s, a) => s + a.price * a.qty, 0);
+  /// Money columns are whole RUPEES; Razorpay wants paise.
   const amountPaise = payable * 100;
 
   /// Retire any older pending add-on order — the line-set or amount may
@@ -828,7 +830,7 @@ exports.refundForBooking = async ({ bookingId, reason, refundAmount = null } = {
     return { paymentId: payment.id, razorpayRefundId: null, amount: 0, status: 'no_refund' };
   }
 
-  /// Razorpay refund API expects amount in paise.
+  /// Razorpay refund API expects amount in paise; we store rupees.
   const amountPaise = resolvedRefund * 100;
   const refundResp = await client().payments.refund(payment.providerPaymentId, {
     amount: amountPaise,
@@ -908,6 +910,7 @@ exports.createOnboardingOrder = async ({ partnerId }) => {
     throw ApiError.badRequest('Onboarding fee is already paid.');
   }
 
+  /// Already paise — see note above.
   const amountPaise = partner.onboardingFeeAmount * 100;
 
   /// Reuse the pending order if the partner re-opens the screen — a
