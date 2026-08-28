@@ -398,33 +398,17 @@ exports.bookingReport = async (query = {}, scope) => {
     where.cityId = { in: ids.length ? ids : [-1] };
   }
 
-  const bookings = await prisma.booking.findMany({
-    where,
-    orderBy: { createdAt: 'desc' },
-    include: {
-      customer: { select: { id: true, name: true, phone: true } },
-      partner: { select: { id: true, name: true, businessName: true, phone: true } },
-      /// `cityRef` is the City relation (cityId FK). The scalar `city`
-      /// column is the legacy free-text snapshot, used as fallback.
-      cityRef: { select: { id: true, name: true, state: { select: { id: true, name: true } } } },
-      /// The FULL settlement split as persisted at completion time —
-      /// the same numbers the invoice prints and the payout credits, so the
-      /// report can never drift from what the partner was actually paid.
-      earning: {
-        select: {
-          bookingAmount: true,
-          commissionPct: true,
-          earnedAmount: true,   // partner GROSS (e.g. 399.20 of ₹499)
-          partnerGst: true,     // 5% inside the partner slice (19.96)
-          netAmount: true,      // credited to partner (379.24)
-          dhoondCommission: true, // Dhoond GROSS (99.80)
-          dhoondGst: true,      // 18% inside Dhoond's slice (17.96)
-          dhoondNet: true,      // Dhoond after tax (81.84)
-        },
-      },
-      items: { include: { service: { select: { name: true, category: { select: { name: true } } } } } },
-    },
-  });
+  /// Pagination — the report used to fetch EVERY matching row with full
+  /// joins on each load, which grows unbounded with booking volume. Rows
+  /// are now paged server-side; the earnings totals still cover the
+  /// WHOLE filtered set via a lean money-only scan below (no joins), so
+  /// the summary cards and the table footer stay exact regardless of
+  /// which page is on screen. `export=true` returns the full (bounded)
+  /// row set in one response for the CSV download.
+  const exportAll = String(query.export ?? '') === 'true';
+  const EXPORT_CAP = 5000;
+  const page = Math.max(1, Number(query.page) || 1);
+  const pageSize = Math.min(200, Math.max(1, Number(query.pageSize) || 25));
 
   /// Two-decimal money for DISPLAY. The PartnerEarning row stores whole
   /// rupees (Int columns — the actual credited amounts, floored so we
@@ -434,6 +418,61 @@ exports.bookingReport = async (query = {}, scope) => {
   /// froze (bookingAmount × commissionPct), so ₹1 shows as ₹0.80/₹0.20
   /// here while the persisted ledger stays untouched.
   const money2 = (v) => Math.round(v * 100) / 100;
+  const splitFor = (e) => {
+    if (!e) {
+      return {
+        partnerGross: 0, partnerGst: 0, partnerNet: 0,
+        dhoondGross: 0, dhoondGstAmt: 0, dhoondNet: 0,
+      };
+    }
+    const base = e.bookingAmount ?? 0;
+    const pct = e.commissionPct ?? 80;
+    const partnerGross = money2((base * pct) / 100);
+    const dhoondGross = money2(base - partnerGross);
+    const partnerGst = money2((partnerGross * 5) / 100);
+    const dhoondGstAmt = money2((dhoondGross * 18) / 100);
+    return {
+      partnerGross,
+      dhoondGross,
+      partnerGst,
+      dhoondGstAmt,
+      partnerNet: money2(partnerGross - partnerGst),
+      dhoondNet: money2(dhoondGross - dhoondGstAmt),
+    };
+  };
+
+  const [bookings, leanRows] = await Promise.all([
+    prisma.booking.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        customer: { select: { id: true, name: true, phone: true } },
+        partner: { select: { id: true, name: true, businessName: true, phone: true } },
+        /// `cityRef` is the City relation (cityId FK). The scalar `city`
+        /// column is the legacy free-text snapshot, used as fallback.
+        cityRef: { select: { id: true, name: true, state: { select: { id: true, name: true } } } },
+        /// Snapshotted split inputs — the exact 2dp split is derived from
+        /// these (see splitFor above).
+        earning: { select: { bookingAmount: true, commissionPct: true } },
+        items: { include: { service: { select: { name: true, category: { select: { name: true } } } } } },
+      },
+      ...(exportAll
+        ? { take: EXPORT_CAP }
+        : { skip: (page - 1) * pageSize, take: pageSize }),
+    }),
+    /// Money-only scan of the FULL filtered set — powers the totals so
+    /// they never shrink to just the visible page. No joins besides the
+    /// earning snapshot; bounded as a runaway guard.
+    prisma.booking.findMany({
+      where,
+      select: {
+        status: true, total: true, subtotal: true, discount: true,
+        grandTotal: true, platformFee: true, gstAmount: true,
+        earning: { select: { bookingAmount: true, commissionPct: true } },
+      },
+      take: 20000,
+    }),
+  ]);
 
   const rows = bookings.map((b) => {
     const isCancelled = b.status === 'CANCELLED';
@@ -442,22 +481,8 @@ exports.bookingReport = async (query = {}, scope) => {
     /// would credit a partner more than was collected.
     const e = b.earning;
     const discount = b.discount ?? 0;
-    let partnerGross = 0;
-    let partnerGst = 0;
-    let partnerNet = 0;
-    let dhoondGross = 0;
-    let dhoondGstAmt = 0;
-    let dhoondNet = 0;
-    if (e) {
-      const base = e.bookingAmount ?? 0;
-      const pct = e.commissionPct ?? 80;
-      partnerGross = money2((base * pct) / 100);
-      dhoondGross = money2(base - partnerGross);
-      partnerGst = money2((partnerGross * 5) / 100);
-      dhoondGstAmt = money2((dhoondGross * 18) / 100);
-      partnerNet = money2(partnerGross - partnerGst);
-      dhoondNet = money2(dhoondGross - dhoondGstAmt);
-    }
+    const { partnerGross, partnerGst, partnerNet, dhoondGross, dhoondGstAmt, dhoondNet } =
+      splitFor(e);
     const partnerEarn = partnerGross;
     // Commission only makes sense once a partner share exists (completed).
     // For non-completed/non-cancelled rows we still show the job amount but
@@ -515,28 +540,36 @@ exports.bookingReport = async (query = {}, scope) => {
     };
   });
 
-  // Totals (live/completed feed the earnings split; cancelled feed refunds).
-  const totals = rows.reduce(
-    (t, r) => {
+  // Totals over the WHOLE filtered set (leanRows), not just the visible
+  // page — live/completed feed the earnings split; cancelled feed refunds.
+  // Mirrors the per-row math above exactly.
+  const totals = leanRows.reduce(
+    (t, b) => {
+      const isCancelled = b.status === 'CANCELLED';
+      const split = splitFor(b.earning);
+      const partnerEarn = isCancelled ? 0 : split.partnerGross;
+      const commission =
+        !isCancelled && b.earning ? money2(Math.max(0, b.total - partnerEarn)) : 0;
+      const platformFee = isCancelled ? 0 : (b.platformFee ?? 0);
       t.bookings += 1;
-      if (r.status === 'COMPLETED') t.completed += 1;
-      else if (r.status === 'CANCELLED') t.cancelled += 1;
-      t.jobAmount += r.jobAmount;
-      t.partnerEarning += r.partnerEarning;
-      t.commission += r.commission;
-      t.platformFee += r.platformFee;
-      t.gst += r.gst;
-      t.dhoondEarning += r.dhoondEarning;
-      t.grandTotal += r.grandTotal;
-      t.subtotal += r.subtotal;
-      t.discount += r.discount;
-      t.partnerGross += r.partnerGross;
-      t.partnerGstAmt += r.partnerGst;
-      t.partnerNet += r.partnerNet;
-      t.dhoondGross += r.dhoondGross;
-      t.dhoondGstAmt += r.dhoondGst;
-      t.dhoondNet += r.dhoondNet;
-      t.refund += r.refund;
+      if (b.status === 'COMPLETED') t.completed += 1;
+      else if (isCancelled) t.cancelled += 1;
+      t.jobAmount += b.total;
+      t.partnerEarning += partnerEarn;
+      t.commission += commission;
+      t.platformFee += platformFee;
+      t.gst += isCancelled ? 0 : (b.gstAmount ?? 0);
+      t.dhoondEarning += money2(commission + platformFee);
+      t.grandTotal += b.grandTotal;
+      t.subtotal += b.subtotal ?? 0;
+      t.discount += b.discount ?? 0;
+      t.partnerGross += isCancelled ? 0 : split.partnerGross;
+      t.partnerGstAmt += isCancelled ? 0 : split.partnerGst;
+      t.partnerNet += isCancelled ? 0 : split.partnerNet;
+      t.dhoondGross += isCancelled ? 0 : split.dhoondGross;
+      t.dhoondGstAmt += isCancelled ? 0 : split.dhoondGstAmt;
+      t.dhoondNet += isCancelled ? 0 : split.dhoondNet;
+      t.refund += isCancelled ? b.grandTotal : 0;
       return t;
     },
     {
@@ -564,7 +597,16 @@ exports.bookingReport = async (query = {}, scope) => {
   /// (₹4 ÷ ₹63 = 6.3% while the card showed ₹74).
   totals.takeRate = totals.grandTotal > 0 ? totals.dhoondEarning / totals.grandTotal : 0;
 
-  return { rows, totals };
+  return {
+    rows,
+    totals,
+    meta: {
+      page: exportAll ? 1 : page,
+      pageSize: exportAll ? rows.length : pageSize,
+      total: leanRows.length,
+      totalPages: exportAll ? 1 : Math.max(1, Math.ceil(leanRows.length / pageSize)),
+    },
+  };
 };
 
 // ── Partner performance ────────────────────────────────────────────────────
