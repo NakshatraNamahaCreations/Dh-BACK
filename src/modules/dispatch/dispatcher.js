@@ -681,49 +681,72 @@ const reconcileStaleOnDuty = async () => {
   }
   const live = await registry.filterOnlinePartnerIds(partners.map((p) => p.id));
 
+  /// The DB truth for "is this partner mid-job": any CONFIRMED /
+  /// IN_PROGRESS booking assigned to them. Queried for the WHOLE scan
+  /// (bounded, ≤1000 ids) because it now drives convergence in BOTH
+  /// directions — stale 'busy' rows with no job, AND working partners
+  /// whose row desynced away from 'busy'.
+  const withActive = await withDbRetry(
+    () =>
+      prisma.booking.findMany({
+        where: {
+          partnerId: { in: partners.map((p) => p.id) },
+          status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
+        },
+        select: { partnerId: true },
+      }),
+    { label: 'reconcile.activeBookings' },
+  ).catch(() => []);
+  const activelyWorking = new Set(withActive.map((b) => b.partnerId));
+
   /// STALE-BUSY reconcile. A partner stuck at dutyState='busy' whose job
   /// ended through a path that missed the busy-clear (dispatcher supersede,
   /// deleted booking, admin reassign edge) is INVISIBLE to dispatch and to
   /// the admin "Available" filter — the orphaned `partner:active` flag also
-  /// makes upsertOnline silently drop their presence pings. The duty-on
+  /// makes upsertOnline drop their geo re-registration. The duty-on
   /// toggle self-heals this (tracking.setDuty), but a partner who never
   /// re-toggles would stay stranded; this sweep is the safety net for them.
-  /// A busy row is STALE iff the partner has NO active CONFIRMED/IN_PROGRESS
-  /// booking. We only pay for the booking query when there ARE busy rows.
-  const busyRows = partners.filter((p) => p.dutyState === 'busy');
-  let staleBusyIds = [];
-  if (busyRows.length > 0) {
-    const busyIds = busyRows.map((p) => p.id);
-    const withActive = await withDbRetry(
-      () =>
-        prisma.booking.findMany({
-          where: {
-            partnerId: { in: busyIds },
-            status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
-          },
-          select: { partnerId: true },
-        }),
-      { label: 'reconcile.busyActiveBookings' },
-    ).catch(() => []);
-    const genuinelyBusy = new Set(withActive.map((b) => b.partnerId));
-    staleBusyIds = busyIds.filter((id) => !genuinelyBusy.has(id));
-  }
+  const staleBusyIds = partners
+    .filter((p) => p.dutyState === 'busy' && !activelyWorking.has(p.id))
+    .map((p) => p.id);
+
+  /// WORKING partner whose row ISN'T 'busy' → converge it to 'busy'.
+  /// Accept writes 'busy' directly, but a pre-fix ghost-flip (or any
+  /// missed write) could leave the row off_duty/available while they're
+  /// on a job — the admin "In Progress" duty filter matches the DB
+  /// column, so those partners vanished from it entirely.
+  const toBusy = partners
+    .filter((p) => activelyWorking.has(p.id) && p.dutyState !== 'busy')
+    .map((p) => p.id);
 
   /// Ghost: marked on duty in DB but no live presence → off_duty.
-  /// NEVER ghost-flip a BUSY row here: a partner mid-job legitimately
-  /// has gaps in presence (accept deletes lastseen; older app builds
-  /// stop pinging while backgrounded on the job), and flipping them
-  /// off_duty mid-job is exactly the "working partner shows Off Duty
-  /// in admin" bug. Stale-busy rows (busy with NO active booking) are
-  /// already handled by the staleBusyIds sweep above.
+  /// NEVER ghost-flip a partner who is BUSY or actively working: a
+  /// partner mid-job legitimately has gaps in presence (accept deletes
+  /// lastseen; older app builds stop pinging while backgrounded on the
+  /// job), and flipping them off_duty mid-job is exactly the "working
+  /// partner shows Off Duty in admin" bug. Stale-busy rows (busy with
+  /// NO active booking) are handled by the staleBusyIds sweep.
   const toOff = partners
-    .filter((p) => p.onDuty && p.dutyState !== 'busy' && !live.has(Number(p.id)))
+    .filter(
+      (p) =>
+        p.onDuty &&
+        p.dutyState !== 'busy' &&
+        !activelyWorking.has(p.id) &&
+        !live.has(Number(p.id)),
+    )
     .map((p) => p.id);
   /// Missed on-write: live presence but DB says off_duty → available.
   /// Also includes STALE-busy rows that ARE still live → back to available.
+  /// Working partners are excluded — they converge to 'busy' above.
   const toAvailable = [
     ...partners
-      .filter((p) => !p.onDuty && p.dutyState === 'off_duty' && live.has(Number(p.id)))
+      .filter(
+        (p) =>
+          !p.onDuty &&
+          p.dutyState === 'off_duty' &&
+          !activelyWorking.has(p.id) &&
+          live.has(Number(p.id)),
+      )
       .map((p) => p.id),
     ...staleBusyIds.filter((id) => live.has(Number(id))),
   ];
@@ -758,9 +781,25 @@ const reconcileStaleOnDuty = async () => {
     ).catch((err) => logger.warn(`duty reconcile on-write failed: ${err.message}`));
     await Promise.all(toAvailable.map((id) => registry.clearDutyMirror(id))).catch(() => {});
   }
-  if (toOff.length || toAvailable.length) {
+  if (toBusy.length > 0) {
+    await withDbRetry(
+      () =>
+        prisma.partner.updateMany({
+          where: { id: { in: toBusy } },
+          data: { onDuty: true, dutyState: 'busy', onDutyChangedAt: new Date() },
+        }),
+      { label: 'reconcile.flipBusy' },
+    ).catch((err) => logger.warn(`duty reconcile busy-write failed: ${err.message}`));
+    await Promise.all(toBusy.map((id) => registry.clearDutyMirror(id))).catch(() => {});
+    /// Re-arm the Redis busy flag too (it may have aged out or been
+    /// wiped by the same desync) so the partner isn't offered NEW jobs
+    /// while still working this one.
+    await Promise.all(toBusy.map((id) => registry.setActiveJob(id))).catch(() => {});
+  }
+  if (toOff.length || toAvailable.length || toBusy.length) {
     logger.info(
-      `duty reconcile: ${toOff.length} → off_duty, ${toAvailable.length} → available` +
+      `duty reconcile: ${toOff.length} → off_duty, ${toAvailable.length} → available, ` +
+        `${toBusy.length} → busy` +
         (staleBusyIds.length ? ` (incl. ${staleBusyIds.length} stale-busy healed)` : ''),
     );
   }
