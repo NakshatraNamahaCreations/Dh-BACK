@@ -195,13 +195,19 @@ exports.list = async ({ status, kyc, search, onDuty, dutyState, categoryId, orde
   ///   `dutyState` (preferred): exact 3-state filter
   ///     'available' (on duty + free) | 'busy' (on a job) | 'off_duty'.
   ///   `onDuty` (legacy boolean): true → on duty (available OR busy).
-  if (['off_duty', 'available', 'busy'].includes(dutyState)) {
-    where.dutyState = dutyState;
-  } else if (onDuty === true || onDuty === 'true') {
-    where.dutyState = { in: ['available', 'busy'] };
-  } else if (onDuty === false || onDuty === 'false') {
-    where.dutyState = 'off_duty';
-  }
+  /// Resolved AGAINST LIVE REDIS below (same signals the badge shows and
+  /// dispatch matches from) — filtering on the DB mirror column made the
+  /// filter disagree with the badges whenever the mirror desynced
+  /// ("Available" filter returned 0 rows while two partners displayed
+  /// as Available). DB-column filtering remains the fallback when Redis
+  /// is unavailable.
+  const dutyFilter = ['off_duty', 'available', 'busy'].includes(dutyState)
+    ? dutyState
+    : onDuty === true || onDuty === 'true'
+      ? 'on'
+      : onDuty === false || onDuty === 'false'
+        ? 'off_duty'
+        : null;
   /// Status filter:
   ///   - 'active'      → isActive=true AND isVerified=true (fully approved + live)
   ///   - 'onboarding'  → isActive=true AND isVerified=false (in-flight)
@@ -226,6 +232,39 @@ exports.list = async ({ status, kyc, search, onDuty, dutyState, categoryId, orde
     ];
   }
   if (scope) applyScopeToWhere(where, scope);
+
+  /// Apply the duty filter. With Redis up: resolve the LIVE duty state
+  /// for every partner matching the other criteria (id-only pre-query,
+  /// bounded), keep the ids whose live state matches, and constrain the
+  /// main query to those ids — pagination and totals then just work,
+  /// and the filter always agrees with the badges. With Redis down:
+  /// fall back to the DB mirror column as before.
+  if (dutyFilter != null) {
+    const registry = require('../dispatch/registry');
+    if (registry.enabled()) {
+      const candidates = await prisma.partner.findMany({
+        where,
+        select: { id: true },
+        take: 5000,
+      });
+      const ids = candidates.map((c) => c.id);
+      const [live, busy, off] = await Promise.all([
+        registry.filterOnlinePartnerIds(ids),
+        registry.filterActivePartnerIds(ids),
+        registry.filterOffDutyPartnerIds(ids),
+      ]);
+      const dutyOf = (id) =>
+        busy.has(id) ? 'busy' : off.has(id) ? 'off_duty' : live.has(id) ? 'available' : 'off_duty';
+      const matched = ids.filter((id) =>
+        dutyFilter === 'on' ? dutyOf(id) !== 'off_duty' : dutyOf(id) === dutyFilter,
+      );
+      where.id = { in: matched };
+    } else if (dutyFilter === 'on') {
+      where.dutyState = { in: ['available', 'busy'] };
+    } else {
+      where.dutyState = dutyFilter;
+    }
+  }
 
   const [items, total, categoryById] = await Promise.all([
     prisma.partner.findMany({
