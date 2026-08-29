@@ -1,6 +1,6 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
-const { authenticate, requireType } = require('../../middlewares/auth');
+const { authenticate, requireType, requirePermission } = require('../../middlewares/auth');
 const {
   idParam,
   createSchema,
@@ -25,15 +25,17 @@ router.post('/apply', customerOnly, validate(applySchema), controller.apply);
 /// path isn't captured as an id.
 router.get('/available', customerOnly, controller.listAvailable);
 
-/// Admin CRUD.
-router.get('/', adminOnly, validate(listQuerySchema), controller.adminList);
-router.post('/', adminOnly, validate(createSchema), controller.adminCreate);
-router.get('/:id', adminOnly, validate(idParam), controller.adminGet);
-router.patch('/:id', adminOnly, validate(updateSchema), controller.adminUpdate);
-router.delete('/:id', adminOnly, validate(idParam), controller.adminDelete);
+/// Admin CRUD — RBAC-gated per action so a role without (e.g.)
+/// `coupons.delete` gets a 403 here even though the button rendered.
+router.get('/', adminOnly, requirePermission('coupons.view'), validate(listQuerySchema), controller.adminList);
+router.post('/', adminOnly, requirePermission('coupons.create'), validate(createSchema), controller.adminCreate);
+router.get('/:id', adminOnly, requirePermission('coupons.view'), validate(idParam), controller.adminGet);
+router.patch('/:id', adminOnly, requirePermission('coupons.edit'), validate(updateSchema), controller.adminUpdate);
+router.delete('/:id', adminOnly, requirePermission('coupons.delete'), validate(idParam), controller.adminDelete);
 router.post(
   '/:id/toggle-active',
   adminOnly,
+  requirePermission('coupons.edit'),
   validate(idParam),
   controller.adminToggleActive,
 );

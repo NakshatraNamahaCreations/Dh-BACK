@@ -1,6 +1,6 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
-const { authenticate, requireType } = require('../../middlewares/auth');
+const { authenticate, requireType, requirePermission } = require('../../middlewares/auth');
 const { captureSchema, summaryQuerySchema } = require('./launch-interest.validator');
 const controller = require('./launch-interest.controller');
 
@@ -14,6 +14,7 @@ router.get(
   '/',
   authenticate,
   requireType('ADMIN'),
+  requirePermission('demand.view'),
   validate(summaryQuerySchema),
   controller.summary,
 );

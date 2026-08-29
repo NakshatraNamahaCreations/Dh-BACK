@@ -1,6 +1,6 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
-const { authenticate, requireType } = require('../../middlewares/auth');
+const { authenticate, requireType, requirePermission } = require('../../middlewares/auth');
 const {
   idParam,
   createSchema,
@@ -18,9 +18,9 @@ router.get('/', validate(listQuerySchema), controller.list);
 // Admin-only writes.
 const adminOnly = [authenticate, requireType('ADMIN')];
 
-router.post('/', adminOnly, validate(createSchema), controller.create);
-router.patch('/:id', adminOnly, validate(updateSchema), controller.update);
-router.post('/:id/toggle', adminOnly, validate(idParam), controller.toggle);
-router.delete('/:id', adminOnly, validate(idParam), controller.remove);
+router.post('/', adminOnly, requirePermission('timeslots.edit'), validate(createSchema), controller.create);
+router.patch('/:id', adminOnly, requirePermission('timeslots.edit'), validate(updateSchema), controller.update);
+router.post('/:id/toggle', adminOnly, requirePermission('timeslots.edit'), validate(idParam), controller.toggle);
+router.delete('/:id', adminOnly, requirePermission('timeslots.edit'), validate(idParam), controller.remove);
 
 module.exports = router;

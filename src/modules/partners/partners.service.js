@@ -438,6 +438,15 @@ exports.get = async (id) => {
     documents: documentsForPartner(p),
     documentDetails: documentDetailsForPartner(p),
     stages: stagesForPartner(p),
+    /// Onboarding-progress fields so the Partner details page can drive
+    /// the call → fee → payment → training → activate flow directly
+    /// (same shape `listOnboarding` gives the review screen).
+    callVerified: Boolean(p.callVerified),
+    onboardingFeeAmount: p.onboardingFeeAmount ?? null,
+    onboardingFeeNote: p.onboardingFeeNote ?? null,
+    onboardingFeePaidAt: p.onboardingFeePaidAt ? p.onboardingFeePaidAt.toISOString() : null,
+    paymentStatus: p.paymentStatus ?? 'unpaid',
+    trainingCompletedAt: p.trainingCompletedAt ? p.trainingCompletedAt.toISOString() : null,
     recentJobs: recent.map((b) => ({
       id: String(b.id),
       /// ISO string — the admin renders it through formatDateTimeIST.

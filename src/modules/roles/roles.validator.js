@@ -31,8 +31,10 @@ const permission = z.enum([
   'geography.view', 'geography.create', 'geography.edit', 'geography.delete',
   'areas.view', 'areas.create', 'areas.edit', 'areas.delete',
   'demand.view',
-  // Bookings
+  // Bookings (bookings.edit = legacy master; fine keys per action)
   'bookings.view', 'bookings.edit', 'bookings.dispatch',
+  'bookings.status', 'bookings.reschedule', 'bookings.cancel',
+  'bookings.mark_paid', 'bookings.invoice',
   'bookings.refund', 'bookings.delete',
   'timeslots.view', 'timeslots.edit',
   // Payments

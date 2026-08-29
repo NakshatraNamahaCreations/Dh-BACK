@@ -39,8 +39,13 @@ const ALL_PERMISSIONS = [
   'geography.view', 'geography.create', 'geography.edit', 'geography.delete',
   'areas.view', 'areas.create', 'areas.edit', 'areas.delete',
   'demand.view',
-  // Bookings
+  // Bookings — `bookings.edit` is the legacy MASTER key (implies every
+  // fine-grained action below via requireAnyPermission on the routes);
+  // the fine keys let a role be granted one Booking-details action at a
+  // time (status / reschedule / cancel / mark paid / invoice).
   'bookings.view', 'bookings.edit', 'bookings.dispatch',
+  'bookings.status', 'bookings.reschedule', 'bookings.cancel',
+  'bookings.mark_paid', 'bookings.invoice',
   'bookings.refund', 'bookings.delete',
   'timeslots.view', 'timeslots.edit',
   // Payments

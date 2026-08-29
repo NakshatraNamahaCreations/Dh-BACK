@@ -1,6 +1,6 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
-const { authenticate, requireType, requirePermission } = require('../../middlewares/auth');
+const { authenticate, requireType, requirePermission, requireAnyPermission } = require('../../middlewares/auth');
 const {
   idParam,
   createSchema,
@@ -49,17 +49,23 @@ router.post('/admin', adminOnly, requirePermission('bookings.edit'), validate(ad
 router.get('/admin', adminOnly, requirePermission('bookings.view'), validate(adminListQuerySchema), controller.adminList);
 router.get('/live', adminOnly, requirePermission('bookings.view'), controller.liveJobs);
 router.get('/disputes', adminOnly, requirePermission('bookings.view'), validate(disputesListQuerySchema), controller.listDisputes);
-router.post('/disputes/:id/resolve', adminOnly, requirePermission('bookings.edit'), validate(resolveDisputeSchema), controller.resolveDispute);
-router.post('/disputes/:id/notes', adminOnly, requirePermission('bookings.edit'), validate(disputeNoteSchema), controller.addDisputeNote);
+/// Fine-grained Booking-details actions. Each accepts its own key OR the
+/// legacy `bookings.edit` master key (requireAnyPermission), so roles
+/// carrying the old coarse grant keep every action while new roles can be
+/// given one action at a time from Roles & access. Disputes ride on
+/// `bookings.dispatch` — the Roles screen groups them together
+/// ("Manual dispatch & disputes").
+router.post('/disputes/:id/resolve', adminOnly, requireAnyPermission('bookings.dispatch', 'bookings.edit'), validate(resolveDisputeSchema), controller.resolveDispute);
+router.post('/disputes/:id/notes', adminOnly, requireAnyPermission('bookings.dispatch', 'bookings.edit'), validate(disputeNoteSchema), controller.addDisputeNote);
 router.get('/stuck', adminOnly, requirePermission('bookings.view'), controller.listStuckJobs);
 router.get('/admin/:id', adminOnly, requirePermission('bookings.view'), validate(idParam), controller.adminGet);
 router.get('/admin/:id/invoice', adminOnly, requirePermission('bookings.view'), validate(idParam), controller.adminDownloadInvoice);
-router.post('/admin/:id/send-invoice', adminOnly, requirePermission('bookings.edit'), validate(idParam), controller.adminSendInvoiceEmail);
-router.patch('/admin/:id/status', adminOnly, requirePermission('bookings.edit'), validate(adminStatusSchema), controller.adminUpdateStatus);
-router.post('/admin/:id/cancel', adminOnly, requirePermission('bookings.edit'), validate(adminCancelSchema), controller.adminCancel);
-router.post('/admin/:id/mark-paid', adminOnly, requirePermission('bookings.edit'), validate(adminMarkPaidSchema), controller.adminMarkPaid);
+router.post('/admin/:id/send-invoice', adminOnly, requireAnyPermission('bookings.invoice', 'bookings.edit'), validate(idParam), controller.adminSendInvoiceEmail);
+router.patch('/admin/:id/status', adminOnly, requireAnyPermission('bookings.status', 'bookings.edit'), validate(adminStatusSchema), controller.adminUpdateStatus);
+router.post('/admin/:id/cancel', adminOnly, requireAnyPermission('bookings.cancel', 'bookings.edit'), validate(adminCancelSchema), controller.adminCancel);
+router.post('/admin/:id/mark-paid', adminOnly, requireAnyPermission('bookings.mark_paid', 'bookings.edit'), validate(adminMarkPaidSchema), controller.adminMarkPaid);
 router.post('/admin/:id/retry-refund', adminOnly, requirePermission('bookings.refund'), validate(idParam), controller.adminRetryRefund);
-router.post('/admin/:id/reschedule', adminOnly, requirePermission('bookings.edit'), validate(adminRescheduleSchema), controller.adminReschedule);
+router.post('/admin/:id/reschedule', adminOnly, requireAnyPermission('bookings.reschedule', 'bookings.edit'), validate(adminRescheduleSchema), controller.adminReschedule);
 router.get('/:id/nearby-partners', adminOnly, requirePermission('bookings.view'), validate(idParam), controller.nearbyPartners);
 router.post('/:id/dispatch', adminOnly, requirePermission('bookings.dispatch'), validate(dispatchSchema), controller.reassign);
 

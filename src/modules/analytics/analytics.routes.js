@@ -1,12 +1,12 @@
 const express = require('express');
 const validate = require('../../middlewares/validate');
-const { authenticate, requireType } = require('../../middlewares/auth');
+const { authenticate, requireType, requirePermission } = require('../../middlewares/auth');
 const { rangeQuerySchema, customerRangeQuerySchema, bookingReportQuerySchema } = require('./analytics.validator');
 const controller = require('./analytics.controller');
 
 const router = express.Router();
 
-const adminOnly = [authenticate, requireType('ADMIN')];
+const adminOnly = [authenticate, requireType('ADMIN'), requirePermission('analytics.view')];
 
 router.get('/summary', adminOnly, controller.summary);
 router.get('/revenue/series', adminOnly, validate(rangeQuerySchema), controller.revenueSeries);

@@ -88,4 +88,28 @@ const requirePermission = (...required) => (req, res, next) => {
   return ok ? next() : next(ApiError.forbidden('You do not have permission for this action'));
 };
 
-module.exports = { authenticate, requireType, requirePermission };
+/// Any-of variant of requirePermission — passes when the admin holds AT
+/// LEAST ONE of the listed permissions. Used where a legacy coarse key
+/// must keep working alongside newer fine-grained keys (e.g. a role with
+/// the old `bookings.edit` master key retains every booking action, while
+/// a new role can be granted just `bookings.reschedule`). Same super
+/// bypass + legacy-token fallback as requirePermission.
+const requireAnyPermission = (...accepted) => (req, res, next) => {
+  if (!req.user || req.user.type !== 'ADMIN') {
+    return next(ApiError.forbidden('Insufficient permissions'));
+  }
+  if (req.user.super === true) return next();
+
+  let perms = req.user.perms;
+  if (perms === undefined && req.user.super === undefined) {
+    if ((req.user.role || 'SUPER') === 'SUPER') return next();
+    const ok = accepted.some((p) => !p.startsWith('admins.') && !p.startsWith('roles.'));
+    return ok ? next() : next(ApiError.forbidden('You do not have permission for this action'));
+  }
+
+  perms = Array.isArray(perms) ? perms : [];
+  const ok = accepted.some((p) => perms.includes(p));
+  return ok ? next() : next(ApiError.forbidden('You do not have permission for this action'));
+};
+
+module.exports = { authenticate, requireType, requirePermission, requireAnyPermission };
