@@ -78,6 +78,9 @@ const companySchema = z.object({
     address: z.string().trim().min(4),
     stateNameCode: z.string().trim().min(2),
     signatureUrl: z.string().url().nullable().optional().or(z.literal('')),
+    /// Company bank account debited for partner payouts — the "Debit
+    /// Account Number" column of the Bank Payout Excel export.
+    debitAccountNumber: z.string().trim().max(34).optional().or(z.literal('')),
   }),
 });
 

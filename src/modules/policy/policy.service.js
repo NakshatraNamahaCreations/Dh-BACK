@@ -138,6 +138,9 @@ const DEFAULT_COMPANY = {
   address: env.COMPANY_ADDRESS,
   stateNameCode: 'Karnataka 29',
   signatureUrl: null,
+  /// Debited for partner payouts — fills the Bank Payout Excel's
+  /// "Debit Account Number" column; blank until an admin sets it.
+  debitAccountNumber: '',
 };
 exports.getCompanyDetails = async () => readSetting(COMPANY_KEY, DEFAULT_COMPANY);
 exports.saveCompanyDetails = async (config) => writeSetting(COMPANY_KEY, config);

@@ -616,6 +616,16 @@ exports.bookingReport = async (query = {}, scope) => {
 
 // ── Partner performance ────────────────────────────────────────────────────
 
+/// Exact partner-gross share for DISPLAY (2dp), recomputed from the
+/// earning row's snapshotted inputs (bookingAmount × commissionPct) —
+/// the same math the Booking report and Payout management use. The
+/// persisted Int `earnedAmount` is the floored credited ledger and
+/// reads ₹0 on small bookings (80% of ₹1 floors to 0), which made this
+/// leaderboard show ₹0 earnings against real completed jobs.
+const displayMoney2 = (v) => Math.round(v * 100) / 100;
+const exactPartnerGross = (e) =>
+  displayMoney2(((e.bookingAmount ?? 0) * (e.commissionPct ?? 80)) / 100);
+
 exports.partnerPerformance = async ({ range = '30d' } = {}, scope) => {
   const { from, days } = dateFromRange(range);
   const priorFrom = new Date(from.getTime() - days * 24 * 60 * 60 * 1000);
@@ -638,11 +648,11 @@ exports.partnerPerformance = async ({ range = '30d' } = {}, scope) => {
     }),
     prisma.partnerEarning.findMany({
       where: { partnerId: { in: partnerIds }, createdAt: { gte: from } },
-      select: { partnerId: true, earnedAmount: true },
+      select: { partnerId: true, bookingAmount: true, commissionPct: true },
     }),
     prisma.partnerEarning.findMany({
       where: { partnerId: { in: partnerIds }, createdAt: { gte: priorFrom, lt: from } },
-      select: { partnerId: true, earnedAmount: true },
+      select: { partnerId: true, bookingAmount: true, commissionPct: true },
     }),
     prisma.category.findMany({
       where: { id: { in: partners.map((p) => p.categoryId).filter(Boolean) } },
@@ -674,11 +684,11 @@ exports.partnerPerformance = async ({ range = '30d' } = {}, scope) => {
   }
   for (const e of currentEarnings) {
     const s = stats.get(e.partnerId);
-    if (s) s.earnings += e.earnedAmount;
+    if (s) s.earnings += exactPartnerGross(e);
   }
   for (const e of priorEarnings) {
     const s = stats.get(e.partnerId);
-    if (s) s.priorEarnings += e.earnedAmount;
+    if (s) s.priorEarnings += exactPartnerGross(e);
   }
 
   const rows = partners.map((p) => {
@@ -701,7 +711,8 @@ exports.partnerPerformance = async ({ range = '30d' } = {}, scope) => {
       category: (p.categoryId && categoryById.get(p.categoryId)) || p.businessName || 'General',
       jobsCompleted: s.completed,
       hoursWorked: 0,
-      earnings: s.earnings,
+      /// Float-drift guard on the accumulated 2dp figures.
+      earnings: displayMoney2(s.earnings),
       rating: r ? Math.round(r.avg * 10) / 10 : 0,
       ratingCount: r ? r.count : 0,
       acceptanceRate: Math.round(acceptanceRate * 100) / 100,
