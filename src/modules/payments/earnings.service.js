@@ -71,6 +71,33 @@ const computeBreakdown = (bookingAmount, partnerPct) => {
   };
 };
 
+/// Two-decimal DISPLAY split, recomputed from the earning row's
+/// snapshotted inputs (bookingAmount × commissionPct) — the SAME math the
+/// admin Booking report uses. The persisted Int columns are the credited
+/// LEDGER (floored whole rupees, so we never credit more than authorised);
+/// on a small booking they read ₹0 — 80% of ₹1 floors to 0 — which made
+/// the payout page show ₹0 payable while the Booking report showed the
+/// same booking crediting ₹0.76. The report reads below aggregate THIS
+/// split for display; ledger writes (creditForBooking / weeklyMarkPaid /
+/// payout records) stay on the Int columns.
+const money2 = (v) => Math.round(v * 100) / 100;
+const displaySplit = (e) => {
+  const base = e.bookingAmount ?? 0;
+  const pct = e.commissionPct ?? 80;
+  const partnerGross = money2((base * pct) / 100);
+  const dhoondGross = money2(base - partnerGross);
+  const partnerGst = money2((partnerGross * 5) / 100);
+  const dhoondGst = money2((dhoondGross * 18) / 100);
+  return {
+    partnerGross,
+    partnerGst,
+    partnerNet: money2(partnerGross - partnerGst),
+    dhoondGross,
+    dhoondGst,
+    dhoondNet: money2(dhoondGross - dhoondGst),
+  };
+};
+
 exports.creditForBooking = async (bookingId) => {
   const booking = await prisma.booking.findUnique({
     where: { id: Number(bookingId) },
@@ -351,20 +378,14 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
 
   const partnerIds = partners.map((p) => p.id);
 
-  /// Single grouped aggregate per metric — far cheaper than running
-  /// the three queries above per-partner.
-  const [pending, lifetime, lastPaid, pendingAdj] = await Promise.all([
-    prisma.partnerEarning.groupBy({
-      by: ['partnerId'],
-      where: { partnerId: { in: partnerIds }, status: 'pending' },
-      _sum: { earnedAmount: true, netAmount: true },
-      _count: { _all: true },
-    }),
-    prisma.partnerEarning.groupBy({
-      by: ['partnerId'],
+  /// Earning rows fetched once for the page's partners and aggregated in
+  /// JS with the exact 2dp split (Booking-report math) — a DB groupBy
+  /// over the floored Int netAmount showed ₹0 pending on small bookings
+  /// while the Booking report credited the partner.
+  const [earnRows, lastPaid, pendingAdj] = await Promise.all([
+    prisma.partnerEarning.findMany({
       where: { partnerId: { in: partnerIds } },
-      _sum: { earnedAmount: true, netAmount: true },
-      _count: { _all: true },
+      select: { partnerId: true, status: true, bookingAmount: true, commissionPct: true },
     }),
     prisma.payout.groupBy({
       by: ['partnerId'],
@@ -381,8 +402,21 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
     }),
   ]);
 
-  const pendingByPid = new Map(pending.map((r) => [r.partnerId, r]));
-  const lifetimeByPid = new Map(lifetime.map((r) => [r.partnerId, r]));
+  const pendingByPid = new Map();
+  const lifetimeByPid = new Map();
+  for (const e of earnRows) {
+    const net = displaySplit(e).partnerNet;
+    const lt = lifetimeByPid.get(e.partnerId) ?? { amount: 0, count: 0 };
+    lt.amount += net;
+    lt.count += 1;
+    lifetimeByPid.set(e.partnerId, lt);
+    if (e.status === 'pending') {
+      const pe = pendingByPid.get(e.partnerId) ?? { amount: 0, count: 0 };
+      pe.amount += net;
+      pe.count += 1;
+      pendingByPid.set(e.partnerId, pe);
+    }
+  }
   const lastPaidByPid = new Map(lastPaid.map((r) => [r.partnerId, r]));
   const pendingAdjByPid = new Map(pendingAdj.map((r) => [r.partnerId, r]));
 
@@ -392,10 +426,6 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
     const lp = lastPaidByPid.get(p.id);
     const adj = pendingAdjByPid.get(p.id);
     const pendingDeductions = adj?._sum.amount ?? 0;
-    // Use netAmount (post-GST) when available, fall back to earnedAmount
-    // for legacy rows that were created before the breakdown columns were added.
-    const pendingNet  = pe?._sum.netAmount  ?? pe?._sum.earnedAmount  ?? 0;
-    const lifetimeNet = lt?._sum.netAmount  ?? lt?._sum.earnedAmount  ?? 0;
     return {
       partnerId: p.id,
       partner: p.name ?? p.businessName ?? `Partner ${p.id}`,
@@ -404,13 +434,13 @@ exports.listPartnerSummaries = async ({ search, scope, page = 1, pageSize = 25 }
       city: p.cityRef?.name ?? p.city ?? null,
       state: p.cityRef?.state?.name ?? null,
       stateCode: p.cityRef?.state?.code ?? null,
-      pendingAmount: pendingNet - pendingDeductions,
-      pendingJobs: pe?._count._all ?? 0,
+      pendingAmount: money2((pe?.amount ?? 0) - pendingDeductions),
+      pendingJobs: pe?.count ?? 0,
       /// Surfaced so the payout table can show "−₹X penalties" alongside
       /// the net pending figure.
       pendingDeductions,
-      lifetimeAmount: lifetimeNet,
-      lifetimeJobs: lt?._count._all ?? 0,
+      lifetimeAmount: money2(lt?.amount ?? 0),
+      lifetimeJobs: lt?.count ?? 0,
       lastPaidAt: lp?._max.paidAt ?? null,
     };
   });
@@ -494,18 +524,25 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
         jobs: 0,
         grossAmount: 0,
         commission: 0,
+        partnerGross: 0,
         partnerGst: 0,
         payable: 0,
         paidJobs: 0,
       };
       byPartner.set(e.partnerId, agg);
     }
+    /// Exact 2dp split (Booking-report math) — NOT the floored Int
+    /// ledger columns, which read ₹0 on small bookings.
+    const s = displaySplit(e);
     agg.jobs += 1;
     agg.grossAmount += e.bookingAmount;
-    agg.commission += e.dhoondCommission;
-    agg.partnerGst += e.partnerGst;
+    agg.commission += s.dhoondGross;
+    /// The partner's share BEFORE the 5% GST deduction — shown on the
+    /// weekly table so the payable column reads as "gross − GST = net".
+    agg.partnerGross += s.partnerGross;
+    agg.partnerGst += s.partnerGst;
     /// What actually lands in the partner's bank for the week.
-    agg.payable += e.netAmount;
+    agg.payable += s.partnerNet;
     if (e.status === 'paid') agg.paidJobs += 1;
   }
 
@@ -515,26 +552,31 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
     if (e.status === 'paid' || e.status === 'reversed') continue;
     weekPendingByPartner.set(
       e.partnerId,
-      (weekPendingByPartner.get(e.partnerId) ?? 0) + e.netAmount,
+      (weekPendingByPartner.get(e.partnerId) ?? 0) + displaySplit(e).partnerNet,
     );
   }
 
   /// Carry-forward: unpaid earnings from BEFORE this week — the "last
-  /// week(s) pending" the accountant must chase. Grouped per partner so
-  /// old dues surface even when the partner had no jobs this week.
-  const carryRows = await prisma.partnerEarning.groupBy({
-    by: ['partnerId'],
+  /// week(s) pending" the accountant must chase. Aggregated per partner
+  /// in JS (not a DB groupBy over the Int netAmount) so old dues use the
+  /// same exact split as the week itself; surfaces even when the partner
+  /// had no jobs this week.
+  const carryEarnings = await prisma.partnerEarning.findMany({
     where: {
       createdAt: { lt: start },
       status: { notIn: ['paid', 'reversed'] },
       ...partnerCityWhere(scope),
     },
-    _sum: { netAmount: true },
-    _count: { _all: true },
+    select: { partnerId: true, bookingAmount: true, commissionPct: true },
   });
-  const carryByPartner = new Map(
-    carryRows.map((c) => [c.partnerId, { amount: c._sum.netAmount ?? 0, jobs: c._count._all }]),
-  );
+  const carryByPartner = new Map();
+  for (const e of carryEarnings) {
+    const c = carryByPartner.get(e.partnerId) ?? { amount: 0, jobs: 0 };
+    c.amount += displaySplit(e).partnerNet;
+    c.jobs += 1;
+    carryByPartner.set(e.partnerId, c);
+  }
+  const carryRows = [...carryByPartner.entries()].map(([partnerId]) => ({ partnerId }));
 
   /// Partners with old dues but NO earnings this week still need a row
   /// (otherwise their dues silently vanish from the screen).
@@ -566,6 +608,7 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
         jobs: 0,
         grossAmount: 0,
         commission: 0,
+        partnerGross: 0,
         partnerGst: 0,
         payable: 0,
         paidJobs: 0,
@@ -583,16 +626,23 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
 
   const items = [...byPartner.values()]
     .map((a) => {
-      const weekPending = weekPendingByPartner.get(a.partnerId) ?? 0;
+      const weekPending = money2(weekPendingByPartner.get(a.partnerId) ?? 0);
       const carry = carryByPartner.get(a.partnerId) ?? { amount: 0, jobs: 0 };
+      const carryForward = money2(carry.amount);
       return {
         ...a,
+        /// money2 on every accumulated figure — pure float-drift guard.
+        grossAmount: money2(a.grossAmount),
+        commission: money2(a.commission),
+        partnerGross: money2(a.partnerGross),
+        partnerGst: money2(a.partnerGst),
+        payable: money2(a.payable),
         weekPending,
         /// Old dues from previous weeks (still unpaid).
-        carryForward: carry.amount,
+        carryForward,
         carryForwardJobs: carry.jobs,
         /// Everything the partner is owed as of this week's end.
-        totalDue: weekPending + carry.amount,
+        totalDue: money2(weekPending + carryForward),
         status:
           a.jobs === 0
             ? 'pending' // carry-forward-only row
@@ -612,10 +662,13 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
     totals: {
       partners: items.length,
       jobs: items.reduce((s, a) => s + a.jobs, 0),
-      payable: items.reduce((s, a) => s + a.payable, 0),
-      pendingPayable: items.reduce((s, a) => s + a.weekPending, 0),
-      carryForward: items.reduce((s, a) => s + a.carryForward, 0),
-      totalDue: items.reduce((s, a) => s + a.totalDue, 0),
+      /// Sum of the customer-paid booking totals for the week — the base
+      /// the commission/gross/GST columns are split from.
+      grossAmount: money2(items.reduce((s, a) => s + a.grossAmount, 0)),
+      payable: money2(items.reduce((s, a) => s + a.payable, 0)),
+      pendingPayable: money2(items.reduce((s, a) => s + a.weekPending, 0)),
+      carryForward: money2(items.reduce((s, a) => s + a.carryForward, 0)),
+      totalDue: money2(items.reduce((s, a) => s + a.totalDue, 0)),
     },
     items,
   };
@@ -752,20 +805,33 @@ exports.monthlyReport = async ({ month, scope }) => {
       };
       byPartner.set(e.partnerId, agg);
     }
+    /// Exact 2dp split (Booking-report math) — NOT the floored Int
+    /// ledger columns, which read ₹0 on small bookings.
+    const s = displaySplit(e);
     agg.jobs += 1;
     agg.grossAmount += e.bookingAmount;
-    agg.partnerGross += e.earnedAmount;
-    agg.partnerGst += e.partnerGst;
-    agg.partnerNet += e.netAmount;
-    agg.dhoondCommission += e.dhoondCommission;
-    agg.dhoondGst += e.dhoondGst;
-    agg.dhoondNet += e.dhoondNet;
-    if (e.status === 'paid') agg.paidAmount += e.netAmount;
-    else agg.pendingAmount += e.netAmount;
+    agg.partnerGross += s.partnerGross;
+    agg.partnerGst += s.partnerGst;
+    agg.partnerNet += s.partnerNet;
+    agg.dhoondCommission += s.dhoondGross;
+    agg.dhoondGst += s.dhoondGst;
+    agg.dhoondNet += s.dhoondNet;
+    if (e.status === 'paid') agg.paidAmount += s.partnerNet;
+    else agg.pendingAmount += s.partnerNet;
   }
 
-  const items = [...byPartner.values()].sort((x, y) => y.partnerNet - x.partnerNet);
-  const sum = (key) => items.reduce((s, a) => s + a[key], 0);
+  const MONEY_KEYS = [
+    'grossAmount', 'partnerGross', 'partnerGst', 'partnerNet',
+    'dhoondCommission', 'dhoondGst', 'dhoondNet', 'paidAmount', 'pendingAmount',
+  ];
+  const items = [...byPartner.values()]
+    .map((a) => {
+      /// Float-drift guard on the accumulated figures.
+      for (const k of MONEY_KEYS) a[k] = money2(a[k]);
+      return a;
+    })
+    .sort((x, y) => y.partnerNet - x.partnerNet);
+  const sum = (key) => money2(items.reduce((s, a) => s + a[key], 0));
 
   return {
     month,
