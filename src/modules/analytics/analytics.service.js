@@ -33,8 +33,13 @@ const dateFromRange = (range = '7d') => {
   return { from, days };
 };
 
-const fmtDay = (d) =>
-  d.toLocaleDateString('en-IN', { weekday: 'short' });
+/// Axis label for one day-bucket. Weekday names only make sense inside a
+/// single week — on 30d/90d they repeat ("Tue Sat Tue Sat…") and say
+/// nothing, so longer windows label with the calendar date instead.
+const fmtDay = (d, days = 7) =>
+  days <= 7
+    ? d.toLocaleDateString('en-IN', { weekday: 'short' })
+    : d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
 
 /// LOCAL calendar-date key (YYYY-MM-DD).
 ///
@@ -127,7 +132,7 @@ exports.revenueSeries = async ({ range = '7d' } = {}, scope) => {
   for (let i = 0; i < days; i++) {
     const d = new Date(seriesStart); d.setDate(d.getDate() + i);
     const key = localDayKey(d);
-    buckets.set(key, { day: fmtDay(d), revenue: 0, jobs: 0 });
+    buckets.set(key, { day: fmtDay(d, days), revenue: 0, jobs: 0 });
   }
   for (const b of bookings) {
     const key = localDayKey(b.createdAt);
@@ -749,7 +754,7 @@ exports.customerInsights = async ({ range = '90d' } = {}, scope) => {
   const buckets = new Map();
   for (let i = 0; i < days; i++) {
     const d = new Date(from); d.setDate(d.getDate() + i);
-    buckets.set(d.toISOString().slice(0, 10), { day: fmtDay(d), count: 0 });
+    buckets.set(d.toISOString().slice(0, 10), { day: fmtDay(d, days), count: 0 });
   }
   for (const c of customers) {
     const key = c.createdAt.toISOString().slice(0, 10);
