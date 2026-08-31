@@ -220,6 +220,29 @@ exports.partnerMine = asyncHandler(async (req, res) => {
   success(res, items, 'Bookings fetched');
 });
 
+/// Self-service view of the partner's own cancellation strikes /
+/// penalties — the same shape + rolling-7-day math the admin panel's
+/// Partner details "Cancellation strikes" card uses, so what the
+/// partner sees and what triggers their auto-suspend always agree.
+/// Reuses `partners.service.cancellationHistory` (admin-facing by
+/// route, but partner-scoped by argument) rather than duplicating it.
+exports.myCancellations = asyncHandler(async (req, res) => {
+  const partnersService = require('../partners/partners.service');
+  const data = await partnersService.cancellationHistory(req.user.sub);
+  success(res, data, 'Cancellation history fetched');
+});
+
+/// Self-service view of the partner's own suspend / pause / re-activate
+/// history — the same admin-audit-log-derived list the admin panel's
+/// Partner details "Account status history" card shows, so a partner
+/// can see WHY and WHEN their account was actioned instead of only
+/// seeing the live "Account suspended" banner while it's happening.
+exports.myStatusHistory = asyncHandler(async (req, res) => {
+  const partnersService = require('../partners/partners.service');
+  const items = await partnersService.statusHistory(req.user.sub);
+  success(res, items, 'Account status history fetched');
+});
+
 exports.partnerCancel = asyncHandler(async (req, res) => {
   const result = await service.partnerCancel({
     partnerId: req.user.sub,

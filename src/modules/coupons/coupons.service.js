@@ -26,6 +26,7 @@ const adminShape = (c) => ({
   validUntil: c.validUntil,
   usageLimit: c.usageLimit,
   usedCount: c.usedCount,
+  perUserLimit: c.perUserLimit,
   active: c.active,
   createdAt: c.createdAt,
   updatedAt: c.updatedAt,
@@ -45,8 +46,10 @@ const computeDiscount = (coupon, subtotal) => {
 /// Throw if the coupon row is unusable for the given subtotal/time. The
 /// same checks fire on customer apply *and* booking creation — never
 /// trust the apply call alone (the user could change the cart between
-/// apply and book).
-const assertUsable = (coupon, subtotal, now = new Date()) => {
+/// apply and book). `perUserUsedCount` is the CALLER's job to compute
+/// (a count of the customer's own non-cancelled bookings against this
+/// coupon) — this function only compares it against the coupon's cap.
+const assertUsable = (coupon, subtotal, { now = new Date(), perUserUsedCount = 0 } = {}) => {
   if (!coupon) throw ApiError.notFound('Coupon not found');
   if (!coupon.active) throw ApiError.badRequest('This coupon is inactive');
   if (coupon.validFrom && now < coupon.validFrom) {
@@ -57,6 +60,9 @@ const assertUsable = (coupon, subtotal, now = new Date()) => {
   }
   if (coupon.usageLimit != null && coupon.usedCount >= coupon.usageLimit) {
     throw ApiError.badRequest('This coupon has reached its usage limit');
+  }
+  if (coupon.perUserLimit != null && perUserUsedCount >= coupon.perUserLimit) {
+    throw ApiError.badRequest("You've already used this coupon the maximum number of times");
   }
   if (subtotal < (coupon.minOrderValue ?? 0)) {
     throw ApiError.badRequest(
@@ -77,11 +83,24 @@ const assertUsable = (coupon, subtotal, now = new Date()) => {
 
 /// ── Customer endpoints ────────────────────────────────────────────────
 
+/// Count how many of a customer's OWN bookings already carry this
+/// coupon and haven't been cancelled — the same "does this still
+/// count as used" rule the platform-wide `usedCount` follows (cancel +
+/// refund frees the slot; completed/pending/in-progress bookings still
+/// hold it). No separate ledger table: Booking.couponId + status is
+/// already the source of truth.
+const countPerUserUses = (client, customerId, couponId) =>
+  customerId == null
+    ? Promise.resolve(0)
+    : client.booking.count({
+        where: { customerId: Number(customerId), couponId, status: { not: 'CANCELLED' } },
+      });
+
 /// Validate a coupon code against an in-flight cart and return the
 /// computed discount. Doesn't mutate `usedCount` — that happens at
 /// booking creation. Subtotal is recomputed from real services to
 /// stop a tampered client from inflating it past the minOrder gate.
-exports.applyForCart = async ({ code, items }) => {
+exports.applyForCart = async ({ code, items, customerId }) => {
   if (!code || !items?.length) throw ApiError.badRequest('Coupon code and items required');
 
   const coupon = await prisma.coupon.findUnique({
@@ -102,7 +121,10 @@ exports.applyForCart = async ({ code, items }) => {
     return sum + svc.basePrice * i.qty;
   }, 0);
 
-  assertUsable(coupon, subtotal);
+  const perUserUsedCount = coupon
+    ? await countPerUserUses(prisma, customerId, coupon.id)
+    : 0;
+  assertUsable(coupon, subtotal, { perUserUsedCount });
 
   const discount = computeDiscount(coupon, subtotal);
 
@@ -118,7 +140,7 @@ exports.applyForCart = async ({ code, items }) => {
 /// their validity window, and not exhausted. Returns the same safe shape
 /// as `apply` (no usedCount), plus `validUntil` so the app can show expiry.
 /// The real discount is still re-validated on apply / at booking creation.
-exports.listAvailable = async () => {
+exports.listAvailable = async (customerId) => {
   const now = new Date();
   const coupons = await prisma.coupon.findMany({
     where: {
@@ -130,23 +152,49 @@ exports.listAvailable = async () => {
     },
     orderBy: [{ minOrderValue: 'asc' }, { discountValue: 'desc' }],
   });
-  return coupons
-    .filter((c) => c.usageLimit == null || c.usedCount < c.usageLimit)
+  const globallyLive = coupons.filter((c) => c.usageLimit == null || c.usedCount < c.usageLimit);
+
+  /// Drop codes THIS customer has personally exhausted. One grouped
+  /// query instead of one-per-coupon — only needed for the subset that
+  /// actually carries a per-user cap.
+  const capped = globallyLive.filter((c) => c.perUserLimit != null);
+  let usedByCoupon = new Map();
+  if (customerId != null && capped.length > 0) {
+    const grouped = await prisma.booking.groupBy({
+      by: ['couponId'],
+      where: {
+        customerId: Number(customerId),
+        couponId: { in: capped.map((c) => c.id) },
+        status: { not: 'CANCELLED' },
+      },
+      _count: { _all: true },
+    });
+    usedByCoupon = new Map(grouped.map((g) => [g.couponId, g._count._all]));
+  }
+
+  return globallyLive
+    .filter((c) => c.perUserLimit == null || (usedByCoupon.get(c.id) ?? 0) < c.perUserLimit)
     .map((c) => ({ ...customerShape(c), validUntil: c.validUntil }));
 };
 
 /// Internal — called by bookings.service.create after the cart's
 /// subtotal is locked. Returns the computed discount and ensures
 /// `usedCount` ticks atomically. Throws if the coupon is unusable
-/// (so the booking transaction can roll back).
-exports.redeemForBooking = async ({ code, subtotal, tx }) => {
+/// (so the booking transaction can roll back). Always called inside
+/// the SAME transaction as the booking insert (`tx`), which is what
+/// keeps the per-user count check honest against a concurrent retry
+/// from the same customer.
+exports.redeemForBooking = async ({ code, subtotal, customerId, tx }) => {
   if (!code) return null;
   const client = tx ?? prisma;
 
   const coupon = await client.coupon.findUnique({
     where: { code: code.trim().toUpperCase() },
   });
-  assertUsable(coupon, subtotal);
+  const perUserUsedCount = coupon
+    ? await countPerUserUses(client, customerId, coupon.id)
+    : 0;
+  assertUsable(coupon, subtotal, { perUserUsedCount });
   const discount = computeDiscount(coupon, subtotal);
 
   /// Atomic increment guards against two concurrent bookings consuming
@@ -235,6 +283,7 @@ const normaliseInput = (data) => ({
   validFrom: data.validFrom ? new Date(data.validFrom) : null,
   validUntil: data.validUntil ? new Date(data.validUntil) : null,
   usageLimit: data.usageLimit ?? null,
+  perUserLimit: data.perUserLimit ?? null,
   active: data.active ?? true,
 });
 

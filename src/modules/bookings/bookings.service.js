@@ -1212,6 +1212,7 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
       couponData = await couponsService.redeemForBooking({
         code: payload.couponCode,
         subtotal,
+        customerId,
         tx,
       });
     }

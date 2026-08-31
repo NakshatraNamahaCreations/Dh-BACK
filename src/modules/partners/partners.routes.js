@@ -37,6 +37,7 @@ router.post('/', adminOnly, requirePermission('partners.edit'), validate(createS
 router.get('/:id', adminOnly, requirePermission('partners.view'), validate(idParam), controller.get);
 router.patch('/:id/status', adminOnly, requirePermission('partners.suspend'), validate(statusSchema), controller.updateStatus);
 router.get('/:id/status-history', adminOnly, requirePermission('partners.view'), validate(idParam), controller.statusHistory);
+router.get('/:id/cancellations', adminOnly, requirePermission('partners.view'), validate(idParam), controller.cancellationHistory);
 router.patch('/:id/documents', adminOnly, requirePermission('partners.edit'), validate(updateDocumentsSchema), controller.updateDocuments);
 router.patch('/:id/category', adminOnly, requirePermission('partners.edit'), validate(updateCategorySchema), controller.updateCategory);
 

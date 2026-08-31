@@ -1278,6 +1278,13 @@ model Coupon {
   /// Total redemptions allowed across all customers. Null = unlimited.
   usageLimit      Int?
   usedCount       Int                @default(0)
+  /// Redemptions allowed PER CUSTOMER — distinct from `usageLimit`
+  /// (the platform-wide cap). Null = no per-customer cap (same customer
+  /// can reuse the code repeatedly, up to usageLimit). Enforced by
+  /// counting the customer's own non-cancelled bookings against this
+  /// coupon (coupons.service) — no separate ledger table needed since
+  /// Booking.couponId + status already carries what's required.
+  perUserLimit    Int?
   active          Boolean            @default(true)
 
   bookings        Booking[]

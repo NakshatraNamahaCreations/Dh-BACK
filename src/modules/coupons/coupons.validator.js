@@ -19,6 +19,9 @@ const couponBodySchema = z
     validFrom: z.string().datetime().optional().nullable(),
     validUntil: z.string().datetime().optional().nullable(),
     usageLimit: z.coerce.number().int().min(1).optional().nullable(),
+    /// Per-customer cap — distinct from `usageLimit` (the platform-wide
+    /// total). Null/omitted = unlimited per customer.
+    perUserLimit: z.coerce.number().int().min(1).optional().nullable(),
     active: z.boolean().optional(),
   })
   .refine((v) => v.discountType !== 'PERCENT' || v.discountValue <= 100, {

@@ -718,6 +718,59 @@ exports.statusHistory = async (id) => {
     .filter(Boolean);
 };
 
+/// Cancellation-strike history for a partner — the "how many strikes"
+/// view the admin panel never surfaced anywhere. Strikes are
+/// `PartnerAdjustment` rows of type `cancellation_penalty`, written one
+/// per partner-initiated cancel (see `bookings.service.exports.partnerCancel`,
+/// which is also where the rolling-7-day auto-suspend is enforced).
+/// Mirrors that same rolling window + limit here so the count shown
+/// here is EXACTLY the number that would trigger auto-suspend right now.
+exports.cancellationHistory = async (id) => {
+  const partnerId = Number(id);
+  const policyService = require('../policy/policy.service');
+  const policy = await policyService.getCancellation();
+  const strikeLimit = Math.max(1, Number(policy.partnerStrikeLimit) || 1);
+  const windowStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+  const [rows, strikesInWindow] = await Promise.all([
+    prisma.partnerAdjustment.findMany({
+      where: { partnerId, type: 'cancellation_penalty' },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: {
+        id: true, bookingId: true, amount: true, reason: true,
+        status: true, createdAt: true,
+        booking: { select: { bookingRef: true } },
+      },
+    }),
+    prisma.partnerAdjustment.count({
+      where: { partnerId, type: 'cancellation_penalty', createdAt: { gte: windowStart } },
+    }),
+  ]);
+
+  return {
+    strikesInWindow,
+    strikeLimit,
+    windowDays: 7,
+    /// True when the NEXT cancellation would flip the partner to
+    /// suspended — lets the UI warn before it happens, not just report
+    /// it after the fact.
+    atRisk: strikesInWindow >= strikeLimit - 1 && strikesInWindow < strikeLimit,
+    items: rows.map((r) => ({
+      id: r.id,
+      bookingId: r.bookingId,
+      bookingRef: r.booking?.bookingRef ?? (r.bookingId != null ? `#${r.bookingId}` : null),
+      amount: r.amount,
+      reason: r.reason,
+      /// pending (awaiting next payout) | applied (netted into a paid
+      /// payout) | reversed (admin voided it — still a strike, just no
+      /// money impact).
+      status: r.status,
+      at: r.createdAt,
+    })),
+  };
+};
+
 exports.listOnboarding = async ({ status, search, categoryId, order, from, to, scope, page = 1, pageSize = 25 } = {}) => {
   const { applyScopeToWhere } = require('../../middlewares/adminScope');
   const where = { isVerified: false };

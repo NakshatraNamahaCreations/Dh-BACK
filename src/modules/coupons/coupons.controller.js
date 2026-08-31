@@ -8,12 +8,13 @@ exports.apply = asyncHandler(async (req, res) => {
   const data = await service.applyForCart({
     code: req.body.code,
     items: req.body.items,
+    customerId: req.user.sub,
   });
   success(res, data, 'Coupon applied');
 });
 
 exports.listAvailable = asyncHandler(async (req, res) => {
-  const data = await service.listAvailable();
+  const data = await service.listAvailable(req.user.sub);
   success(res, data, 'Coupons fetched');
 });
 

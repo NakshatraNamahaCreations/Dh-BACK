@@ -578,11 +578,31 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
   }
   const carryRows = [...carryByPartner.entries()].map(([partnerId]) => ({ partnerId }));
 
-  /// Partners with old dues but NO earnings this week still need a row
-  /// (otherwise their dues silently vanish from the screen).
-  const missingIds = carryRows
-    .map((c) => c.partnerId)
-    .filter((id) => !byPartner.has(id) && (carryByPartner.get(id)?.amount ?? 0) > 0);
+  /// Pending debits (cancellation penalties, etc.) — ANY pending
+  /// PartnerAdjustment, not scoped to this week, mirroring the classic
+  /// Generate-payout flow's netting so the figure shown here is exactly
+  /// what "Mark week paid" is about to deduct. Not type-filtered (same
+  /// as `generateForPartner` / `listPartnerSummaries`) so a future debit
+  /// type nets the same way without a code change.
+  const pendingAdjRows = await prisma.partnerAdjustment.groupBy({
+    by: ['partnerId'],
+    where: { status: 'pending', payoutId: null, ...partnerCityWhere(scope) },
+    _sum: { amount: true },
+    _count: { _all: true },
+  });
+  const pendingAdjByPartner = new Map(
+    pendingAdjRows.map((a) => [a.partnerId, { amount: a._sum.amount ?? 0, count: a._count._all }]),
+  );
+
+  /// Partners with old dues OR pending penalties but NO earnings this
+  /// week still need a row (otherwise those amounts silently vanish
+  /// from the screen).
+  const missingIds = [
+    ...new Set([
+      ...carryRows.map((c) => c.partnerId).filter((id) => (carryByPartner.get(id)?.amount ?? 0) > 0),
+      ...pendingAdjRows.map((a) => a.partnerId).filter((id) => (pendingAdjByPartner.get(id)?.amount ?? 0) !== 0),
+    ]),
+  ].filter((id) => !byPartner.has(id));
   if (missingIds.length) {
     const partners = await prisma.partner.findMany({
       where: { id: { in: missingIds } },
@@ -629,6 +649,8 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
       const weekPending = money2(weekPendingByPartner.get(a.partnerId) ?? 0);
       const carry = carryByPartner.get(a.partnerId) ?? { amount: 0, jobs: 0 };
       const carryForward = money2(carry.amount);
+      const pendingAdj = pendingAdjByPartner.get(a.partnerId) ?? { amount: 0, count: 0 };
+      const penalties = money2(pendingAdj.amount);
       return {
         ...a,
         /// money2 on every accumulated figure — pure float-drift guard.
@@ -641,8 +663,18 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
         /// Old dues from previous weeks (still unpaid).
         carryForward,
         carryForwardJobs: carry.jobs,
-        /// Everything the partner is owed as of this week's end.
-        totalDue: money2(weekPending + carryForward),
+        /// Pending debits (cancellation penalties) that "Mark week paid"
+        /// will net out of the transfer — same figure the classic
+        /// Generate-payout flow deducts. Can exceed what's owed (a
+        /// partner who cancelled a lot with few completed jobs); the
+        /// UI shows that as a negative total due rather than pretending
+        /// the debt doesn't exist.
+        penalties,
+        penaltyCount: pendingAdj.count,
+        /// Everything the partner is owed as of this week's end, AFTER
+        /// pending penalties. This is the exact amount "Mark week paid"
+        /// transfers and settles.
+        totalDue: money2(weekPending + carryForward - penalties),
         status:
           a.jobs === 0
             ? 'pending' // carry-forward-only row
@@ -668,6 +700,7 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
       payable: money2(items.reduce((s, a) => s + a.payable, 0)),
       pendingPayable: money2(items.reduce((s, a) => s + a.weekPending, 0)),
       carryForward: money2(items.reduce((s, a) => s + a.carryForward, 0)),
+      penalties: money2(items.reduce((s, a) => s + a.penalties, 0)),
       totalDue: money2(items.reduce((s, a) => s + a.totalDue, 0)),
     },
     items,
@@ -709,21 +742,50 @@ exports.weeklyMarkPaid = async ({ weekStart, partnerIds, scope }) => {
     byPartner.get(e.partnerId).push(e);
   }
 
+  /// Pending debits (cancellation penalties, etc.) for every partner
+  /// being settled — netted into the payout amount below, exactly like
+  /// the classic Generate-payout flow. Previously "Mark week paid" only
+  /// looked at PartnerEarning rows, so a partner's cancellation
+  /// penalties never actually left their balance: they just sat as
+  /// `pending` PartnerAdjustment rows forever while the full earnings
+  /// amount got paid out regardless.
+  const settledPartnerIds = [...byPartner.keys()];
+  const pendingAdjustments = await prisma.partnerAdjustment.findMany({
+    where: { partnerId: { in: settledPartnerIds }, status: 'pending', payoutId: null },
+    select: { id: true, partnerId: true, amount: true },
+  });
+  const adjByPartner = new Map();
+  for (const a of pendingAdjustments) {
+    if (!adjByPartner.has(a.partnerId)) adjByPartner.set(a.partnerId, []);
+    adjByPartner.get(a.partnerId).push(a);
+  }
+
   const now = new Date();
   const weekLabel = start.toISOString().slice(0, 10);
   let updated = 0;
 
   for (const [partnerId, earnings] of byPartner) {
-    const amount = earnings.reduce(
+    const earningsTotal = earnings.reduce(
       (s, e) => s + (e.netAmount > 0 ? e.netAmount : e.earnedAmount),
       0,
     );
+    const adjustments = adjByPartner.get(partnerId) ?? [];
+    const adjustmentsTotal = adjustments.reduce((s, a) => s + a.amount, 0);
+    /// Can go negative when pending penalties exceed the week's
+    /// earnings — same intentional behaviour as `generateForPartner`
+    /// (the partner carries the remaining debit into the next cycle
+    /// rather than it silently disappearing).
+    const amount = earningsTotal - adjustmentsTotal;
     const periodStart = earnings.reduce(
       (min, e) => (e.createdAt < min ? e.createdAt : min),
       earnings[0].createdAt,
     );
-    // One transaction per partner — payout row + earning links land
-    // together or not at all.
+    const notes =
+      adjustmentsTotal > 0
+        ? `Weekly settlement (week of ${weekLabel}) — bulk marked paid from Payout management. Includes −₹${adjustmentsTotal} in cancellation penalties (${adjustments.length}).`
+        : `Weekly settlement (week of ${weekLabel}) — bulk marked paid from Payout management`;
+    // One transaction per partner — payout row + earning/adjustment
+    // links land together or not at all.
     await prisma.$transaction(async (tx) => {
       const payout = await tx.payout.create({
         data: {
@@ -734,13 +796,19 @@ exports.weeklyMarkPaid = async ({ weekStart, partnerIds, scope }) => {
           periodStart,
           periodEnd: new Date(end.getTime() - 1),
           paidAt: now,
-          notes: `Weekly settlement (week of ${weekLabel}) — bulk marked paid from Payout management`,
+          notes,
         },
       });
       await tx.partnerEarning.updateMany({
         where: { id: { in: earnings.map((e) => e.id) } },
         data: { status: 'paid', paidAt: now, payoutId: payout.id },
       });
+      if (adjustments.length > 0) {
+        await tx.partnerAdjustment.updateMany({
+          where: { id: { in: adjustments.map((a) => a.id) } },
+          data: { payoutId: payout.id, status: 'applied' },
+        });
+      }
     });
     updated += earnings.length;
   }

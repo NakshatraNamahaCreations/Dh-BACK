@@ -37,6 +37,8 @@ const partnerOnly = [authenticate, requireType('PARTNER')];
 // ── Partner routes (before /:id catch-alls) ──────────────────────────────────
 router.get('/partner/incoming', partnerOnly, validate(partnerIncomingQuerySchema), controller.partnerIncoming);
 router.get('/partner/mine', partnerOnly, validate(partnerMineQuerySchema), controller.partnerMine);
+router.get('/partner/cancellations/mine', partnerOnly, controller.myCancellations);
+router.get('/partner/status-history/mine', partnerOnly, controller.myStatusHistory);
 router.post('/partner/:id/accept', partnerOnly, validate(idParam), controller.partnerAccept);
 router.post('/partner/:id/cancel', partnerOnly, validate(partnerCancelSchema), controller.partnerCancel);
 router.post('/partner/:id/status', partnerOnly, validate(partnerStatusSchema), controller.partnerUpdateStatus);

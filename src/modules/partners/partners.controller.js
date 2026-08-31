@@ -36,6 +36,14 @@ exports.statusHistory = asyncHandler(async (req, res) => {
   success(res, items, 'Partner status history fetched');
 });
 
+/// Cancellation-strike count + history for the partner-details page —
+/// the rolling-7-day strike count that drives auto-suspend, made visible
+/// to admins instead of only being enforced silently on partnerCancel.
+exports.cancellationHistory = asyncHandler(async (req, res) => {
+  const item = await service.cancellationHistory(req.params.id);
+  success(res, item, 'Partner cancellation history fetched');
+});
+
 exports.updateDocuments = asyncHandler(async (req, res) => {
   const item = await service.updateDocuments(req.params.id, req.body);
   success(res, item, 'Partner documents updated');
