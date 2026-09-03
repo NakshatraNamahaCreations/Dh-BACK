@@ -312,6 +312,12 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       lat: true,
       lng: true,
       offeredPrice: true,
+      /// Drives the green "+₹N extra" chip on the partner's offer card.
+      /// Same trap as the address fields below: this is an explicit
+      /// `select`, so a field missing here is silently `undefined` in the
+      /// socket/push payload, and the chip only appeared once the app's
+      /// HTTP refresh caught up seconds later.
+      offerBumpAmount: true,
       isInstant: true,
       scheduledAt: true,
       createdAt: true,
