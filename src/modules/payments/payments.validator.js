@@ -120,6 +120,18 @@ const razorpayVerifySchema = z.object({
   }),
 });
 
+/// Partner balance settlement — the same signed triple as a booking
+/// payment but with NO bookingId (the payment settles a ledger balance,
+/// not a job) and deliberately NO amount: the server derives what is
+/// owed from the earnings ledger, so a client cannot propose a figure.
+const balanceSettlementVerifySchema = z.object({
+  body: z.object({
+    razorpayOrderId: z.string().min(1),
+    razorpayPaymentId: z.string().min(1),
+    razorpaySignature: z.string().min(1),
+  }),
+});
+
 /// Add-on side-bill — same field shapes as the main order/verify pair.
 const razorpayAddOnOrderSchema = razorpayCreateOrderSchema;
 const razorpayAddOnVerifySchema = razorpayVerifySchema;
@@ -182,6 +194,7 @@ module.exports = {
   ledgerQuerySchema,
   razorpayCreateOrderSchema,
   razorpayVerifySchema,
+  balanceSettlementVerifySchema,
   razorpayAddOnOrderSchema,
   razorpayAddOnVerifySchema,
   razorpayReconcileSchema,

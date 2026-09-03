@@ -642,6 +642,7 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     grandTotal: fare.grandTotal,
     couponDiscount: b.couponDiscount,
     addOnPaidTotal: addOnShape.addOnPaidTotal,
+    offeredPrice: b.offeredPrice,
   });
   const primaryCategoryId = b.items?.[0]?.service?.categoryId ?? null;
   const partnerCommissionPct =
@@ -652,9 +653,18 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
   /// settled amount). Partner gross = base × partnerPct%.
   /// Partner 5% GST is deducted from gross → net is what gets credited.
   /// Matches the earnings.service computeBreakdown design exactly.
-  const _partnerGross = Math.floor((revenueTotal * partnerCommissionPct) / 100);
-  const _partnerGst   = Math.round(_partnerGross * 5 / 100);
-  const partnerEarning = _partnerGross - _partnerGst; // net credited to partner
+  ///
+  /// Rounded to 2dp, NOT floored. `Math.floor` here meant 80% of a ₹1
+  /// booking (₹0.80) displayed as ₹0 — a partner who completed a job saw
+  /// "1 completed orders · ₹0" and no explanation. The whole-rupee Int
+  /// ledger has to floor because its columns are Ints, but this is a
+  /// DISPLAY shape with no such constraint, and the admin panel's
+  /// booking report already shows the exact 2dp split. Flooring here was
+  /// the only reason the two disagreed.
+  const money2 = (v) => Math.round(v * 100) / 100;
+  const _partnerGross = money2((revenueTotal * partnerCommissionPct) / 100);
+  const _partnerGst   = money2(_partnerGross * 5 / 100);
+  const partnerEarning = money2(_partnerGross - _partnerGst); // net credited to partner
 
   const statusMap = {
     PENDING: 'incoming',
@@ -1228,7 +1238,14 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
     }
 
     let couponData = null;
-    if (payload.couponCode) {
+    /// Skip redemption entirely on BYOP. The validator already rejects
+    /// the combination, so this is the second layer: it stops an
+    /// admin-created or otherwise non-validated call from burning a
+    /// customer's coupon use on a booking whose price the coupon can't
+    /// affect — and, more importantly, from writing a `couponDiscount`
+    /// that `partnerEarningsBase` would later add back on top of the
+    /// offered price and pay out against money never collected.
+    if (payload.couponCode && payload.offeredPrice == null) {
       couponData = await couponsService.redeemForBooking({
         code: payload.couponCode,
         subtotal,
@@ -2663,11 +2680,17 @@ exports.reassign = async (bookingId, partnerId, reason = 'Manual assignment') =>
   /// is still connected — which on aggressive OEMs is unreliable.
   /// Mirrors what the dispatcher does for the normal wave path.
   const headService = updated.items?.[0]?.serviceName ?? 'Service';
-  /// Same single-source-of-truth pricing as the dispatcher: grandTotal
-  /// is the customer-facing all-in amount the partner-app surfaces
-  /// inside the job-request screen, so the assign notification quotes
-  /// the same number. BYOP wins, grandTotal next, legacy `total` last.
-  const amount = updated.offeredPrice ?? updated.grandTotal ?? updated.total ?? 0;
+  /// Same single-source-of-truth pricing as the dispatcher: the
+  /// PARTNER-facing job value, which adds back any Dhoond-funded coupon
+  /// (utils/fare partnerEarningsBase) so an assigned job is quoted at
+  /// the amount the partner will actually be paid on — not the reduced
+  /// sum the customer handed over. BYOP wins, grandTotal next, legacy
+  /// `total` last.
+  const amount = partnerEarningsBase({
+    grandTotal: updated.offeredPrice ?? updated.grandTotal ?? updated.total ?? 0,
+    couponDiscount: updated.couponDiscount,
+    offeredPrice: updated.offeredPrice,
+  });
   /// Ring the partner-app's "New job assigned" alert (5s vibrate +
   /// sound) over the live socket when their app is open + connected.
   /// Distinct from the dispatch.offer path: this job is already theirs,

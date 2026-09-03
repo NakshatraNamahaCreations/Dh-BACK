@@ -252,6 +252,40 @@ exports.setDuty = async ({ partnerId, onDuty, lat, lng }) => {
   });
 
   if (onDuty) {
+    /// NEGATIVE-BALANCE GATE — a partner who owes Dhoond more in unpaid
+    /// cancellation penalties than they've earned cannot take new work
+    /// until they clear it. Six cancellations at ₹200 is ₹1,200 of
+    /// strikes; letting that partner keep accepting jobs means the debt
+    /// just rolls forward against future payouts forever while they go
+    /// on cancelling.
+    ///
+    /// Enforced HERE, server-side, not only in the app: the client gate
+    /// is UX, but presence can also be re-registered by the socket ping
+    /// and the background task, so an out-of-date or tampered build
+    /// would otherwise walk straight back into the dispatch pool.
+    ///
+    /// Going OFF duty is never gated — we must always let a partner
+    /// stop working.
+    const { balanceForPartner } = require('../payments/earnings.service');
+    const wallet = await balanceForPartner(Number(partnerId)).catch(() => null);
+    /// Fail OPEN on a lookup error. A Redis/DB hiccup must not strand
+    /// every partner off-duty; the debt is still owed and the gate will
+    /// catch them on the next toggle.
+    if (wallet?.owes) {
+      throw new ApiError(
+        403,
+        `You have an outstanding balance of ₹${wallet.dueAmount}. Clear your pending cancellation penalties to go back on duty.`,
+        {
+          code: 'NEGATIVE_BALANCE',
+          balance: wallet.balance,
+          dueAmount: wallet.dueAmount,
+          pendingEarnings: wallet.pendingEarnings,
+          pendingPenalties: wallet.pendingPenalties,
+          penaltyCount: wallet.penaltyCount,
+        },
+      );
+    }
+
     await registry.clearOffDuty(Number(partnerId));
 
     /// SELF-HEAL a stale "busy" flag. A partner's active-job flag

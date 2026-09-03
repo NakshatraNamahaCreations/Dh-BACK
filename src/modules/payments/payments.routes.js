@@ -13,6 +13,7 @@ const {
   ledgerQuerySchema,
   razorpayCreateOrderSchema,
   razorpayVerifySchema,
+  balanceSettlementVerifySchema,
   razorpayAddOnOrderSchema,
   razorpayAddOnVerifySchema,
   razorpayReconcileSchema,
@@ -27,6 +28,7 @@ const router = express.Router();
 
 const adminOnly = [authenticate, requireType('ADMIN')];
 const customerOnly = [authenticate, requireType('CUSTOMER')];
+const partnerOnly = [authenticate, requireType('PARTNER')];
 
 // ── Razorpay (customer-facing) ─────────────────────────────────────────────
 // Webhook MUST be registered with express.raw() so the signature can be
@@ -79,6 +81,24 @@ router.post(
   customerOnly,
   validate(razorpayAddOnVerifySchema),
   controller.razorpayAddOnVerify,
+);
+
+// ── Partner: own wallet balance ────────────────────────────────────────────
+// The signed-in partner's unsettled position (unpaid earnings − unpaid
+// cancellation penalties). Registered BEFORE the admin `/earnings/*`
+// routes and under `/me` so it can never collide with the
+// `/earnings/partners/:id` param route. Partner id comes from the JWT.
+router.get('/me/balance', partnerOnly, controller.myBalance);
+// Settle a negative balance from the partner app. The order carries NO
+// client-supplied amount — it is derived from the ledger server-side —
+// and verify re-fetches the order from Razorpay to prove it was minted
+// for this partner before crediting anything.
+router.post('/me/balance/order', partnerOnly, controller.myBalanceOrder);
+router.post(
+  '/me/balance/verify',
+  partnerOnly,
+  validate(balanceSettlementVerifySchema),
+  controller.myBalanceVerify,
 );
 
 // ── Admin: Commission rules ────────────────────────────────────────────────

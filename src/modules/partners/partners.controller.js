@@ -44,6 +44,14 @@ exports.cancellationHistory = asyncHandler(async (req, res) => {
   success(res, item, 'Partner cancellation history fetched');
 });
 
+/// Waive a pending cancellation penalty so it stops counting against the
+/// partner's payable balance (and unblocks their duty toggle). The strike
+/// itself is retained.
+exports.waiveAdjustment = asyncHandler(async (req, res) => {
+  const item = await service.waiveAdjustment(req.params.adjustmentId, { reason: req.body?.reason });
+  success(res, item, 'Penalty waived');
+});
+
 exports.updateDocuments = asyncHandler(async (req, res) => {
   const item = await service.updateDocuments(req.params.id, req.body);
   success(res, item, 'Partner documents updated');

@@ -50,6 +50,19 @@ const createSchema = z.object({
       message: 'Book at your price is available only for instant bookings',
       path: ['offeredPrice'],
     })
+    /// A coupon is meaningless on a customer-NAMED price — `computeFare`
+    /// uses `offeredPrice` as the grand total verbatim and ignores the
+    /// discount, so the customer is charged the full offer either way.
+    /// The coupon would nonetheless be persisted as `couponDiscount`, and
+    /// `partnerEarningsBase` adds coupons back on top of what was
+    /// collected — so the pair would credit the partner for a discount
+    /// that never came off the bill, paying out MORE than Dhoond took in.
+    /// The customer app never sends both; this makes that a server rule
+    /// rather than a client convention a stale build or curl can break.
+    .refine((v) => v.offeredPrice == null || !v.couponCode, {
+      message: 'A coupon cannot be applied to a Book at your price offer',
+      path: ['couponCode'],
+    })
     .refine((v) => Boolean(v.customerAddressId) || (v.addressLine && v.city), {
       message: 'Either customerAddressId or addressLine + city must be provided',
       path: ['addressLine'],

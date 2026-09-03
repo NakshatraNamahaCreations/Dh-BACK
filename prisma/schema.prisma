@@ -1117,14 +1117,31 @@ model PartnerAdjustment {
   /// lives on and may later earn for a different partner.
   bookingId  Int?
 
-  /// `cancellation_penalty` today; open string so future debit/credit
-  /// types (manual_debit, bonus, etc.) don't need a migration.
+  /// `cancellation_penalty` (debit) and `balance_settlement` (credit —
+  /// the partner paid off a negative balance from the app) today; open
+  /// string so future debit/credit types (manual_debit, bonus, etc.)
+  /// don't need a migration.
   type       String
-  /// Positive whole rupees to DEDUCT from the partner's next payout.
-  /// May be 0 (penalty disabled in policy) — the row still counts as a
-  /// strike.
+  /// Whole rupees to DEDUCT from the partner's next payout. Normally
+  /// POSITIVE (a penalty). May be 0 (penalty disabled in policy) — the
+  /// row still counts as a strike.
+  ///
+  /// NEGATIVE on a `balance_settlement` row: the partner has paid money
+  /// IN to clear what they owed, so it offsets the penalties instead of
+  /// adding to them. Balance stays a single expression —
+  /// `pendingEarnings - sum(pending adjustments)` — with no special
+  /// casing, and the original penalty rows keep their audit trail
+  /// untouched rather than being rewritten on payment.
   amount     Int      @default(0)
   reason     String?
+
+  /// External payment reference (the Razorpay payment id) for rows
+  /// created by a real money movement. UNIQUE so a replayed or
+  /// double-submitted verify callback can never credit the same
+  /// payment twice — the insert fails instead of silently wiping a
+  /// second penalty. Null for admin/system rows, which is why it is
+  /// nullable (Postgres unique indexes permit many NULLs).
+  externalRef String? @unique
 
   /// pending — not yet netted into a payout
   /// applied — rolled into a Payout (payoutId set)

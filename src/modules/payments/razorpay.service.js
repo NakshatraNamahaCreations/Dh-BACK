@@ -1020,6 +1020,133 @@ exports.verifyOnboardingPayment = async ({
   return { ok: true };
 };
 
+/// Partner BALANCE-SETTLEMENT order — the partner paying off a negative
+/// balance so they can go back on duty.
+///
+/// Differs from the onboarding fee in that the amount is DERIVED, never
+/// client-supplied: we recompute it from the ledger here so a tampered
+/// request can't settle a ₹768 debt for ₹1. The app's displayed figure
+/// is advisory; this is authoritative.
+///
+/// Unlike onboarding we do NOT persist the order id on Partner. There's
+/// no column for it, and a settlement is a repeatable event (a partner
+/// can accrue a new debt next month), so a single cached id would be
+/// wrong anyway. Replay protection instead comes from two places: the
+/// order's `notes` are checked at verify time to prove the order was
+/// minted for THIS partner and this purpose, and the resulting credit
+/// carries the Razorpay payment id under a unique index.
+exports.createBalanceSettlementOrder = async ({ partnerId }) => {
+  const earnings = require('./earnings.service');
+  const id = Number(partnerId);
+
+  const partner = await prisma.partner.findUnique({
+    where: { id },
+    select: { id: true, name: true, email: true, phone: true },
+  });
+  if (!partner) throw ApiError.notFound('Partner not found');
+
+  const wallet = await earnings.balanceForPartner(id);
+  if (!wallet.owes || wallet.payableNow <= 0) {
+    throw ApiError.badRequest('You have no outstanding balance to clear.');
+  }
+
+  const amountPaise = wallet.payableNow * 100;
+
+  const order = await client().orders.create({
+    amount: amountPaise,
+    currency: 'INR',
+    receipt: `partner_balance_${partner.id}_${Date.now()}`,
+    notes: {
+      kind: 'partner_balance_settlement',
+      partnerId: String(partner.id),
+    },
+  });
+
+  return {
+    orderId: order.id,
+    amount: amountPaise,
+    /// Rupees, for the button label — so the app never has to divide.
+    amountRupees: wallet.payableNow,
+    currency: 'INR',
+    keyId: KEY_ID,
+    balance: wallet.balance,
+    partner: {
+      name: partner.name,
+      email: partner.email,
+      phone: partner.phone,
+    },
+  };
+};
+
+/// Verify a settlement payment and credit it against the partner's
+/// balance. Three independent checks before any money is recorded:
+///   1. HMAC signature over `order_id|payment_id` — proves Razorpay
+///      signed it and the payload wasn't forged.
+///   2. The order's `notes` must name THIS partner and this purpose —
+///      stops a partner replaying someone else's signed payload, or
+///      recycling their own onboarding-fee payment as a settlement.
+///   3. The order must actually be paid at Razorpay, and we credit the
+///      order's OWN amount, never a client-supplied one.
+exports.verifyBalanceSettlement = async ({
+  partnerId,
+  razorpayOrderId,
+  razorpayPaymentId,
+  razorpaySignature,
+}) => {
+  const earnings = require('./earnings.service');
+  const id = Number(partnerId);
+
+  if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+    throw ApiError.badRequest('Missing Razorpay fields');
+  }
+  if (!KEY_SECRET) throw ApiError.internal('RAZORPAY_KEY_SECRET not set');
+
+  const expected = crypto
+    .createHmac('sha256', KEY_SECRET)
+    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+    .digest('hex');
+  if (expected !== razorpaySignature) {
+    throw ApiError.badRequest('Signature verification failed');
+  }
+
+  /// Re-read the order from Razorpay rather than trusting anything the
+  /// client sent about it. This is what ties the signed payload to this
+  /// partner — the signature alone only proves Razorpay issued it, not
+  /// that it was issued for THEM.
+  const order = await client().orders.fetch(razorpayOrderId);
+  if (!order || order.notes?.kind !== 'partner_balance_settlement') {
+    throw ApiError.badRequest('This payment is not a balance settlement');
+  }
+  if (String(order.notes?.partnerId) !== String(id)) {
+    throw ApiError.forbidden('This payment belongs to a different partner');
+  }
+  if (order.status !== 'paid') {
+    throw ApiError.badRequest('Payment is not captured yet. Please try again shortly.');
+  }
+
+  /// Credit the amount Razorpay actually collected, converted back from
+  /// paise. Using the order's own figure means even a tampered client
+  /// can't inflate the credit.
+  const amountRupees = Math.round(Number(order.amount) / 100);
+
+  const { adjustment, alreadySettled } = await earnings.settleBalanceForPartner({
+    partnerId: id,
+    amountRupees,
+    externalRef: razorpayPaymentId,
+    note: `Balance cleared by partner via Razorpay (₹${amountRupees})`,
+  });
+
+  const wallet = await earnings.balanceForPartner(id);
+
+  return {
+    ok: true,
+    alreadySettled,
+    adjustmentId: adjustment?.id ?? null,
+    amountPaid: amountRupees,
+    balance: wallet,
+  };
+};
+
 /// Webhook handler — Razorpay POSTs payment events here independently of
 /// the customer app. We rely on this as a backup so a payment that
 /// completed after the user backgrounded the app still flips the

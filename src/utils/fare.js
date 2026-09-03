@@ -95,9 +95,19 @@ exports.computeFare = ({ subtotal, discount = 0, offeredPrice = null } = {}) => 
  * PAID add-ons join the base (the customer settled that money for this
  * job too); unpaid ones stay out.
  *
- * NOT double-counted on BYOP: the customer app never forwards a coupon
- * alongside an `offeredPrice` (a coupon has no effect on a
- * customer-named price), so `couponDiscount` is null on those rows.
+ * NOT double-counted on BYOP. A coupon has no effect on a customer-named
+ * price — `computeFare` uses `offeredPrice` as the grand total verbatim
+ * and never subtracts the discount — so adding it back here would credit
+ * the partner for a reduction that never came off the bill and pay out
+ * more than was collected (₹500 offer + ₹400 coupon ⇒ ₹684 to the
+ * partner against ₹500 taken).
+ *
+ * This used to rest on "the customer app never sends both", which is a
+ * client convention, not a guarantee: a stale build or a direct POST
+ * could send both and mint money. It is now refused at the validator and
+ * skipped at redemption — and ignored HERE too, so a row already written
+ * that way (or backfilled) still can't pay out on the phantom discount.
+ * Pass `offeredPrice` whenever the caller has it.
  *
  * Accounting note: this deliberately splits the PRE-coupon value, so a
  * couponed booking records Dhoond's nominal commission (20% of ₹569 =
@@ -108,9 +118,11 @@ exports.partnerEarningsBase = ({
   grandTotal = 0,
   couponDiscount = 0,
   addOnPaidTotal = 0,
+  offeredPrice = null,
 } = {}) =>
   Math.max(0, Number(grandTotal) || 0) +
-  Math.max(0, Number(couponDiscount) || 0) +
+  /// Coupons never join the base on a BYOP row — see above.
+  (offeredPrice != null ? 0 : Math.max(0, Number(couponDiscount) || 0)) +
   Math.max(0, Number(addOnPaidTotal) || 0);
 
 exports.GST_PCT = GST_PCT;

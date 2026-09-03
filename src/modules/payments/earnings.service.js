@@ -126,6 +126,10 @@ exports.creditForBooking = async (bookingId) => {
     grandTotal: booking.grandTotal ?? booking.total,
     couponDiscount: booking.couponDiscount,
     addOnPaidTotal,
+    /// Suppresses the coupon add-back on BYOP rows — a coupon never came
+    /// off a customer-named price, so adding it back would credit the
+    /// partner more than was collected.
+    offeredPrice: booking.offeredPrice,
   });
   const bd = computeBreakdown(base, partnerPct);
 
@@ -338,6 +342,168 @@ exports.summaryForPartner = async (partnerId) => {
       count: lifetime._count._all,
     },
   };
+};
+
+/**
+ * The partner's own UNSETTLED position — what Dhoond would actually pay
+ * them if a payout ran right now.
+ *
+ *   balance = unpaid earnings − unpaid cancellation penalties
+ *
+ * This is the same arithmetic `weeklyMarkPaid` performs when it nets
+ * pending `PartnerAdjustment` rows out of a settlement, so the number a
+ * partner sees here is the number that hits their bank.
+ *
+ * It can go NEGATIVE, and that case is the point of this function.
+ * Cancellation penalties accrue independently of earnings, so a partner
+ * who cancelled six jobs (₹1,200 in strikes) and then completed one
+ * (₹432 net) is ₹768 in DEBT to the platform. Home previously showed
+ * only the ₹432 and clamped everything else out of view, so the partner
+ * had no idea their next payout was zero — they'd just see a payout
+ * never arrive. We surface the negative directly instead.
+ *
+ * Deliberately scoped to `status: 'pending'` on BOTH sides: rows already
+ * rolled into a payout are settled history and must not re-enter the
+ * balance (netting an applied penalty twice would charge the partner for
+ * the same cancellation on every future payout).
+ *
+ * `netAmount ?? earnedAmount` mirrors `summaryForPartner` — early ledger
+ * rows predate the net column.
+ */
+exports.balanceForPartner = async (partnerId) => {
+  const id = Number(partnerId);
+
+  const [rows, pendingAdj] = await Promise.all([
+    /// Per-row rather than a SQL aggregate, ON PURPOSE. The ledger's
+    /// money columns are whole-rupee Ints, so 80% of a ₹1 booking is
+    /// ₹0.80 → stored as ₹0. A partner whose only completed job was a ₹1
+    /// test booking saw "1 completed orders" next to "₹0" and reasonably
+    /// asked why. Summing `netAmount` would just reproduce that ₹0.
+    ///
+    /// `displaySplit` recomputes the exact 2dp split from the snapshotted
+    /// `bookingAmount × commissionPct`, which is what the admin panel's
+    /// Payout management and Partner performance pages already show — so
+    /// the partner and the admin now read the same number instead of
+    /// ₹0 vs ₹0.80. Narrow projection, and a partner has one row per
+    /// completed job, so this stays cheap.
+    prisma.partnerEarning.findMany({
+      where: { partnerId: id },
+      select: { bookingAmount: true, commissionPct: true, status: true },
+    }),
+    /// Every pending adjustment, not an aggregate: debits (penalties,
+    /// positive) and credits (`balance_settlement`, negative — the
+    /// partner paid off what they owed) have to be reported separately
+    /// so the UI can say "₹1,200 in penalties, ₹768 paid" rather than a
+    /// meaningless net. The balance itself is still their plain sum.
+    prisma.partnerAdjustment.findMany({
+      where: { partnerId: id, status: 'pending' },
+      select: { amount: true },
+    }),
+  ]);
+
+  let pendingEarnings = 0;
+  let lifetimeEarnings = 0;
+  for (const r of rows) {
+    const net = displaySplit(r).partnerNet;
+    lifetimeEarnings += net;
+    if (r.status === 'pending') pendingEarnings += net;
+  }
+  pendingEarnings = money2(pendingEarnings);
+  lifetimeEarnings = money2(lifetimeEarnings);
+
+  let pendingPenalties = 0;
+  let settlementsPaid = 0;
+  let penaltyCount = 0;
+  for (const a of pendingAdj) {
+    const amt = a.amount ?? 0;
+    if (amt < 0) {
+      settlementsPaid += -amt;
+    } else {
+      pendingPenalties += amt;
+      /// A ₹0 penalty (policy disabled) is still a strike, so it counts.
+      penaltyCount += 1;
+    }
+  }
+
+  const balance = money2(pendingEarnings - (pendingPenalties - settlementsPaid));
+
+  return {
+    pendingEarnings,
+    pendingPenalties,
+    /// Rupees the partner has already paid in against those penalties.
+    settlementsPaid,
+    penaltyCount,
+    /// Signed. Negative ⇒ the partner owes Dhoond.
+    balance,
+    owes: balance < 0,
+    /// Unsigned rupees the partner must clear before they can work again.
+    /// Always ≥ 0 so the UI can print it without re-deriving the sign.
+    dueAmount: money2(Math.max(0, -balance)),
+    /// What a settlement payment would actually charge. Rounded UP to a
+    /// whole rupee because Razorpay bills in paise but the adjustment
+    /// ledger is Int rupees — paying the ceiling leaves the partner a
+    /// few paise in credit (returned in their next payout) instead of a
+    /// few paise still owing, which would leave them blocked after
+    /// paying. Zero when they owe nothing.
+    payableNow: Math.ceil(Math.max(0, -balance)),
+    lifetimeEarnings,
+    lifetimeOrders: rows.length,
+  };
+};
+
+/**
+ * Record a partner's INBOUND payment against their negative balance.
+ *
+ * Written as a NEGATIVE `balance_settlement` adjustment rather than by
+ * mutating the penalty rows. Two reasons:
+ *   - The penalties stay exactly as they were, so the strike history and
+ *     the "why do I owe this" audit trail survive the payment.
+ *   - `balanceForPartner` and the payout netting keep one formula
+ *     (earnings − sum(adjustments)) with no special-casing.
+ *
+ * `externalRef` is the Razorpay payment id and carries a UNIQUE index.
+ * That is the idempotency guarantee: a replayed verify callback hits the
+ * constraint and we return the existing row instead of crediting twice.
+ * Never call this without a real external reference.
+ */
+exports.settleBalanceForPartner = async ({ partnerId, amountRupees, externalRef, note }) => {
+  const id = Number(partnerId);
+  const amount = Math.round(Number(amountRupees) || 0);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw ApiError.badRequest('Settlement amount must be a positive whole rupee value');
+  }
+  if (!externalRef) {
+    throw ApiError.badRequest('Settlement requires an external payment reference');
+  }
+
+  /// Fast path for an obvious replay — the unique index below is the
+  /// real guard, this just avoids a noisy constraint error.
+  const existing = await prisma.partnerAdjustment.findUnique({ where: { externalRef } });
+  if (existing) return { adjustment: existing, alreadySettled: true };
+
+  try {
+    const adjustment = await prisma.partnerAdjustment.create({
+      data: {
+        partnerId: id,
+        type: 'balance_settlement',
+        /// Negative = credit. See the `amount` note on the model.
+        amount: -amount,
+        reason: note ?? `Balance cleared by partner (₹${amount})`,
+        status: 'pending',
+        externalRef,
+      },
+    });
+    return { adjustment, alreadySettled: false };
+  } catch (e) {
+    /// P2002 = unique violation on externalRef: a concurrent replay won
+    /// the race. Treat as already settled rather than erroring — the
+    /// partner's money was taken exactly once either way.
+    if (e?.code === 'P2002') {
+      const row = await prisma.partnerAdjustment.findUnique({ where: { externalRef } });
+      return { adjustment: row, alreadySettled: true };
+    }
+    throw e;
+  }
 };
 
 /// Admin overview — list of partners with their pending-earning rollup.
@@ -589,15 +755,48 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
   /// what "Mark week paid" is about to deduct. Not type-filtered (same
   /// as `generateForPartner` / `listPartnerSummaries`) so a future debit
   /// type nets the same way without a code change.
-  const pendingAdjRows = await prisma.partnerAdjustment.groupBy({
-    by: ['partnerId'],
-    where: { status: 'pending', payoutId: null, ...partnerCityWhere(scope) },
-    _sum: { amount: true },
-    _count: { _all: true },
-  });
-  const pendingAdjByPartner = new Map(
-    pendingAdjRows.map((a) => [a.partnerId, { amount: a._sum.amount ?? 0, count: a._count._all }]),
-  );
+  ///
+  /// Split into DEBITS and CREDITS rather than one net sum. Since
+  /// partners can now clear a negative balance by paying through the
+  /// app (a negative `balance_settlement` row), a single sum showed
+  /// "Penalties −₹432" for a partner who actually has ₹1,200 of
+  /// penalties and has already paid ₹768 against them — and counted the
+  /// settlement as a 7th penalty. Both figures were untrue. `totalDue`
+  /// is unchanged: it still nets the two.
+  const [debitRows, creditRows] = await Promise.all([
+    prisma.partnerAdjustment.groupBy({
+      by: ['partnerId'],
+      where: { status: 'pending', payoutId: null, amount: { gt: 0 }, ...partnerCityWhere(scope) },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
+    prisma.partnerAdjustment.groupBy({
+      by: ['partnerId'],
+      where: { status: 'pending', payoutId: null, amount: { lt: 0 }, ...partnerCityWhere(scope) },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
+  ]);
+  const pendingAdjByPartner = new Map();
+  for (const d of debitRows) {
+    pendingAdjByPartner.set(d.partnerId, {
+      penalties: d._sum.amount ?? 0,
+      count: d._count._all,
+      settlementsPaid: 0,
+    });
+  }
+  for (const c of creditRows) {
+    const row = pendingAdjByPartner.get(c.partnerId) ?? { penalties: 0, count: 0, settlementsPaid: 0 };
+    /// Stored negative; report the magnitude the partner actually paid.
+    row.settlementsPaid = -(c._sum.amount ?? 0);
+    pendingAdjByPartner.set(c.partnerId, row);
+  }
+  /// Kept for the union below — a partner with ONLY a credit still needs
+  /// a row so their payout isn't silently dropped from the screen.
+  const pendingAdjRows = [...pendingAdjByPartner.entries()].map(([partnerId, v]) => ({
+    partnerId,
+    _sum: { amount: v.penalties - v.settlementsPaid },
+  }));
 
   /// Partners with old dues OR pending penalties but NO earnings this
   /// week still need a row (otherwise those amounts silently vanish
@@ -654,8 +853,14 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
       const weekPending = money2(weekPendingByPartner.get(a.partnerId) ?? 0);
       const carry = carryByPartner.get(a.partnerId) ?? { amount: 0, jobs: 0 };
       const carryForward = money2(carry.amount);
-      const pendingAdj = pendingAdjByPartner.get(a.partnerId) ?? { amount: 0, count: 0 };
-      const penalties = money2(pendingAdj.amount);
+      const pendingAdj =
+        pendingAdjByPartner.get(a.partnerId) ?? { penalties: 0, count: 0, settlementsPaid: 0 };
+      /// TRUE penalty total — not net of what the partner has paid in.
+      const penalties = money2(pendingAdj.penalties);
+      /// Rupees the partner already settled through the app, shown
+      /// separately so "Penalties −₹1,200 · Paid ₹768" reads honestly
+      /// instead of collapsing to a meaningless "−₹432".
+      const settlementsPaid = money2(pendingAdj.settlementsPaid);
       return {
         ...a,
         /// money2 on every accumulated figure — pure float-drift guard.
@@ -676,10 +881,13 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
         /// the debt doesn't exist.
         penalties,
         penaltyCount: pendingAdj.count,
+        settlementsPaid,
         /// Everything the partner is owed as of this week's end, AFTER
-        /// pending penalties. This is the exact amount "Mark week paid"
-        /// transfers and settles.
-        totalDue: money2(weekPending + carryForward - penalties),
+        /// pending penalties and AFTER anything they've already paid in.
+        /// This is the exact amount "Mark week paid" transfers — the
+        /// two adjustment directions net here exactly as they do in
+        /// `weeklyMarkPaid`, so the screen and the transfer agree.
+        totalDue: money2(weekPending + carryForward - penalties + settlementsPaid),
         status:
           a.jobs === 0
             ? 'pending' // carry-forward-only row
@@ -706,6 +914,8 @@ exports.weeklySettlements = async ({ weekStart, scope }) => {
       pendingPayable: money2(items.reduce((s, a) => s + a.weekPending, 0)),
       carryForward: money2(items.reduce((s, a) => s + a.carryForward, 0)),
       penalties: money2(items.reduce((s, a) => s + a.penalties, 0)),
+      /// Total already paid in by partners clearing their own balances.
+      settlementsPaid: money2(items.reduce((s, a) => s + (a.settlementsPaid ?? 0), 0)),
       totalDue: money2(items.reduce((s, a) => s + a.totalDue, 0)),
     },
     items,
@@ -785,10 +995,21 @@ exports.weeklyMarkPaid = async ({ weekStart, partnerIds, scope }) => {
       (min, e) => (e.createdAt < min ? e.createdAt : min),
       earnings[0].createdAt,
     );
-    const notes =
-      adjustmentsTotal > 0
-        ? `Weekly settlement (week of ${weekLabel}) — bulk marked paid from Payout management. Includes −₹${adjustmentsTotal} in cancellation penalties (${adjustments.length}).`
-        : `Weekly settlement (week of ${weekLabel}) — bulk marked paid from Payout management`;
+    /// Describe debits and credits separately. The old note summed them
+    /// and called the result "cancellation penalties", so a partner who
+    /// owed ₹1,200 and had already paid ₹768 got a payout note claiming
+    /// "−₹432 in cancellation penalties (7)" — wrong amount, and a count
+    /// that included their own payment as a penalty.
+    const debits = adjustments.filter((a) => a.amount > 0);
+    const credits = adjustments.filter((a) => a.amount < 0);
+    const debitTotal = debits.reduce((s, a) => s + a.amount, 0);
+    const creditTotal = credits.reduce((s, a) => s + -a.amount, 0);
+    const parts = [];
+    if (debitTotal > 0) parts.push(`−₹${debitTotal} in cancellation penalties (${debits.length})`);
+    if (creditTotal > 0) parts.push(`+₹${creditTotal} already paid by the partner (${credits.length})`);
+    const notes = parts.length
+      ? `Weekly settlement (week of ${weekLabel}) — bulk marked paid from Payout management. Includes ${parts.join(' and ')}.`
+      : `Weekly settlement (week of ${weekLabel}) — bulk marked paid from Payout management`;
     // One transaction per partner — payout row + earning/adjustment
     // links land together or not at all.
     await prisma.$transaction(async (tx) => {

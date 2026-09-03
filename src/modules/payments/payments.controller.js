@@ -35,6 +35,35 @@ exports.getPartnerSummary = asyncHandler(async (req, res) => {
   success(res, data, 'Partner summary fetched');
 });
 
+/// Partner-facing: the signed-in partner's OWN unsettled balance
+/// (unpaid earnings − unpaid penalties). Reads the partner id from the
+/// JWT, never from the URL, so one partner can't inspect another's
+/// wallet. Backs the Home balance banner and the duty-toggle gate.
+exports.myBalance = asyncHandler(async (req, res) => {
+  const data = await earnings.balanceForPartner(req.user.sub);
+  success(res, data, 'Balance fetched');
+});
+
+/// Partner-facing: mint a Razorpay order for the partner's OWN
+/// outstanding balance. The amount is derived server-side from the
+/// ledger — the request carries no amount at all.
+exports.myBalanceOrder = asyncHandler(async (req, res) => {
+  const data = await razorpay.createBalanceSettlementOrder({ partnerId: req.user.sub });
+  success(res, data, 'Settlement order created');
+});
+
+/// Partner-facing: verify the signed Razorpay callback and credit the
+/// payment against the partner's balance, unblocking their duty toggle.
+exports.myBalanceVerify = asyncHandler(async (req, res) => {
+  const data = await razorpay.verifyBalanceSettlement({
+    partnerId: req.user.sub,
+    razorpayOrderId: req.body.razorpayOrderId,
+    razorpayPaymentId: req.body.razorpayPaymentId,
+    razorpaySignature: req.body.razorpaySignature,
+  });
+  success(res, data, data.alreadySettled ? 'Balance already settled' : 'Balance cleared');
+});
+
 // ── Weekly settlements (Mon–Sun) ───────────────────────────────────────────
 
 exports.weeklySettlements = asyncHandler(async (req, res) => {

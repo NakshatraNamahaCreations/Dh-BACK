@@ -740,13 +740,30 @@ exports.cancellationHistory = async (id) => {
       select: {
         id: true, bookingId: true, amount: true, reason: true,
         status: true, createdAt: true,
-        booking: { select: { bookingRef: true } },
       },
     }),
     prisma.partnerAdjustment.count({
       where: { partnerId, type: 'cancellation_penalty', createdAt: { gte: windowStart } },
     }),
   ]);
+
+  /// Booking refs come from a SEPARATE lookup, not a Prisma relation.
+  /// `PartnerAdjustment.bookingId` is a bare Int with no FK — deliberately,
+  /// because the abandoned-booking purge deletes bookings and a real
+  /// relation would either block that or cascade the penalty away. This
+  /// query previously did `booking: { select: { bookingRef: true } }`,
+  /// which is not a field on the model, so the whole endpoint threw a
+  /// Prisma validation error — a 500 that both the admin "Cancellation
+  /// strikes" card and the partner app's "Deductions" section swallowed,
+  /// silently rendering nothing. Neither had ever displayed a row.
+  const bookingIds = [...new Set(rows.map((r) => r.bookingId).filter((v) => v != null))];
+  const refRows = bookingIds.length
+    ? await prisma.booking.findMany({
+        where: { id: { in: bookingIds } },
+        select: { id: true, bookingRef: true },
+      })
+    : [];
+  const refById = new Map(refRows.map((b) => [b.id, b.bookingRef]));
 
   return {
     strikesInWindow,
@@ -759,7 +776,9 @@ exports.cancellationHistory = async (id) => {
     items: rows.map((r) => ({
       id: r.id,
       bookingId: r.bookingId,
-      bookingRef: r.booking?.bookingRef ?? (r.bookingId != null ? `#${r.bookingId}` : null),
+      /// Falls back to `#id` when the booking has since been purged, so
+      /// a deleted job still shows an identifiable strike.
+      bookingRef: refById.get(r.bookingId) ?? (r.bookingId != null ? `#${r.bookingId}` : null),
       amount: r.amount,
       reason: r.reason,
       /// pending (awaiting next payout) | applied (netted into a paid
@@ -769,6 +788,51 @@ exports.cancellationHistory = async (id) => {
       at: r.createdAt,
     })),
   };
+};
+
+/**
+ * Waive a cancellation penalty — the escape hatch for the negative-balance
+ * duty block.
+ *
+ * A partner whose unpaid penalties exceed their unpaid earnings can't go
+ * on duty until the balance clears, and "Mark week paid" CANNOT clear it
+ * for them: that flow iterates partners who have earnings to settle, so a
+ * partner sitting on ₹1,200 of strikes and ₹0 earned is never visited and
+ * would stay blocked forever. Ops needs a direct lever, and this is it.
+ *
+ * Sets `reversed`, not delete: the row stays in the partner's strike
+ * history (and still counts toward the rolling-7-day auto-suspend), it
+ * just stops carrying money. That's the documented meaning of the status
+ * — "admin voided it — still a strike, just no money impact".
+ *
+ * Only `pending` rows can be waived. An `applied` penalty was already
+ * netted out of a real bank transfer, so reversing it here would silently
+ * hand the partner money that was never withheld.
+ */
+exports.waiveAdjustment = async (adjustmentId, { reason } = {}) => {
+  const id = Number(adjustmentId);
+  const row = await prisma.partnerAdjustment.findUnique({
+    where: { id },
+    select: { id: true, status: true, amount: true, partnerId: true, reason: true },
+  });
+  if (!row) throw ApiError.notFound('Adjustment not found');
+  if (row.status === 'reversed') return row; // idempotent
+  if (row.status !== 'pending') {
+    throw ApiError.badRequest(
+      'Only a pending penalty can be waived — this one was already settled into a payout.',
+    );
+  }
+
+  return prisma.partnerAdjustment.update({
+    where: { id },
+    data: {
+      status: 'reversed',
+      /// Keep the original reason and append why it was waived, so the
+      /// audit trail survives.
+      reason: reason ? `${row.reason ?? 'Cancellation penalty'} — waived: ${reason}` : row.reason,
+    },
+    select: { id: true, partnerId: true, amount: true, status: true, reason: true },
+  });
 };
 
 exports.listOnboarding = async ({ status, search, categoryId, order, from, to, scope, page = 1, pageSize = 25 } = {}) => {

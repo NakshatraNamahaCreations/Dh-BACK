@@ -7,6 +7,7 @@ const logger = require('../../config/logger');
 const queue = require('./queue');
 const registry = require('./registry');
 const { sendJobOfferPushes, clearJobOfferPush } = require('../notifications/push.service');
+const { partnerEarningsBase } = require('../../utils/fare');
 
 /**
  * BullMQ-driven dispatch — Phase 2 of the dispatcher rewrite.
@@ -318,6 +319,12 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       /// socket/push payload, and the chip only appeared once the app's
       /// HTTP refresh caught up seconds later.
       offerBumpAmount: true,
+      /// Needed to quote the PARTNER-facing amount: a coupon is
+      /// Dhoond-funded, so the partner is offered (and paid on) the
+      /// pre-coupon value. Without this in the select the card first
+      /// flashed the ₹1 the customer paid, then jumped to ₹569 when the
+      /// app's HTTP refresh landed.
+      couponDiscount: true,
       isInstant: true,
       scheduledAt: true,
       createdAt: true,
@@ -536,7 +543,17 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
   /// set their own price — takes precedence; otherwise fall through to
   /// `grandTotal`, then `total` for old rows that pre-date the
   /// grand-total column being populated.
-  const amount = booking.offeredPrice ?? booking.grandTotal ?? booking.total ?? 0;
+  /// PARTNER-facing job value, which is not always what the customer
+  /// paid: a coupon is a Dhoond-funded promo, so it is added back (see
+  /// utils/fare partnerEarningsBase). This is the SAME figure the
+  /// earnings ledger credits on, so the amount a partner is offered
+  /// matches the amount they are later paid for. BYOP is unaffected —
+  /// `offeredPrice` wins and never carries a coupon.
+  const amount = partnerEarningsBase({
+    grandTotal: booking.offeredPrice ?? booking.grandTotal ?? booking.total ?? 0,
+    couponDiscount: booking.couponDiscount,
+    offeredPrice: booking.offeredPrice,
+  });
   /// Best address we can surface without a follow-up DB read — used by
   /// the partner app to render the card instantly (no "Loading address…"
   /// while refreshIncoming is pending). Prefer the stored addressLine
