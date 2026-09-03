@@ -128,6 +128,16 @@ const INSTANT_DISPATCH_TOTAL_MS = INSTANT_FINAL_WAVE.offsetMs + DISPATCH_WINDOW_
 /// 6-wave ladder with the +5/+10 min second-chance rounds; scheduled
 /// bookings keep the plain ladder (their misses go to admin dispatch).
 const isByopBooking = (booking) => booking.offeredPrice != null;
+
+/// How long ONE offer card stays open on the partner's phone. BYOP gets
+/// 10s, not the standard 30s, because the customer is shown "add a
+/// little extra" price bumps 10s into their search — a partner still
+/// sitting on a 30s card could otherwise accept the ORIGINAL price
+/// after the customer had already moved on to a higher offer.
+/// Scheduled and instant pay-now jobs keep the full 30s.
+const BYOP_OFFER_WINDOW_MS = 10 * 1000;
+const offerWindowMsFor = (booking) =>
+  isByopBooking(booking) ? BYOP_OFFER_WINDOW_MS : DISPATCH_WINDOW_MS;
 const isInstantFixedBooking = (booking) =>
   booking.isInstant === true && booking.offeredPrice == null;
 const wavePlanFor = (booking) => {
@@ -535,6 +545,11 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
   /// Push to connected partners. The gateway's emitter is responsible
   /// for figuring out which candidates have a live socket; the rest
   /// will pick up the offer via partnerIncoming polling.
+  /// The partner-app renders its offer countdown from this, so it is the
+  /// SERVER that decides how long a card lives — 10s for BYOP, 30s
+  /// otherwise (see offerWindowMsFor).
+  const offerWindowSec = offerWindowMsFor(booking) / 1000;
+  const byop = isByopBooking(booking);
   if (socketEmitter) {
     for (const c of candidates) {
       socketEmitter('dispatch.offer', c.partnerId, {
@@ -542,7 +557,8 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
         wave: waveSpec.wave,
         radiusKm,
         retry: waveSpec.retry,
-        activeForSec: DISPATCH_WINDOW_MS / 1000,
+        activeForSec: offerWindowSec,
+        byop,
         distanceKm: c.distanceKm,
         serviceName,
         amount,
@@ -562,7 +578,18 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
     void sendJobOfferPushes(
       prisma,
       candidates.map((c) => c.partnerId),
-      { bookingId: booking.id, serviceName, amount, dispatchWave: waveSpec.wave, address },
+      {
+        bookingId: booking.id,
+        serviceName,
+        amount,
+        dispatchWave: waveSpec.wave,
+        address,
+        /// Lets the BACKGROUND surfaces (native overlay card + the
+        /// notifee alert) use the same 10s/30s window the in-app sheet
+        /// does — they render straight from this payload with no DB read.
+        byop: byop ? '1' : '0',
+        offerWindowSec,
+      },
       /// Per-partner distance (km) so the offer card can show "6 min
       /// (2.0 km)" like a ride-hailing card — each partner gets their OWN
       /// number, not a shared one.

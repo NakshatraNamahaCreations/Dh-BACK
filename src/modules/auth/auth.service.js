@@ -3,6 +3,7 @@ const prisma = require('../../config/prisma');
 const logger = require('../../config/logger');
 const ApiError = require('../../utils/ApiError');
 const { signToken } = require('../../utils/jwt');
+const env = require('../../config/env');
 const { comparePassword } = require('../../utils/password');
 const otpService = require('./otp.service');
 const auditLogs = require('../audit-logs/audit-logs.service');
@@ -26,9 +27,21 @@ const customerVerifyOtp = async ({ phone, code, name }) => {
     throw ApiError.forbidden('Account is disabled');
   }
 
-  const token = signToken({ sub: customer.id, type: 'CUSTOMER' });
+  const token = signCustomerToken(customer.id);
   return { user: customer, token };
 };
+
+/// Customer tokens get their own (longer) lifetime — see
+/// CUSTOMER_JWT_EXPIRES_IN in config/env. Kept in one place so login and
+/// the sliding renewal in `me` can never drift apart.
+const signCustomerToken = (customerId) =>
+  signToken({ sub: customerId, type: 'CUSTOMER' }, { expiresIn: env.CUSTOMER_JWT_EXPIRES_IN });
+
+/// Sliding-session renewal threshold. A customer token older than this
+/// gets replaced on /auth/me. One day means a daily-active user always
+/// carries a token that's within a day of freshly minted, while we
+/// don't churn out a new JWT on every single launch.
+const CUSTOMER_TOKEN_RENEW_AFTER_MS = 24 * 60 * 60 * 1000;
 
 // -------- Partner (OTP) --------
 
@@ -142,11 +155,38 @@ const adminLogin = async ({ email, password }) => {
 
 // -------- Current user resolver --------
 
-const me = async ({ sub, type }) => {
+const me = async ({ sub, type, iat, exp }) => {
   if (type === 'CUSTOMER') {
     const user = await prisma.customer.findUnique({ where: { id: sub } });
     if (!user) throw ApiError.notFound('Customer not found');
-    return { type, user };
+    /// A SUSPENDED account must lose its session — the one "security
+    /// logout" the product spec allows. This matters more now that
+    /// customer tokens live 30 days: without it, an admin-disabled
+    /// customer would keep booking for the rest of that window (the old
+    /// 7-day token merely made the same gap shorter). 403 is what
+    /// bootstrap treats as "genuinely rejected", so the app clears the
+    /// token and returns to Login. Mirrors customerVerifyOtp, which
+    /// already refuses to issue a token to a disabled account.
+    if (!user.isActive) throw ApiError.forbidden('Account is disabled');
+
+    /// Sliding session: hand back a fresh token once the presented one
+    /// is old enough, so an active customer never hits hard expiry.
+    /// `iat`/`exp` are the JWT's issued-at/expiry (seconds), surfaced on
+    /// req.user by verifyToken.
+    ///
+    /// The renewal age is capped at HALF the token's own lifetime, which
+    /// removes a config foot-gun: if CUSTOMER_JWT_EXPIRES_IN were ever
+    /// set below the fixed 24h threshold, renewal could never fire
+    /// before expiry and every customer would be logged out on schedule
+    /// — the exact bug this whole change exists to kill.
+    const lifetimeMs = iat && exp ? (exp - iat) * 1000 : 0;
+    const renewAfterMs =
+      lifetimeMs > 0
+        ? Math.min(CUSTOMER_TOKEN_RENEW_AFTER_MS, Math.floor(lifetimeMs / 2))
+        : CUSTOMER_TOKEN_RENEW_AFTER_MS;
+    const ageMs = iat ? Date.now() - iat * 1000 : 0;
+    const token = ageMs > renewAfterMs ? signCustomerToken(user.id) : undefined;
+    return token ? { type, user, token } : { type, user };
   }
   if (type === 'PARTNER') {
     const user = await prisma.partner.findUnique({ where: { id: sub }, include: PARTNER_INCLUDE });

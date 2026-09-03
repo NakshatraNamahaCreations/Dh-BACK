@@ -206,7 +206,7 @@ const sendFcmDataMessage = async (token, data, notification = null) => {
  *   delivery looks successful while producing no alert on the phone.
  * @param {{ bookingId: number, serviceName: string, amount: number, dispatchWave?: number, address?: string }} jobInfo
  */
-const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, amount, dispatchWave, address }, distanceByPartner = {}) => {
+const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, amount, dispatchWave, address, byop, offerWindowSec }, distanceByPartner = {}) => {
   if (!partnerIds || partnerIds.length === 0) return;
   try {
     const partners = await prisma.partner.findMany({
@@ -235,6 +235,11 @@ const sendJobOfferPushes = async (prisma, partnerIds, { bookingId, serviceName, 
             /// no real reach — only the double alert.
             {
               type: 'job_request', bookingId, serviceName, amount, dispatchWave, address,
+              /// Offer-card lifetime, decided server-side: 10s for BYOP
+              /// (the customer is offered price bumps at 10s), 30s for
+              /// scheduled / instant pay-now. The background surfaces
+              /// render from this payload alone, so it has to ride along.
+              byop, offerWindowSec,
               /// This partner's own distance to the job, when the dispatcher
               /// computed one — drives the "6 min (2.0 km)" line on the card.
               ...(Number.isFinite(Number(distanceByPartner[p.id]))

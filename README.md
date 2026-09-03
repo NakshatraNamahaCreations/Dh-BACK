@@ -64,7 +64,10 @@ Server listens on `http://localhost:PORT` (default `5000`). API base: `/api/v1`.
 - `POST /api/v1/auth/admin/login` — `{ email, password }`
 
 ### Common
-- `GET /api/v1/auth/me` *(Bearer token)* — returns `{ type, user }`
+- `GET /api/v1/auth/me` *(Bearer token)* — returns `{ type, user }`. For a
+  CUSTOMER it may also return `token`: a renewed JWT issued when the presented
+  one is past its renewal age (sliding session — see `CUSTOMER_JWT_EXPIRES_IN`).
+  Clients MUST persist `token` when present. Returns 403 for a disabled account.
 
 ## JWT payload
 

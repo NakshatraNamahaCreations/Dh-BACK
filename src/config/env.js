@@ -6,6 +6,14 @@ const schema = z.object({
   DATABASE_URL: z.string().url(),
   JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 characters'),
   JWT_EXPIRES_IN: z.string().default('7d'),
+  /// Customer sessions are deliberately decoupled from JWT_EXPIRES_IN
+  /// (which also governs admin/partner tokens). A customer's session
+  /// SLIDES: /auth/me re-issues a fresh token once the current one is
+  /// over a day old, so an active customer is never logged out — this
+  /// window only bites someone who hasn't opened the app at all for
+  /// this long. Previously every customer was hard-logged-out
+  /// JWT_EXPIRES_IN after login regardless of activity.
+  CUSTOMER_JWT_EXPIRES_IN: z.string().default('30d'),
   CORS_ORIGIN: z.string().default('*'),
   LOG_LEVEL: z.string().default('info'),
   OTP_EXPIRY_MINUTES: z.coerce.number().int().min(1).max(30).default(5),
