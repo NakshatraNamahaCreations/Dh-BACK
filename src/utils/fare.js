@@ -77,5 +77,41 @@ exports.computeFare = ({ subtotal, discount = 0, offeredPrice = null } = {}) => 
   };
 };
 
+/**
+ * The amount a PARTNER's earnings are computed on.
+ *
+ * A coupon is a DHOOND-FUNDED promotion, not a price cut on the
+ * partner's work: the partner does the same ₹569 job whether or not the
+ * customer had a code, so the platform — which chose to run the promo —
+ * absorbs it. The coupon is therefore ADDED BACK on top of what the
+ * customer actually paid.
+ *
+ * Worked example (the case this was written for): a ₹569 service with a
+ * ₹568 coupon leaves the customer paying ₹1. Splitting that ₹1 credited
+ * the partner ₹0.80 — which floors to ₹0 in the whole-rupee ledger — for
+ * a full job. The base is now ₹1 + ₹568 = ₹569, so the partner is paid
+ * as if no coupon existed and Dhoond carries the ₹568.
+ *
+ * PAID add-ons join the base (the customer settled that money for this
+ * job too); unpaid ones stay out.
+ *
+ * NOT double-counted on BYOP: the customer app never forwards a coupon
+ * alongside an `offeredPrice` (a coupon has no effect on a
+ * customer-named price), so `couponDiscount` is null on those rows.
+ *
+ * Accounting note: this deliberately splits the PRE-coupon value, so a
+ * couponed booking records Dhoond's nominal commission (20% of ₹569 =
+ * ₹113.80) even though only ₹1 was collected. The ₹568 gap is the
+ * marketing spend, tracked on the booking's own `couponDiscount`.
+ */
+exports.partnerEarningsBase = ({
+  grandTotal = 0,
+  couponDiscount = 0,
+  addOnPaidTotal = 0,
+} = {}) =>
+  Math.max(0, Number(grandTotal) || 0) +
+  Math.max(0, Number(couponDiscount) || 0) +
+  Math.max(0, Number(addOnPaidTotal) || 0);
+
 exports.GST_PCT = GST_PCT;
 exports.PLATFORM_FEE_PCT = PLATFORM_FEE_PCT;

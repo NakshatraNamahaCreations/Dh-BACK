@@ -1,5 +1,6 @@
 const prisma = require('../../config/prisma');
 const { splitByPct } = require('../../utils/split');
+const { partnerEarningsBase } = require('../../utils/fare');
 const ApiError = require('../../utils/ApiError');
 const commissionsService = require('./commissions.service');
 
@@ -113,15 +114,19 @@ exports.creditForBooking = async (bookingId) => {
 
   const categoryId = resolveCategoryId(booking);
   const partnerPct = await commissionsService.getEffectivePctForCategory(categoryId);
-  // Use grandTotal (what customer paid) as the commission base, not
-  // the pre-tax `total`. grandTotal is the all-in price; partner earns
-  // their % of that, then 5% GST is deducted from their share.
-  // PAID add-ons join the base — the customer settled that money for
-  // this job too. Unpaid add-ons are excluded (no money came in).
+  // Base = grandTotal (the all-in price) + PAID add-ons + any COUPON the
+  // customer redeemed. The coupon is added back because Dhoond funds the
+  // promotion, not the partner — see `partnerEarningsBase`. Without it a
+  // ₹569 job bought with a ₹568 coupon credited the partner ₹0.
+  // The partner earns their % of this, then 5% GST comes off their share.
   const addOnPaidTotal = (booking.addOns ?? [])
     .filter((a) => a.status === 'paid')
     .reduce((s, a) => s + a.price * a.qty, 0);
-  const base = (booking.grandTotal ?? booking.total) + addOnPaidTotal;
+  const base = partnerEarningsBase({
+    grandTotal: booking.grandTotal ?? booking.total,
+    couponDiscount: booking.couponDiscount,
+    addOnPaidTotal,
+  });
   const bd = computeBreakdown(base, partnerPct);
 
   /// Upsert by bookingId so idempotency is enforced at the DB level.

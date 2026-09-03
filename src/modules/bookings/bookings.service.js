@@ -10,7 +10,7 @@ const earningsService = require('../payments/earnings.service');
 const razorpayService = require('../payments/razorpay.service');
 const policyService = require('../policy/policy.service');
 const cityResolver = require('../geography/city-resolver');
-const { computeFare } = require('../../utils/fare');
+const { computeFare, partnerEarningsBase } = require('../../utils/fare');
 
 /// Best-effort refund kick — called from every CANCELLED transition.
 /// Wrapped so a Razorpay outage / config gap can't roll back a cancel
@@ -630,7 +630,19 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
   /// PAID add-ons roll into the job's revenue — the customer has settled
   /// that money, so the partner's Amount / Revenue / earning all include
   /// it. Unpaid add-ons stay out until they're actually paid.
-  const revenueTotal = fare.grandTotal + addOnShape.addOnPaidTotal;
+  ///
+  /// Any COUPON is added back too: Dhoond funds the promo, so from the
+  /// partner's side the job is worth its pre-coupon value (a ₹569 job
+  /// bought with a ₹568 coupon is still a ₹569 job to them). This keeps
+  /// the partner app coherent — its Earnings screen derives "Taxes +
+  /// fees" as revenue − earning, which went NEGATIVE when revenue was
+  /// the ₹1 the customer actually paid. Same base the earnings ledger
+  /// credits on (payments/earnings.service creditForBooking).
+  const revenueTotal = partnerEarningsBase({
+    grandTotal: fare.grandTotal,
+    couponDiscount: b.couponDiscount,
+    addOnPaidTotal: addOnShape.addOnPaidTotal,
+  });
   const primaryCategoryId = b.items?.[0]?.service?.categoryId ?? null;
   const partnerCommissionPct =
     (commissionMap && primaryCategoryId != null
@@ -720,7 +732,12 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     /// customer's payment before the partner's share is computed.
     partnerCommissionPct,
     partnerEarning,
-    platformCommission: fare.total - partnerEarning,
+    /// Dhoond's cut of the SAME base the partner's share came from, so
+    /// the two reconcile: revenue = partner gross + platform commission.
+    /// Was `fare.total - partnerEarning`, which went negative on a
+    /// couponed job (fare.total was the ₹1 collected while the partner's
+    /// share was computed on ₹569).
+    platformCommission: revenueTotal - _partnerGross,
     offeredPrice: b.offeredPrice ?? null,
     /// Rupees the customer added over their previous offer — the offer
     /// card renders it as a green "+₹N" so a sweetened job stands out.
