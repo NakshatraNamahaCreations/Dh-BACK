@@ -38,6 +38,9 @@ const createSchema = z.object({
     notes: z.string().trim().max(500).optional(),
     /// optional customer-offered price — drives the "Book at your price" flow
     offeredPrice: z.number().int().min(0).max(10_000_000).optional(),
+    /// rupees added on top of the PREVIOUS offer when re-booking after
+    /// nobody accepted — shown to the partner as a green "+₹N"
+    offerBumpAmount: z.number().int().min(0).max(10_000_000).optional(),
     /// optional coupon code — backend re-validates against the cart and
     /// applies the discount inside the same transaction as the booking
     /// insert so a coupon redemption is never burned without a booking.

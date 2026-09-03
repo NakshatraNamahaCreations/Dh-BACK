@@ -722,6 +722,9 @@ const partnerShape = (b, partnerCoords, commissionMap) => {
     partnerEarning,
     platformCommission: fare.total - partnerEarning,
     offeredPrice: b.offeredPrice ?? null,
+    /// Rupees the customer added over their previous offer — the offer
+    /// card renders it as a green "+₹N" so a sweetened job stands out.
+    offerBumpAmount: b.offerBumpAmount ?? null,
     /// High-demand pricing snapshot — non-null when surge raised this
     /// booking's prices; the partner summary explains the higher rates.
     surgeMultiplier: b.surgeMultiplier ?? null,
@@ -1258,6 +1261,13 @@ exports.create = async ({ customerId, payload, idempotencyKey = null }) => {
         platformFee: fare.platformFee,
         grandTotal: fare.grandTotal,
         offeredPrice: payload.offeredPrice ?? null,
+        /// Only meaningful alongside an offeredPrice — a bump is by
+        /// definition a re-book of a BYOP offer. Stored so the partner's
+        /// offer card can show "+₹N" in green.
+        offerBumpAmount:
+          payload.offeredPrice != null && payload.offerBumpAmount
+            ? payload.offerBumpAmount
+            : null,
         couponId: couponData?.couponId ?? null,
         couponCode: couponData?.couponCode ?? null,
         couponDiscount: couponData ? couponData.discount : null,

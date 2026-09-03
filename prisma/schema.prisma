@@ -666,6 +666,14 @@ model Booking {
   grandTotal      Int           @default(0)
   /// optional customer-offered price (used for "Book at your price")
   offeredPrice    Int?
+  /// Rupees the customer ADDED on top of their previous BYOP offer when
+  /// re-booking after nobody accepted ("Still waiting? Add a little
+  /// extra" → +₹50/80/110/140). A bump always creates a NEW booking that
+  /// supersedes the old one, so without this the partner-app has no way
+  /// to tell a sweetened offer from a first attempt. Surfaced on the
+  /// partner's offer card as a green "+₹N". Null / 0 = not a bumped
+  /// offer.
+  offerBumpAmount Int?
   /// optional coupon redemption — set when the customer applied a code
   /// at checkout. `couponDiscount` is the actual rupees deducted (after
   /// percent + cap math), captured at booking time so the value remains

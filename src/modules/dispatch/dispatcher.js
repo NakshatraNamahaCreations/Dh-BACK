@@ -559,6 +559,9 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
         retry: waveSpec.retry,
         activeForSec: offerWindowSec,
         byop,
+        /// Green "+₹N" on the partner's card when the customer sweetened
+        /// this offer after nobody took the previous one.
+        offerBump: booking.offerBumpAmount ?? null,
         distanceKm: c.distanceKm,
         serviceName,
         amount,
@@ -589,6 +592,9 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
         /// does — they render straight from this payload with no DB read.
         byop: byop ? '1' : '0',
         offerWindowSec,
+        /// Rupees added over the customer's previous offer, so the
+        /// background surfaces can show the same green "+₹N".
+        offerBump: booking.offerBumpAmount ?? undefined,
       },
       /// Per-partner distance (km) so the offer card can show "6 min
       /// (2.0 km)" like a ride-hailing card — each partner gets their OWN
