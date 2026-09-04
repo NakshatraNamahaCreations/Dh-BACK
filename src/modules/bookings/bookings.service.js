@@ -1861,6 +1861,19 @@ const adminShape = (b) => {
     grandTotal: b.grandTotal && b.grandTotal > 0 ? b.grandTotal : b.total,
     couponCode: b.couponCode,
     couponDiscount: b.couponDiscount,
+    /// What the JOB was worth, as opposed to what the customer paid.
+    ///
+    /// A coupon is Dhoond-funded, so a 569-rupee job with a 568-rupee
+    /// code leaves `grandTotal` at 1 — correct for "money collected",
+    /// badly wrong anywhere the reader is judging the work. The partner
+    /// pages listed it as a 1-rupee job. Same base the partner is
+    /// actually paid on, so admin and the partner app agree.
+    jobValue: partnerEarningsBase({
+      grandTotal: b.grandTotal && b.grandTotal > 0 ? b.grandTotal : b.total,
+      couponDiscount: b.couponDiscount,
+      addOnPaidTotal: shapeAddOns(b).addOnPaidTotal,
+      offeredPrice: b.offeredPrice,
+    }),
     surgeMultiplier: b.surgeMultiplier ?? null,
     surgeRuleName: b.surgeRuleName ?? null,
     /// Payment rollup mirrored from the latest Payment row.
