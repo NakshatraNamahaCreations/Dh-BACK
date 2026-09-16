@@ -74,8 +74,9 @@ const { partnerEarningsBase } = require('../../utils/fare');
 /// at 3:10 (see INSTANT_RETRY_WAVES):
 ///   Wave 7 (5:00)   — widest-ring second chance, 30s active
 ///   Wave 8 (10:00)  — widest-ring final chance, 30s active
-///   Expiry (10:30)  — auto-cancel + automatic refund; instant
-///                     bookings never park in manual dispatch.
+///   Expiry (10:30)  — booking flips to `needs_admin_dispatch`, same as
+///                     scheduled; ops has ADMIN_DISPATCH_GRACE_MS to
+///                     assign a partner before auto-cancel + refund.
 const DISPATCH_WINDOW_MS = 30 * 1000;
 const DISPATCH_RETRY_GAP_MS = 2 * 1000;
 const DISPATCH_STEP_MS = DISPATCH_WINDOW_MS + DISPATCH_RETRY_GAP_MS;
@@ -109,13 +110,13 @@ const BYOP_FINAL_WAVE = BYOP_DISPATCH_WAVES[BYOP_DISPATCH_WAVES.length - 1];
 const BYOP_DISPATCH_TOTAL_MS = BYOP_FINAL_WAVE.offsetMs + DISPATCH_WINDOW_MS;
 
 /// INSTANT second-chance rounds. When the 6-wave ladder ends with no
-/// acceptance, an instant (fixed-price) booking is NOT parked in the
-/// admin manual-dispatch queue — the customer is waiting at the door
-/// right now, and a 2-hour admin grace (the scheduled-booking
-/// treatment) just strands them. Instead it gets two more broadcast
+/// acceptance, an instant (fixed-price) booking gets two more broadcast
 /// rounds at the widest ring — at +5 min and +10 min from dispatch
-/// start — and if those also pass untaken, handleExpire auto-cancels
-/// WITH an automatic refund. Scheduled + BYOP flows are unchanged.
+/// start — before the automated search is declared over. If those also
+/// pass untaken, handleExpire hands the booking to the admin Manual
+/// Dispatch queue exactly like a scheduled booking, and the
+/// ADMIN_DISPATCH_GRACE_MS safety net auto-cancels + refunds it only if
+/// ops never assigns a partner. Scheduled + BYOP flows are unchanged.
 /// Mirror of the same plan in bookings.service.js — keep in sync.
 const INSTANT_RETRY_WAVES = [
   { wave: 7, radiusKm: 7, stage: 2, offsetMs: 5 * 60 * 1000, retry: true },
@@ -178,13 +179,14 @@ const resolveWaveRadiusKm = async (waveSpec) => {
 // Lead time before a scheduled slot at which dispatch begins. MUST stay
 // in sync with the same constant in bookings.service.js.
 const SCHEDULE_DISPATCH_LEAD_MS = 30 * 60 * 1000;
-/// When all six waves elapse without acceptance, the booking is
-/// handed off to admin (status stays PENDING, dispatchStatus flips
-/// to `needs_admin_dispatch`). This is how long admin has to take
-/// action before a safety-net auto-cancel kicks in. Keep this long
-/// enough to span a typical work-day handover, short enough that a
-/// forgotten booking doesn't sit in limbo for days.
-const ADMIN_DISPATCH_GRACE_MS = 2 * 60 * 60 * 1000;
+/// Manual Dispatch timeout. When a booking's broadcast plan elapses
+/// without acceptance it is handed off to admin (status stays PENDING,
+/// dispatchStatus flips to `needs_admin_dispatch`). This is how long
+/// ops has to assign a partner before the safety-net auto-cancel fires
+/// (with an automatic refund for paid rows). Applies to EVERY booking
+/// that enters the queue, paid or not — the customer is waiting on a
+/// definitive answer, so an open-ended wait is never the right grace.
+const ADMIN_DISPATCH_GRACE_MS = 30 * 60 * 1000;
 
 let worker = null;
 let socketEmitter = null;
@@ -646,8 +648,8 @@ const handleReconcile = async () => {
   /// fresh-but-still-broadcasting rows out of scope. Instant
   /// fixed-price rows use the LONGER instant window (the +5/+10 min
   /// retry rounds) — with the shared cutoff they'd be flagged as
-  /// orphans mid-retry, and a lost-expire re-queue would auto-cancel
-  /// them seven minutes early.
+  /// orphans mid-retry, and a lost-expire re-queue would hand them to
+  /// manual dispatch seven minutes early.
   const cutoff = new Date(Date.now() - DISPATCH_TOTAL_MS - RECONCILE_GRACE_MS);
   const instantCutoff = new Date(Date.now() - INSTANT_DISPATCH_TOTAL_MS - RECONCILE_GRACE_MS);
   const lookback = new Date(Date.now() - RECONCILE_LOOKBACK_MS);
@@ -659,6 +661,11 @@ const handleReconcile = async () => {
         where: {
           status: 'PENDING',
           partnerId: null,
+          /// Rows already parked in Manual Dispatch are NOT orphans —
+          /// their expire ran and the admin_timeout job owns them (see
+          /// the second scan below). Re-firing expire for them every
+          /// 60s would only churn no-op jobs.
+          dispatchStatus: { not: 'needs_admin_dispatch' },
           OR: [
             /// Instant fixed-price → the extended retry window applies.
             {
@@ -681,13 +688,43 @@ const handleReconcile = async () => {
       }),
     { label: 'reconcile.findOrphans' },
   );
-  if (orphans.length === 0) return;
+  if (orphans.length > 0) {
+    /// Re-enqueue with delay 0 — these are already past their expiry
+    /// window so they should fire immediately. BullMQ's idempotent
+    /// jobId means re-queueing one we already have is a no-op.
+    await Promise.all(orphans.map((b) => queue.enqueueExpire(b.id, 0)));
+    logger.info(`reconciler: re-queued expire for ${orphans.length} orphaned PENDING bookings`);
+  }
 
-  /// Re-enqueue with delay 0 — these are already past their expiry
-  /// window so they should fire immediately. BullMQ's idempotent
-  /// jobId means re-queueing one we already have is a no-op.
-  await Promise.all(orphans.map((b) => queue.enqueueExpire(b.id, 0)));
-  logger.info(`reconciler: re-queued expire for ${orphans.length} orphaned PENDING bookings`);
+  /// Second stage of the same durability net: bookings parked in Manual
+  /// Dispatch whose deadline has passed but whose `admin_timeout` job
+  /// never fired (lost enqueue, evicted job, worker down at the time).
+  /// Without this a forgotten row would sit in the queue forever; with
+  /// it the DB deadline is the source of truth. Idempotent jobId again,
+  /// so a still-queued timeout is left alone.
+  const stuckInManual = await withDbRetry(
+    () =>
+      prisma.booking.findMany({
+        where: {
+          status: 'PENDING',
+          partnerId: null,
+          dispatchStatus: 'needs_admin_dispatch',
+          dispatchExpiresAt: {
+            gte: lookback,
+            lte: new Date(Date.now() - RECONCILE_GRACE_MS),
+          },
+        },
+        select: { id: true },
+        take: 200,
+      }),
+    { label: 'reconcile.findStuckManualDispatch' },
+  );
+  if (stuckInManual.length > 0) {
+    await Promise.all(stuckInManual.map((b) => queue.enqueueAdminTimeout(b.id, 0)));
+    logger.info(
+      `reconciler: re-queued admin_timeout for ${stuckInManual.length} manual-dispatch bookings past their deadline`,
+    );
+  }
 };
 
 /// Reconcile the DB duty MIRROR against the AUTHORITATIVE Redis presence,
@@ -1303,21 +1340,24 @@ const handlePaymentExpire = async ({ bookingId, attempt = 0 }) => {
   );
 };
 
-/// Wave expiry. After the 7km retry broadcast also passes without
+/// Wave expiry. After the booking's FINAL broadcast wave passes without
 /// an acceptance, we DON'T cancel the booking — instead it transitions
 /// to `dispatchStatus: 'needs_admin_dispatch'` while keeping
 /// `status: 'PENDING'`. The admin's Manual Dispatch queue picks it up
 /// and ops can hand-assign a partner using nearbyPartners + reassign.
+/// This applies to scheduled AND instant fixed-price bookings alike;
+/// the only rows that skip the queue are unpaid BYOP price requests.
 ///
 /// A safety-net `admin_timeout` job is enqueued at the same time —
 /// if ops doesn't action the booking inside `ADMIN_DISPATCH_GRACE_MS`,
-/// `handleAdminTimeout` flips it to CANCELLED with all the same
-/// refund/cleanup the old behaviour did.
+/// `handleAdminTimeout` flips it to CANCELLED and refunds paid rows.
+/// Cancellation therefore ONLY happens after the Manual Dispatch
+/// timeout, never straight out of the broadcast cycle.
 const handleExpire = async ({ bookingId }) => {
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
     select: {
-      id: true, status: true, partnerId: true, customerId: true,
+      id: true, status: true, partnerId: true, customerId: true, dispatchStatus: true,
       offeredPrice: true, paymentStatus: true, isInstant: true, couponId: true,
     },
   });
@@ -1327,12 +1367,17 @@ const handleExpire = async ({ bookingId }) => {
     await registry.clearBooking(bookingId);
     return;
   }
+  /// Already handed to Manual Dispatch by an earlier run of this job
+  /// (BullMQ retry, reconciler re-fire, legacy sweep). The admin_timeout
+  /// job owns the row from here — re-running the handoff would push the
+  /// deadline out, re-notify every admin and re-ping the customer.
+  if (booking.dispatchStatus === 'needs_admin_dispatch') return;
 
   /// BYOP abandon shortcut. "Book at your price" broadcasts BEFORE
   /// payment, so an unpaid BYOP booking that reached the end of the
   /// broadcast window with no partner is an ABANDONED price request —
   /// the customer never committed money and (typically) has left. There
-  /// is no point routing it to admin manual dispatch for a 2-hour grace:
+  /// is no point routing it to admin manual dispatch for the grace window:
   /// even if an admin assigned a partner, there's no paying customer on
   /// the other end. Cancel it now and stop broadcasting. (Fixed-price
   /// bookings are pre-paid, so they still go to the admin queue below.)
@@ -1371,119 +1416,42 @@ const handleExpire = async ({ bookingId }) => {
     return;
   }
 
-  /// INSTANT auto-cancel. This expire only fires AFTER the instant
-  /// plan's +5 min and +10 min second-chance rounds also went untaken
-  /// (see INSTANT_RETRY_WAVES) — so the search is genuinely over. End
-  /// it definitively: cancel, refund automatically (payment + coupon),
-  /// and tell the customer, instead of parking the row in the admin
-  /// manual-dispatch queue. An instant customer has been watching a
-  /// spinner for ~10 minutes; "no partner found, money back" beats an
-  /// open-ended wait on ops.
-  if (isInstantFixedBooking(booking)) {
-    const isPaid = booking.paymentStatus === 'paid';
-    /// A partner-cancelled row must survive (partner's Past tab), and a
-    /// row with ANY payment attempt must survive (it carries the only
-    /// server-side link to possibly-captured money). Only truly
-    /// untouched rows are hard-deleted — same policy as admin_timeout.
-    const wasPartnerCancelled =
-      (await prisma.partnerAdjustment.count({
-        where: { bookingId: booking.id, type: 'cancellation_penalty' },
-      })) > 0;
-    const hasPaymentAttempt =
-      (await prisma.payment.count({ where: { bookingId: booking.id } })) > 0;
-
-    let didCancel = false;
-    let didDelete = false;
-    await prisma.$transaction(async (tx) => {
-      /// Release the coupon in every outcome — the customer received no
-      /// service, so the redemption must not stay consumed.
-      if (booking.couponId != null) {
-        await couponsService.refundForBooking({ couponId: booking.couponId, tx });
-      }
-      if (isPaid || wasPartnerCancelled || hasPaymentAttempt) {
-        const result = await tx.booking.updateMany({
-          where: { id: booking.id, status: 'PENDING', partnerId: null },
-          data: {
-            status: 'CANCELLED',
-            dispatchStatus: 'no_partner_found',
-            dispatchExpiresAt: null,
-            /// Keep noPartnerReason null for partner-cancelled rows so
-            /// the partner-history filter reads them as real cancels.
-            noPartnerReason: wasPartnerCancelled
-              ? null
-              : 'No partner accepted within the broadcast window or the 5/10-minute retry rounds — instant booking auto-cancelled' +
-                (isPaid ? ' and refunded automatically.' : '.'),
-          },
-        });
-        didCancel = result.count > 0;
-      } else {
-        const result = await tx.booking.deleteMany({
-          where: {
-            id: booking.id,
-            status: 'PENDING',
-            partnerId: null,
-            paymentStatus: { not: 'paid' },
-          },
-        });
-        didDelete = result.count > 0;
-      }
-    });
-    if (!didCancel && !didDelete) return;
-
-    /// Snapshot the audience BEFORE clearBooking wipes visibleTo, then
-    /// tear the broadcast down everywhere (socket close + FCM clear).
-    const audience = await registry.listPartnersForBooking(bookingId).catch(() => []);
-    await registry.clearBooking(bookingId);
-    if (audience.length > 0) {
-      if (socketEmitter) {
-        for (const pid of audience) {
-          socketEmitter('dispatch.claimed', pid, { bookingId, partnerId: null, reason: 'expired' });
-        }
-      }
-      void clearJobOfferPush(prisma, audience, bookingId);
-    }
-
-    if (didCancel && isPaid) {
-      try {
-        await razorpayService.refundForBooking({
-          bookingId,
-          reason: 'No partner accepted the instant booking — automatic refund',
-        });
-      } catch (err) {
-        /// Refund failure must not kill the job (the cancel already
-        /// committed); payment_success's paid+cancelled safety net and
-        /// support tooling can still reconcile it from the kept row.
-        logger.error(`Instant auto-refund failed for booking ${bookingId}: ${err.message}`);
-      }
-    }
-
-    if (socketEmitter) {
-      socketEmitter('booking.expired', `customer:${booking.customerId}`, { bookingId: booking.id });
-    }
-    logger.info(
-      `dispatch expire: instant booking ${bookingId} ${didDelete ? 'deleted' : 'cancelled'} after retry rounds` +
-        (didCancel && isPaid ? ' (auto-refund issued)' : ' (unpaid)'),
-    );
-    return;
-  }
-
+  /// Everything else — instant fixed-price, scheduled, and paid BYOP —
+  /// goes to the admin Manual Dispatch queue. This expire only fires
+  /// after the booking's FULL broadcast plan went untaken (for instant
+  /// rows that includes the +5/+10 min second-chance rounds), so the
+  /// automated search is genuinely over and ops takes it from here. The
+  /// booking is NOT cancelled at this point: cancellation happens only
+  /// if the Manual Dispatch timeout (ADMIN_DISPATCH_GRACE_MS) elapses
+  /// with nobody assigned — see handleAdminTimeout.
+  ///
   /// Atomic transition — `updateMany` with status='PENDING' guard so a
   /// late race against partnerAccept can't overwrite a CONFIRMED row.
   ///
-  /// PAID bookings have NO auto-cancel deadline: the customer's money is
-  /// committed, so the row stays in the Manual Dispatch queue until an
-  /// admin assigns a partner or explicitly cancels (which refunds).
-  /// Only unpaid rows keep the auto-cleanup grace window.
+  /// `dispatchExpiresAt` is the Manual Dispatch deadline (the "Grace"
+  /// column on the admin queue). It is stamped for paid AND unpaid rows
+  /// — the `admin_timeout` job armed below fires at that exact moment.
   const isPaid = booking.paymentStatus === 'paid';
+  const isInstant = isInstantFixedBooking(booking);
+  const plan = wavePlanFor(booking);
+  const finalWave = plan[plan.length - 1];
   const result = await prisma.booking.updateMany({
-    where: { id: booking.id, status: 'PENDING', partnerId: null },
+    where: {
+      id: booking.id,
+      status: 'PENDING',
+      partnerId: null,
+      /// Same idempotency guard as the early return above, enforced at
+      /// the write so two concurrent expire runs can't both "hand off".
+      dispatchStatus: { not: 'needs_admin_dispatch' },
+    },
     data: {
       dispatchStatus: 'needs_admin_dispatch',
-      dispatchRadiusKm: FINAL_DISPATCH_WAVE.radiusKm,
-      dispatchWave: FINAL_DISPATCH_WAVE.wave,
-      dispatchExpiresAt: isPaid ? null : new Date(Date.now() + ADMIN_DISPATCH_GRACE_MS),
-      noPartnerReason:
-        'No partner accepted within 3km, 5km, or 7km broadcast and retry windows — awaiting admin dispatch.',
+      dispatchRadiusKm: finalWave.radiusKm,
+      dispatchWave: finalWave.wave,
+      dispatchExpiresAt: new Date(Date.now() + ADMIN_DISPATCH_GRACE_MS),
+      noPartnerReason: isInstant
+        ? 'No partner accepted within the 3km, 5km, or 7km broadcast windows or the 5/10-minute retry rounds — awaiting admin dispatch.'
+        : 'No partner accepted within 3km, 5km, or 7km broadcast and retry windows — awaiting admin dispatch.',
     },
   });
   if (result.count === 0) return;
@@ -1510,12 +1478,13 @@ const handleExpire = async ({ bookingId }) => {
     void clearJobOfferPush(prisma, offerAudience, bookingId);
   }
 
-  /// Schedule the safety-net auto-cancel — UNPAID bookings only. Paid
-  /// bookings must never be auto-cancelled: they wait in the Manual
-  /// Dispatch queue until an admin acts, however long that takes.
-  if (!isPaid) {
-    await queue.enqueueAdminTimeout(bookingId, ADMIN_DISPATCH_GRACE_MS);
-  }
+  /// Arm the Manual Dispatch timeout for EVERY booking in the queue,
+  /// paid or not. handleAdminTimeout cancels the booking (refunding
+  /// payment + coupon for paid rows) if ops hasn't assigned a partner
+  /// by then — the customer must get a definitive answer, not an
+  /// open-ended wait. Idempotent jobId, so a reconciler re-fire of this
+  /// expire can't double-arm it.
+  await queue.enqueueAdminTimeout(bookingId, ADMIN_DISPATCH_GRACE_MS);
 
   if (socketEmitter) {
     /// Tell the customer the broadcast finished without a match — they
@@ -1539,9 +1508,10 @@ const handleExpire = async ({ bookingId }) => {
     void adminNotifs.notifyAllAdmins({
       type: adminNotifs.TYPES.BOOKING_DISPATCH_NEEDED,
       title: `Manual dispatch needed for #${booking.id}`,
-      body: isPaid
-        ? 'PAID booking — no partner accepted in the broadcast windows. It will WAIT in Manual Dispatch until you assign a partner or cancel (with refund).'
-        : 'No partner accepted in the 3 km / 5 km / 7 km broadcast and retry windows. Assign one before the 2-hour grace elapses.',
+      body:
+        `No partner accepted during the automated broadcast${isInstant ? ' or retry rounds' : ''}. ` +
+        `Assign a partner within ${ADMIN_DISPATCH_GRACE_MS / 60000} minutes — after that the booking auto-cancels` +
+        (isPaid ? ' and the payment is refunded automatically.' : '.'),
       href: '/bookings/manual-dispatch',
       bookingId: booking.id,
     });
@@ -1552,10 +1522,14 @@ const handleExpire = async ({ bookingId }) => {
   );
 };
 
-/// Safety net for the manual-dispatch handoff. Fires
-/// `ADMIN_DISPATCH_GRACE_MS` after `handleExpire` routes a booking to
-/// admin. If admin still hasn't dispatched it, we cancel + refund — same
-/// flow the old expire used to run, just delayed by the grace window.
+/// Manual Dispatch timeout. Fires `ADMIN_DISPATCH_GRACE_MS` after
+/// `handleExpire` routes a booking to admin. If ops still hasn't
+/// assigned a partner, the booking is cancelled and the customer told:
+///   • paid rows are kept as CANCELLED and refunded automatically
+///     (Razorpay payment + coupon redemption),
+///   • unpaid rows a partner had cancelled, or that carry any payment
+///     attempt, are kept as CANCELLED (history / money trail),
+///   • truly untouched unpaid rows are hard-deleted.
 ///
 /// Gated on (status='PENDING' AND partnerId=null AND dispatchStatus=
 /// 'needs_admin_dispatch'). If admin assigned a partner in the meantime,
@@ -1583,30 +1557,23 @@ const handleAdminTimeout = async ({ bookingId }) => {
     return;
   }
 
-  /// PAID bookings are NEVER auto-cancelled — they wait in the Manual
-  /// Dispatch queue until an admin assigns a partner or cancels (which
-  /// refunds). handleExpire no longer enqueues this job for paid rows;
-  /// this guard covers timeout jobs enqueued BEFORE that policy change
-  /// and any reconciler re-fires.
-  if (booking.paymentStatus === 'paid') {
-    logger.info(
-      `admin_timeout: booking ${bookingId} is PAID — left in manual dispatch queue (no auto-cancel)`,
-    );
-    return;
-  }
-
+  const isPaid = booking.paymentStatus === 'paid';
   /// A booking a PARTNER cancelled is kept (as CANCELLED) even when unpaid,
-  /// so it survives in that partner's Past tab. Only truly-abandoned unpaid
-  /// bookings (never accepted by anyone) are hard-deleted.
+  /// so it survives in that partner's Past tab. A row with ANY payment
+  /// attempt is kept too — it carries the only server-side link to
+  /// possibly-captured money. Only truly-abandoned unpaid bookings (never
+  /// accepted, never paid for) are hard-deleted.
   const wasPartnerCancelled =
     (await prisma.partnerAdjustment.count({
       where: { bookingId: booking.id, type: 'cancellation_penalty' },
     })) > 0;
+  const hasPaymentAttempt =
+    (await prisma.payment.count({ where: { bookingId: booking.id } })) > 0;
 
   let didCancel = false;
   let didDelete = false;
   await prisma.$transaction(async (tx) => {
-    if (booking.paymentStatus === 'paid' || wasPartnerCancelled) {
+    if (isPaid || wasPartnerCancelled || hasPaymentAttempt) {
       const result = await tx.booking.updateMany({
         where: {
           id: booking.id,
@@ -1617,19 +1584,17 @@ const handleAdminTimeout = async ({ bookingId }) => {
         data: {
           status: 'CANCELLED',
           dispatchStatus: 'no_partner_found',
+          dispatchExpiresAt: null,
           /// Keep noPartnerReason null for partner-cancelled rows so the
-          /// partner-history filter treats them as real cancellations;
-          /// the unpaid-abandoned-but-kept case (paid) keeps the reason.
+          /// partner-history filter treats them as real cancellations.
           noPartnerReason: wasPartnerCancelled
             ? null
-            : 'No partner found within broadcast and retry windows; admin grace period elapsed without manual dispatch.',
+            : 'No partner was assigned within the Manual Dispatch window — booking auto-cancelled' +
+              (isPaid ? ' and refunded automatically.' : '.'),
         },
       });
       didCancel = result.count > 0;
     } else {
-      if (booking.couponId != null) {
-        await couponsService.refundForBooking({ couponId: booking.couponId, tx });
-      }
       const result = await tx.booking.deleteMany({
         where: {
           id: booking.id,
@@ -1641,37 +1606,48 @@ const handleAdminTimeout = async ({ bookingId }) => {
       });
       didDelete = result.count > 0;
     }
+    /// Release the coupon whenever the booking actually ended here — the
+    /// customer received no service, so the redemption must not stay
+    /// consumed. Gated on the write above so a lost race (admin assigned
+    /// a partner a moment ago) doesn't decrement a live redemption.
+    if ((didCancel || didDelete) && booking.couponId != null) {
+      await couponsService.refundForBooking({ couponId: booking.couponId, tx });
+    }
   });
   if (!didCancel && !didDelete) return;
 
+  /// Money back for paid rows. Best-effort and outside the transaction:
+  /// the cancel is already committed, and a Razorpay hiccup must not fail
+  /// the job — payment_success's paid+cancelled safety net and support
+  /// tooling can still reconcile from the kept row. refundForBooking is
+  /// a silent no-op when nothing was captured, so calling it for every
+  /// kept row is safe and also covers a capture the webhook hasn't
+  /// stamped onto paymentStatus yet.
   if (didCancel) {
     try {
       await razorpayService.refundForBooking({
         bookingId,
-        reason: 'No partner found within broadcast + admin grace window',
+        reason: 'No partner assigned within the Manual Dispatch window — automatic refund',
       });
     } catch (err) {
-      logger.warn(`Refund kick failed for booking ${bookingId}: ${err.message}`);
-    }
-
-    if (socketEmitter) {
-      socketEmitter('booking.expired', `customer:${booking.customerId}`, {
-        bookingId: booking.id,
-      });
+      logger.error(`admin_timeout: refund for booking ${bookingId} failed: ${err.message}`);
     }
   }
 
-  if (didDelete) {
-    await registry.clearBooking(bookingId);
-    if (socketEmitter) {
-      socketEmitter('booking.expired', `customer:${booking.customerId}`, {
-        bookingId: booking.id,
-      });
-    }
+  /// handleExpire already tore the broadcast down; this is a harmless
+  /// belt-and-braces clear so no stale offer key can outlive the row.
+  await registry.clearBooking(bookingId).catch(() => {});
+
+  if (socketEmitter) {
+    socketEmitter('booking.expired', `customer:${booking.customerId}`, {
+      bookingId: booking.id,
+    });
   }
 
   logger.info(
-    `admin_timeout: booking ${bookingId} ${didDelete ? 'deleted' : 'cancelled'} (admin grace elapsed)`,
+    `admin_timeout: booking ${bookingId} ${didDelete ? 'deleted' : 'cancelled'} after ` +
+      `${ADMIN_DISPATCH_GRACE_MS / 60000}m in manual dispatch` +
+      (didCancel && isPaid ? ' (auto-refund issued)' : ''),
   );
 };
 

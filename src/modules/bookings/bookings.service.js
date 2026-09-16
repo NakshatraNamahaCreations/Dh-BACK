@@ -312,7 +312,8 @@ const BYOP_DISPATCH_TOTAL_MS = BYOP_DISPATCH_WAVES[BYOP_DISPATCH_WAVES.length - 
 
 /// Mirror of `dispatcher.INSTANT_RETRY_WAVES` — instant fixed-price
 /// bookings get two extra widest-ring rounds at +5 min and +10 min
-/// before the expire path auto-cancels + refunds. Keep in sync.
+/// before the expire path hands them to the admin Manual Dispatch
+/// queue (auto-cancel + refund only after that window). Keep in sync.
 const INSTANT_RETRY_WAVES = [
   {
     wave: 7,
@@ -385,9 +386,9 @@ const expireBroadcasts = async (now = new Date()) => {
       /// accepted" event would leave the coupon's `usedCount` ticked
       /// up even though the customer never received service.
       couponId: true,
-      /// PAID bookings are never auto-cancelled — they route to the
-      /// admin Manual Dispatch queue instead (mirrors the BullMQ
-      /// dispatcher's handleExpire policy).
+      /// Needed to tell an abandoned (unpaid) BYOP price request apart
+      /// from a real booking that must go to Manual Dispatch (mirrors
+      /// the BullMQ dispatcher's handleExpire policy).
       paymentStatus: true,
     },
     take: 200,
@@ -396,45 +397,79 @@ const expireBroadcasts = async (now = new Date()) => {
   const allExpired = pending.filter(
     (b) => now.getTime() - broadcastStartFor(b).getTime() >= dispatchTotalMsFor(b),
   );
-  if (allExpired.length === 0) return;
 
-  /// PAID → park in the admin Manual Dispatch queue (no cancel, no
-  /// refund; the money is committed and an admin must assign or cancel
-  /// explicitly). Only unpaid rows fall through to the auto-cancel below.
-  const paidExpired = allExpired.filter((b) => b.paymentStatus === 'paid');
-  if (paidExpired.length > 0) {
+  /// Mirror of the BullMQ dispatcher's handleExpire policy:
+  ///   • unpaid BYOP price requests are abandoned → cancel now;
+  ///   • EVERYTHING else (instant, scheduled, paid BYOP) → park in the
+  ///     admin Manual Dispatch queue with the timeout deadline stamped.
+  ///     Nothing is cancelled straight out of the broadcast cycle.
+  const isAbandonedByop = (b) => b.offeredPrice != null && b.paymentStatus !== 'paid';
+  const toManual = allExpired.filter((b) => !isAbandonedByop(b));
+  if (toManual.length > 0) {
     await prisma.booking.updateMany({
-      where: { id: { in: paidExpired.map((b) => b.id) }, status: 'PENDING', partnerId: null },
+      where: {
+        id: { in: toManual.map((b) => b.id) },
+        status: 'PENDING',
+        partnerId: null,
+        dispatchStatus: { in: ['waiting', 'broadcasting'] },
+      },
       data: {
         dispatchStatus: 'needs_admin_dispatch',
-        dispatchExpiresAt: null,
+        dispatchRadiusKm: FINAL_DISPATCH_WAVE.radiusKm,
+        dispatchWave: FINAL_DISPATCH_WAVE.wave,
+        dispatchExpiresAt: new Date(now.getTime() + dispatcher.ADMIN_DISPATCH_GRACE_MS),
         noPartnerReason:
           'No partner accepted within 3km, 5km, or 7km broadcast and retry windows — awaiting admin dispatch.',
       },
     });
   }
 
-  const expired = allExpired.filter((b) => b.paymentStatus !== 'paid');
-  if (expired.length === 0) return;
+  /// Manual Dispatch timeout sweep — rows whose deadline passed with
+  /// nobody assigned. With no BullMQ worker there is no `admin_timeout`
+  /// job, so this lazy pass is what enforces the window in legacy mode.
+  const timedOut = await prisma.booking.findMany({
+    where: {
+      status: 'PENDING',
+      partnerId: null,
+      dispatchStatus: 'needs_admin_dispatch',
+      dispatchExpiresAt: { lte: now },
+    },
+    select: { id: true, couponId: true, paymentStatus: true },
+    take: 200,
+  });
+
+  const toCancel = [
+    ...allExpired.filter(isAbandonedByop).map((b) => ({
+      b,
+      reason:
+        'Book-at-your-price request expired — no partner accepted within the broadcast window and payment was never made.',
+    })),
+    ...timedOut.map((b) => ({
+      b,
+      reason:
+        'No partner was assigned within the Manual Dispatch window — booking auto-cancelled' +
+        (b.paymentStatus === 'paid' ? ' and refunded automatically.' : '.'),
+    })),
+  ];
+  if (toCancel.length === 0) return;
 
   /// Per-booking transition so the coupon refund is gated on the
   /// actual cancel, not just on what we read at findMany time. A
-  /// partner can race in and accept between our read and the write —
-  /// in that case `updateMany` returns count 0 for that row and we
-  /// skip the refund (the booking is now legitimately in flight).
+  /// partner (or admin) can race in and assign between our read and the
+  /// write — in that case `updateMany` returns count 0 for that row and
+  /// we skip the refund (the booking is now legitimately in flight).
   /// Track which bookings actually transitioned so we can kick the
   /// payment refund AFTER the transaction commits.
   const cancelledIds = [];
   await prisma.$transaction(async (tx) => {
-    for (const b of expired) {
+    for (const { b, reason } of toCancel) {
       const result = await tx.booking.updateMany({
         where: { id: b.id, status: 'PENDING', partnerId: null },
         data: {
           status: 'CANCELLED',
           dispatchStatus: 'no_partner_found',
-          dispatchRadiusKm: FINAL_DISPATCH_WAVE.radiusKm,
-          dispatchWave: FINAL_DISPATCH_WAVE.wave,
-          noPartnerReason: 'No partner accepted within 3km, 5km, or 7km broadcast and retry windows.',
+          dispatchExpiresAt: null,
+          noPartnerReason: reason,
         },
       });
       if (result.count > 0) {
@@ -447,12 +482,13 @@ const expireBroadcasts = async (now = new Date()) => {
   });
 
   /// Kick payment refunds outside the transaction. Best-effort — a
-  /// Razorpay outage never blocks the cancel itself.
+  /// Razorpay outage never blocks the cancel itself, and refundForBooking
+  /// is a silent no-op for rows with nothing captured.
   for (const bid of cancelledIds) {
     try {
       await razorpayService.refundForBooking({
         bookingId: bid,
-        reason: 'No partner found within broadcast and retry windows',
+        reason: 'No partner assigned within the Manual Dispatch window — automatic refund',
       });
     } catch (err) {
       console.warn(`Refund kick failed for booking ${bid}: ${err.message}`);
