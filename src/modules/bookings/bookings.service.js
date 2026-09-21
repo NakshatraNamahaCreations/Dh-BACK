@@ -100,6 +100,27 @@ const findServiceAreaForAddress = async ({ city, pincode, cityId }) => {
   });
 };
 
+/// DB truth for "could these partners really take a job in these
+/// categories": active, verified and CURRENTLY in one of them. The Redis
+/// pools can hold stale members — a suspended partner within the sticky
+/// TTL, or one whose category an admin changed while their app kept
+/// pinging the old pool — so every customer-facing count gates on this.
+/// Same rule as the dispatcher's candidate gate, so "N partners
+/// available" never counts someone the broadcast won't actually offer to.
+const dispatchablePartnerIds = async (partnerIds, categoryIds) => {
+  if (partnerIds.length === 0) return new Set();
+  const rows = await prisma.partner.findMany({
+    where: {
+      id: { in: partnerIds.map(Number) },
+      isActive: true,
+      isVerified: true,
+      categoryId: { in: categoryIds },
+    },
+    select: { id: true },
+  });
+  return new Set(rows.map((r) => r.id));
+};
+
 /**
  * INSTANT bookings only: refuse to create one when no partner who can
  * actually do the job is online, nearby and free.
@@ -157,6 +178,12 @@ const checkInstantAvailability = async ({ services, lat, lng }) => {
       if (ids.length > 0) {
         const busy = await dispatchRegistry.filterActivePartnerIds(ids);
         free = ids.filter((id) => !busy.has(Number(id)));
+      }
+      /// Drop stale pool members (suspended / category since changed).
+      /// A DB error lands in the catch below and fails open, as designed.
+      if (free.length > 0) {
+        const ok = await dispatchablePartnerIds(free, [categoryId]);
+        free = free.filter((id) => ok.has(Number(id)));
       }
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -2454,6 +2481,8 @@ const AVAILABILITY_RADIUS_KM = 7;
 ///   - union + dedupe (a partner registered for two categories counts once)
 ///   - drop partners currently on an active job (busy)
 ///   - drop partners who already DECLINED this booking
+///   - drop stale pool members: not active/verified, or no longer in the
+///     booking's category (dispatchablePartnerIds — the dispatcher's gate)
 /// Returns { count, hasNearby, radiusKm }. Soft-fails to count 0 when
 /// Redis/geo is unavailable rather than throwing into the customer flow.
 exports.availability = async ({ customerId, id }) => {
@@ -2515,8 +2544,14 @@ exports.availability = async ({ customerId, id }) => {
     const declined = await dispatchRegistry
       .getDeclinedPartners(Number(id))
       .catch(() => new Set());
+    /// Only partners who are active, verified and STILL in one of this
+    /// booking's categories — a stale pool member (e.g. category changed
+    /// by admin) showed as "1 partner available" with nobody there.
+    const dispatchable = await dispatchablePartnerIds(ids, categoryIds);
 
-    const count = ids.filter((id) => !busy.has(id) && !declined.has(id)).length;
+    const count = ids.filter(
+      (id) => dispatchable.has(Number(id)) && !busy.has(id) && !declined.has(id),
+    ).length;
     return { count, hasNearby: count > 0, radiusKm: AVAILABILITY_RADIUS_KM };
   } catch (err) {
     console.warn(`[availability] booking ${id}: ${err.message}`);
