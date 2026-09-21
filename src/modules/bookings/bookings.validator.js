@@ -219,8 +219,8 @@ const listMineQuerySchema = z.object({
     status: z
       .enum(['PENDING', 'CONFIRMED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'])
       .optional(),
-    /** "upcoming" or "past" — convenience filter */
-    bucket: z.enum(['upcoming', 'past']).optional(),
+    /** "upcoming" / "past" / "awaiting_payment" (accepted BYOP, unpaid, in its pay window) */
+    bucket: z.enum(['upcoming', 'past', 'awaiting_payment']).optional(),
   }),
 });
 

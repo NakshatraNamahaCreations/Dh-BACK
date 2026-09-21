@@ -1499,6 +1499,18 @@ exports.listMine = async ({ customerId, status, bucket }) => {
         ],
       },
     ];
+  } else if (bucket === 'awaiting_payment') {
+    /// Accepted "Book at your price" bookings still inside their pay
+    /// window. `upcoming` is paid-only, and the in-app pay sheet only
+    /// exists while the cart screen that ran the search stays open — so a
+    /// customer who closed the app mid-flow (or before the partner even
+    /// accepted) had NO way back to pay or cancel. The customer-app Home
+    /// pay bar reads this bucket. A partner cancel flips the row back to
+    /// PENDING and clears the deadline, so it drops out on its own.
+    where.status = 'CONFIRMED';
+    where.offeredPrice = { not: null };
+    where.paymentStatus = { not: 'paid' };
+    where.paymentDeadlineAt = { gt: new Date() };
   }
 
   /// Most-recent-first across both buckets — a customer who just
@@ -1737,6 +1749,19 @@ exports.cancelOwn = async ({ customerId, id, reason }) => {
         : `Customer cancelled booking #${id}.`,
       bookingId: id,
     });
+    /// Dedicated live event on top of the notification row. The partner
+    /// app re-syncs its jobs on this, so the active card (incl. a BYOP
+    /// "Waiting for customer to pay" hold) disappears instantly instead
+    /// of on the next 5s poll. Kept separate from `notification.new`
+    /// because the partner's OWN cancel also writes a `job_cancelled`
+    /// row — keying the "customer cancelled" popup off that would
+    /// double-alert a partner who just cancelled themselves.
+    try {
+      dispatcher.emitToPartner(b.partnerId, 'job.cancelled', {
+        bookingId: id,
+        beforePayment: b.paymentStatus !== 'paid',
+      });
+    } catch { /* socket optional — partner-app poll catches up */ }
   }
 
   /// Re-read after the refund kick so the returned booking reflects the

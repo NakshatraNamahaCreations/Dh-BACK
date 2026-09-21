@@ -292,7 +292,24 @@ const updateMe = async ({ sub, type }, data) => {
     }
 
     if (Object.keys(partnerData).length > 0) {
+      /// A category change must reach dispatch too (Redis pools + a live
+      /// socket's cached category) — same path as the admin change
+      /// (partners.service.updateCategory), so both writers stay in sync.
+      const prevCategoryId =
+        partnerData.categoryId !== undefined
+          ? (await prisma.partner.findUnique({ where: { id: sub }, select: { categoryId: true } }))
+              ?.categoryId
+          : undefined;
       await prisma.partner.update({ where: { id: sub }, data: partnerData });
+      if (prevCategoryId !== undefined && prevCategoryId !== partnerData.categoryId) {
+        await require('../dispatch/registry')
+          .moveCategory({
+            partnerId: sub,
+            fromCategoryId: prevCategoryId,
+            toCategoryId: partnerData.categoryId,
+          })
+          .catch(() => {});
+      }
     }
     if (Object.keys(docData).length > 0) {
       await prisma.partnerDocument.upsert({

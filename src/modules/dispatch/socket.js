@@ -215,12 +215,23 @@ const start = (httpServer) => {
       /// TEMP DIAGNOSTIC — confirms presence reached upsertOnline.
       logger.info(`[presence-debug] partner ${partnerId} presence OK → upsertOnline (${lat},${lng})`);
       try {
-        await registry.upsertOnline({
+        const placed = await registry.upsertOnline({
           partnerId,
           categoryId: socket.data.categoryId,
           lat,
           lng,
         });
+        /// The cached category goes stale if an admin changes it mid-
+        /// session; upsertOnline reports the current one (and has already
+        /// re-homed this ping into the right pool). Refresh the cache so
+        /// later pings — and the disconnect cleanup — use it too.
+        if (placed && placed.categoryId !== socket.data.categoryId) {
+          logger.info(
+            `partner ${partnerId} category changed ${socket.data.categoryId} → ${placed.categoryId} mid-session`,
+          );
+          socket.data.categoryId = placed.categoryId;
+          if (placed.categoryId == null) socket.data.dispatchable = false;
+        }
         await registry.touchSocketConn(partnerId).catch(() => {});
         /// Keep the DB position fresh while on-duty (throttled ~60s)
         /// so admin "nearby partners" + the accept-time fallback don't

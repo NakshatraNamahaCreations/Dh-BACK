@@ -449,12 +449,13 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
     }
   }
 
-  /// HARD GATE — drop SUSPENDED / PAUSED / UNVERIFIED partners. The DB is
-  /// the source of truth for account standing; a suspended partner can
-  /// linger in the Redis pool for up to the sticky TTL (or be put back by
-  /// the auto-suspend-on-cancel path that clears their busy flag), so this
-  /// is the bulletproof belt that stops a blocked partner from EVER being
-  /// offered a job regardless of how they got into the candidate set.
+  /// HARD GATE — drop SUSPENDED / PAUSED / UNVERIFIED partners, and anyone
+  /// whose CURRENT category no longer matches this booking. The DB is the
+  /// source of truth for both; a partner can linger in a Redis pool for up
+  /// to the sticky TTL (a suspend, or an admin category change while their
+  /// app kept pinging the OLD category's pool), so this is the bulletproof
+  /// belt that stops them from EVER being offered a job they aren't
+  /// allowed to take, regardless of how they got into the candidate set.
   if (candidates.length > 0) {
     const eligible = await prisma.partner
       .findMany({
@@ -462,6 +463,7 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
           id: { in: candidates.map((c) => c.partnerId) },
           isActive: true,
           isVerified: true,
+          categoryId: { in: categoryIds },
         },
         select: { id: true },
       })
@@ -477,7 +479,7 @@ const handleWave = async ({ bookingId, wave: waveNumber }) => {
       }
       if (before !== candidates.length) {
         logger.info(
-          `dispatch wave ${waveNumber} for booking ${bookingId}: dropped ${before - candidates.length} suspended/unverified partner(s)`,
+          `dispatch wave ${waveNumber} for booking ${bookingId}: dropped ${before - candidates.length} suspended/unverified/category-changed partner(s)`,
         );
       }
     }

@@ -1100,10 +1100,30 @@ exports.updateCategory = async (id, categoryId) => {
     if (!cat.active) throw ApiError.badRequest('Category is not active');
   }
 
+  const nextCategoryId = categoryId == null ? null : Number(categoryId);
   await prisma.partner.update({
     where: { id: partnerId },
-    data: { categoryId: categoryId == null ? null : Number(categoryId) },
+    data: { categoryId: nextCategoryId },
   });
+
+  /// The DB write alone never reached dispatch: an on-duty partner stayed
+  /// in the OLD category's Redis pool, and their live socket (which caches
+  /// the category from connect) kept re-adding them there every ~15s — so
+  /// they got old-category jobs and none of the new one's until their app
+  /// reconnected. Move their presence to the new pool now and record the
+  /// change for the socket to pick up on its next ping. Runs even when the
+  /// category is unchanged, so re-saving it resyncs a partner whose live
+  /// app is still on a stale category (the pool move itself only happens
+  /// on a real change). Best-effort: the dispatcher's DB category gate
+  /// already blocks old-category offers.
+  const registry = require('../dispatch/registry');
+  await registry
+    .moveCategory({
+      partnerId,
+      fromCategoryId: partner.categoryId,
+      toCategoryId: nextCategoryId,
+    })
+    .catch(() => {});
   return exports.get(partnerId);
 };
 

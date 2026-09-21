@@ -96,6 +96,17 @@ const offDutyKey = (partnerId) => `partner:offduty:${partnerId}`;
 /// pinned "busy" forever. 4h comfortably covers any real job.
 const ACTIVE_JOB_TTL_S = 4 * 60 * 60;
 const activeJobKey = (partnerId) => `partner:active:${partnerId}`;
+/// Partner's CURRENT category, written when an admin changes it. A live
+/// socket caches the category it read at connect and presence-pings that
+/// pool every ~15s, so without this an admin change never reached a
+/// connected partner (they kept getting the OLD category's jobs and none
+/// of the new one's until their app reconnected). `upsertOnline` reads it
+/// in the same MGET as the duty/busy flags — no extra round trip — and
+/// re-homes the partner on their next ping. 'none' = category cleared.
+/// The TTL only needs to outlive the gap to the next ping (any reconnect
+/// re-reads the DB anyway); 24h is generous.
+const CATEGORY_OVERRIDE_TTL_S = 24 * 60 * 60;
+const partnerCategoryKey = (partnerId) => `partner:category:${partnerId}`;
 const visibleToKey = (bookingId) => `booking:visibleTo:${bookingId}`;
 const claimKey = (bookingId) => `booking:claim:${bookingId}`;
 /// Partners who DECLINED / cancelled this specific booking — they must
@@ -127,6 +138,9 @@ const isSentinelDefaultCoord = (lat, lng) =>
   Math.abs(Number(lat) - SENTINEL_DEFAULT_LAT) < 1e-4 &&
   Math.abs(Number(lng) - SENTINEL_DEFAULT_LNG) < 1e-4;
 
+/// Returns `{ categoryId }` — the category the partner ACTUALLY belongs to
+/// (the caller's value, unless an admin change overrode it) so a socket can
+/// refresh its cached copy. `undefined` when skipped / Redis is off.
 const upsertOnline = async ({ partnerId, categoryId, lat, lng }) => {
   if (categoryId == null || lat == null || lng == null) return;
   /// Reject the known hardcoded default — see isSentinelDefaultCoord.
@@ -144,14 +158,30 @@ const upsertOnline = async ({ partnerId, categoryId, lat, lng }) => {
     /// job offers (push + socket) while they're still finishing the job
     /// they accepted — their app keeps pinging presence as they drive,
     /// and without this they'd be re-added to the pool ~15s after accept.
-    const [offDuty, activeJob] = await redis.mget(
+    /// The third key is the admin category override (partnerCategoryKey).
+    const [offDuty, activeJob, categoryOverride] = await redis.mget(
       offDutyKey(partnerId),
       activeJobKey(partnerId),
+      partnerCategoryKey(partnerId),
     );
+    /// The caller's category may be stale (a socket's connect-time cache).
+    /// If an admin has changed it since, drop the partner from the stale
+    /// pool and register them in the current one instead.
+    const current =
+      categoryOverride == null
+        ? categoryId
+        : categoryOverride === 'none'
+          ? null
+          : Number(categoryOverride);
+    const stale = current !== categoryId;
+    if (stale) {
+      await redis.zrem(onlineKey(categoryId), String(partnerId));
+    }
+    if (current == null) return { categoryId: null };
     if (offDuty != null) {
       /// TEMP DIAGNOSTIC — remove once "no job alert" is resolved.
       logger.info(`[presence-debug] upsertOnline BLOCKED partner ${partnerId}: off-duty flag set`);
-      return;
+      return { categoryId: current };
     }
     if (activeJob != null) {
       /// BUSY partner: keep them OUT of the geo pool (no new offers while
@@ -162,18 +192,48 @@ const upsertOnline = async ({ partnerId, categoryId, lat, lng }) => {
       /// partners to off_duty WHILE THEY WERE ON A JOB (the bulk
       /// onDutyChangedAt flips seen in the partners table).
       await redis.set(lastSeenKey(partnerId), Date.now(), 'EX', STICKY_ONLINE_TTL_S);
-      return;
+      return { categoryId: current };
     }
     await redis
       .multi()
-      .geoadd(onlineKey(categoryId), Number(lng), Number(lat), String(partnerId))
+      .geoadd(onlineKey(current), Number(lng), Number(lat), String(partnerId))
       /// Use the STICKY TTL (not 90s): any presence ping means the
       /// partner is on duty, and we want them to survive the app being
       /// backgrounded/frozen between pings. They're removed on explicit
       /// Off Duty; the long TTL is just the "forgot to go off" safety net.
       .set(lastSeenKey(partnerId), Date.now(), 'EX', STICKY_ONLINE_TTL_S)
       .exec();
-    logger.info(`[presence-debug] upsertOnline DONE partner ${partnerId} → cat:${categoryId} geoadd OK`);
+    logger.info(`[presence-debug] upsertOnline DONE partner ${partnerId} → cat:${current} geoadd OK`);
+    return { categoryId: current };
+  });
+};
+
+/// Admin changed a partner's category. Record the new one for live sockets
+/// (partnerCategoryKey — picked up by their next presence ping) and, if the
+/// partner is sitting in the old category's pool right now, MOVE them to the
+/// new pool at the same position so they can receive the new category's
+/// jobs immediately instead of after their next ping / app reconnect.
+/// Busy or off-duty partners aren't in any pool, so nothing is added for
+/// them — they re-register normally once they're back. Best-effort.
+const moveCategory = async ({ partnerId, fromCategoryId, toCategoryId }) => {
+  return safe(async () => {
+    const member = String(partnerId);
+    const pipe = redis
+      .multi()
+      .set(
+        partnerCategoryKey(partnerId),
+        toCategoryId == null ? 'none' : String(toCategoryId),
+        'EX',
+        CATEGORY_OVERRIDE_TTL_S,
+      );
+    if (fromCategoryId != null && fromCategoryId !== toCategoryId) {
+      const [pos] = await redis.geopos(onlineKey(fromCategoryId), member);
+      pipe.zrem(onlineKey(fromCategoryId), member);
+      if (pos && toCategoryId != null) {
+        pipe.geoadd(onlineKey(toCategoryId), Number(pos[0]), Number(pos[1]), member);
+      }
+    }
+    await pipe.exec();
   });
 };
 
@@ -741,6 +801,7 @@ module.exports = {
   PRESENCE_TTL_S,
   upsertOnline,
   setStickyOnline,
+  moveCategory,
   removeOnline,
   setOffDuty,
   clearOffDuty,
